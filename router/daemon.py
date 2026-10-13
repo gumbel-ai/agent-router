@@ -17,6 +17,7 @@ from router.child import child_environment, launch, opencode_command
 from router.config import Settings
 from router.db import Store, now_ms
 from router.dispatch import MUTATIONS, canonical
+from router.native import NativeObserver
 from router.process import UncertainProcess, owned_state, stop_owned, supervised_state
 from router.snapshot import cleanup, git, validate_repository
 
@@ -35,9 +36,43 @@ def required_text(payload: dict, key: str) -> str:
 def public(task: dict, store: Store | None = None) -> dict:
     result = {key: value for key, value in task.items() if key not in {
         "session_id", "invocation", "feedback", "permission_profile", "setup_command", "cleanup_requested"}}
+    history = store.history(task["task_id"]) if store is not None else []
+    result.update(visibility(task, history))
     if store is not None:
-        result["attempt_history"] = store.history(task["task_id"])
+        result["attempt_history"] = history
     return result
+
+
+def visibility(task: dict, history: list[dict]) -> dict:
+    model = task.get("resolved_model")
+    attempts = {attempt["attempt_number"]: attempt for attempt in history if "attempt_number" in attempt}
+    current = dict(task)
+    if task["status"] in {"preparing", "running", "cancelling"} and "attempt_started_at" in task:
+        current["duration_ms"] = max(0, now_ms() - task["attempt_started_at"])
+    if "attempt_number" in task:
+        attempts[task["attempt_number"]] = current
+    frames = list(attempts.values()) or [current]
+    cost = sum(frame["cost"] for frame in frames) if all("cost" in frame for frame in frames) else None
+    elapsed = sum(frame.get("duration_ms", 0) for frame in frames) if any("duration_ms" in frame for frame in frames) else None
+    usage = {}
+    def add_usage(destination, source):
+        for key, value in source.items():
+            if isinstance(value, dict):
+                add_usage(destination.setdefault(key, {}), value)
+            elif isinstance(value, (int, float)):
+                destination[key] = destination.get(key, 0) + value
+    for frame in frames:
+        add_usage(usage, frame.get("usage", {}))
+    return {"owner": "router", "control_mode": "control", "parent_session_id": task["session_id"],
+            "parent_agent_id": task.get("parent_agent_id"), "task": task["invocation"]["task"], "cwd": task["invocation"]["parent_worktree"],
+            "started_at": task.get("attempt_started_at"),
+            "elapsed_ms": elapsed,
+            "models": [model] if model else [], "model_source": "configured" if model else None,
+            "cost": cost, "cost_source": "executor_reported" if cost is not None else "unavailable",
+            "cost_note": "Task-total executor estimate, not billed spend" if cost is not None else "Cost unavailable for one or more attempts",
+            "price_date": None, "price_source": None, "price_overrides_used": [], "price_sources": {},
+            "usage": usage or None, "usage_source": "executor_reported" if usage else "unavailable",
+            "activity": task.get("phase"), "visibility_reason": None, "runtime_partial": False}
 
 
 class Controller:
@@ -51,6 +86,7 @@ class Controller:
             raise ValueError("Router state must be outside every configured parent worktree")
         self.directory.mkdir(parents=True, exist_ok=True, mode=0o700)
         self.store = Store(self.directory / "router.sqlite3")
+        self.native = NativeObserver(self.store, settings.model_prices)
         self.changed = threading.Event()
 
     def handle(self, operation: str, payload: dict) -> dict | list:
@@ -62,8 +98,12 @@ class Controller:
             return self.authorize(payload)
         if operation == "status":
             return self.status(payload)
+        if operation == "observe":
+            return self.native.observe(payload)
         if operation not in MUTATIONS:
             raise ValueError("Unknown operation")
+        if str(payload.get("task_id", "")).startswith("native-"):
+            raise ValueError("Native agent is host-managed; Router cannot control it")
         result = self.mutate(operation, payload)
         self.changed.set()
         return public(result, self.store)
@@ -106,7 +146,11 @@ class Controller:
                 if tuple(previous) != (operation, encoded):
                     raise ValueError("request_id was already authorized with another payload")
             else:
-                db.execute("INSERT INTO authorizations(session_id,request_id,operation,payload,instruction_id) VALUES(?,?,?,?,?)", (session, request_id, operation, encoded, row[0]))
+                actor = payload.get("parent_agent_id")
+                if actor is not None:
+                    actor = required_text(payload, "parent_agent_id")
+                db.execute("INSERT INTO authorizations(session_id,request_id,operation,payload,instruction_id,parent_agent_id) VALUES(?,?,?,?,?,?)",
+                           (session, request_id, operation, encoded, row[0], actor))
         return {"authorized": True, "request_id": request_id}
 
     def mutate(self, operation: str, payload: dict) -> dict:
@@ -140,6 +184,7 @@ class Controller:
                 if current is None or current[0] != payload["instruction_id"]:
                     raise ValueError("Submission has been superseded")
                 task = {"task_id": "task-" + uuid.uuid4().hex, "session_id": session,
+                        "parent_agent_id": authorization["parent_agent_id"],
                         "instruction_id": payload["instruction_id"], "invocation": payload,
                         "status": "created", "attempts": 0, "review_retries": 0, "continuations": 0,
                         "executor": payload["executor"], "requested_model": payload["model"],
@@ -224,9 +269,14 @@ class Controller:
                     cleanup_pending=not keep, cleanup_requested=not keep)
 
     def status(self, payload: dict) -> dict | list:
-        if set(payload) - {"task_id", "filter"}:
+        if set(payload) - {"task_id", "filter", "native_offset"}:
             raise ValueError("Unknown status field")
+        offset = payload.get("native_offset", 0)
+        if not isinstance(offset, int) or isinstance(offset, bool) or offset < 0:
+            raise ValueError("native_offset must be a nonnegative integer")
         if payload.get("task_id"):
+            if str(payload["task_id"]).startswith("native-"):
+                return self.native.status(payload["task_id"])
             return public(self.store.get(payload["task_id"]), self.store)
         if payload.get("filter") not in {None, "needs_decision"}:
             raise ValueError("Unknown status filter")
@@ -235,8 +285,15 @@ class Controller:
             tasks = [task for task in tasks if task["status"] in DECISIONS or
                      (task["status"] == "awaiting_review" and task["attempts"] >= self.settings.max_attempts)]
         keys = {"task_id", "status", "attempts", "review_retries", "continuations", "last_event_at",
-                "executor", "requested_model", "resolved_model", "failure_reason", "execution_outcome", "max_attempts"}
-        return [{key: value for key, value in task.items() if key in keys} for task in tasks]
+                "executor", "requested_model", "resolved_model", "failure_reason", "execution_outcome", "max_attempts", "worktree"}
+        rows = []
+        for task in tasks:
+            row = {key: value for key, value in task.items() if key in keys}
+            row.update(visibility(task, self.store.history(task["task_id"])))
+            rows.append(row)
+        if payload.get("filter") is None:
+            rows.extend(self.native.status(offset=offset))
+        return rows
 
 
 class PhaseStopped(RuntimeError):
@@ -254,6 +311,8 @@ class Runtime:
         self.stopping = threading.Event()
 
     def start(self) -> None:
+        # In serve(), the single-instance daemon lock is already held here.
+        self.control.native.reconcile_restart()
         for task in self.store.all():
             if task["status"] != "closed" and task["max_attempts"] != self.control.settings.max_attempts:
                 self.store.update(task["task_id"], lambda t: t.update(max_attempts=self.control.settings.max_attempts))
@@ -428,7 +487,8 @@ class Runtime:
                 if event.get("type") == "error":
                     current["execution_error"] = True
                 if event.get("type") == "step_finish":
-                    current["cost"] = current.get("cost", 0) + float(part.get("cost", 0))
+                    if isinstance(part.get("cost"), (int, float)):
+                        current["cost"] = current.get("cost", 0) + float(part["cost"])
                     usage = current.setdefault("usage", {})
                     for key, value in part.get("tokens", {}).items():
                         if isinstance(value, (int, float)):

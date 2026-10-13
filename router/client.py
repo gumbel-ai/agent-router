@@ -8,9 +8,9 @@ from router.config import socket_path
 from router.dispatch import canonical
 
 
-def request(operation: str, payload: dict, endpoint: Path | None = None) -> dict | list:
+def request(operation: str, payload: dict, endpoint: Path | None = None, *, timeout: float = 15) -> dict | list:
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
-        client.settimeout(15)
+        client.settimeout(timeout)
         try:
             client.connect(str(endpoint or socket_path()))
         except OSError as error:

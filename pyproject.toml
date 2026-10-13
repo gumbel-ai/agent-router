@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=77"]
+requires = ["setuptools>=77.0.3"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -7,11 +7,14 @@ name = "agent-router"
 version = "0.1.0"
 description = "Local, parent-supervised delegation between coding agent CLIs"
 readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
 requires-python = ">=3.14"
 dependencies = ["pydantic-settings>=2.10,<3"]
 
 [project.scripts]
 router = "router.cli:main"
+router-observe = "router.observer_hook:main"
 
 [tool.setuptools.packages.find]
 include = ["router*"]

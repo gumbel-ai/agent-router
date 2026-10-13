@@ -5,6 +5,8 @@ description: Delegate an explicitly requested task to an operator-configured Ope
 
 # Agent Router
 
+Monitoring shows every open Router task and up to 100 native observations per page; use `router status --native-offset 100` for the next native page or look up a native ID directly for its full retained record. Compact lists omit full transcript paths, summaries, pricing-source maps and file lists; detail includes the latest 64 reported file paths, not proof of every edit. Router cost/usage/time totals include recorded attempts and exclude parent review waits. Pending or skipped transcript data is explicit and cannot produce a complete token-based cost.
+
 Delegate only when the user requests it. Do not replace a requested executor or model. The MVP supports OpenCode; unsupported targets fail without fallback. Semantic intent checking is your responsibility, not the router's.
 
 The UserPromptSubmit hook supplies `ROUTER_INSTRUCTION_ID`. Use that ID for every delegation from this submission. If it is absent, do not invent it. Check that the operator has started the daemon and configured the repository, model alias, setup command, and explicit allow/deny permissions in `opencode.json`.
@@ -23,6 +25,8 @@ Use single quotes around the JSON. For an apostrophe inside it, use the canonica
 Start requires `request_version: "1"`, `request_id`, `instruction_id`, `executor: "opencode"`, the configured `model` alias, `task`, absolute `parent_repo` and `parent_worktree` root paths, and `mode: "write"`. Optional `context` contains arrays `relevant_paths` and `constraints`. The returned task ID means registration, not completion.
 
 Inspect a task with `router status <task_id> --json`. Use `router status --filter needs_decision --json` when you need to act. Do not watch by repeatedly polling from model turns; a person can run `router status --watch` without consuming model context.
+
+The status view includes native Claude subagents as `control_mode: "observe"` alongside Router-launched children as `control_mode: "control"`. Native agents remain Claude-managed: never review, cancel, or close their `native-` IDs through Router. A native `stopped` observation is not evidence of successful work; stale or missing lifecycle evidence is `unknown`. Quiet agents are not assumed dead. Task descriptions and activity are summaries, not complete transcripts or proof of file ownership. Model and usage data come from host results and native transcripts; costs are explicitly labelled API-equivalent estimates, not subscription charges or invoices. Unknown rates or token details stay unknown. Additional hosts must preserve the same rule: native subagents for observation, Router-launched children for lifecycle control.
 
 When `awaiting_review`, inspect the recorded patch, child files, and test/output artifacts. Review JSON contains `task_id`, `request_id`, `expected_attempt` (the current `attempts` count), and `outcome: "accepted"` or `"rejected"`. Rejection also requires actionable `feedback`; one correction uses the same worktree, session, and resolved model. Limits cannot be changed through task inputs. Process completion does not establish code quality.
 

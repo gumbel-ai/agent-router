@@ -7,6 +7,8 @@ from dotenv import dotenv_values
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from router.pricing import PriceTier
+
 
 def path_setting(name: str, fallback: str) -> Path:
     value = os.environ.get(name)
@@ -33,6 +35,16 @@ class Settings(BaseSettings):
     opencode_command: list[str] = Field(min_length=1, validation_alias="AGENT_ROUTER_OPENCODE_COMMAND")
     models: dict[str, str] = Field(min_length=1, validation_alias="AGENT_ROUTER_MODELS")
     repositories: dict[str, dict[str, str]] = Field(min_length=1, validation_alias="AGENT_ROUTER_REPOSITORIES")
+    model_prices: dict[str, list[PriceTier]] = Field(default_factory=dict, validation_alias="AGENT_ROUTER_MODEL_PRICES")
+
+    @field_validator("model_prices")
+    @classmethod
+    def ordered_price_tiers(cls, value: dict[str, list[PriceTier]]) -> dict[str, list[PriceTier]]:
+        for model, tiers in value.items():
+            thresholds = [tier.above_input_tokens for tier in tiers]
+            if not model.strip() or not thresholds or thresholds[0] != 0 or thresholds != sorted(set(thresholds)):
+                raise ValueError("Each exact model price needs ascending tiers beginning at zero")
+        return value
 
     @field_validator("models")
     @classmethod

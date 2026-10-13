@@ -18,6 +18,9 @@ class ConfigTests(unittest.TestCase):
                  "AGENT_ROUTER_REPOSITORIES": {"/tmp/project": {"setup_command": "true"}}}
         cases = [{key: value for key, value in valid.items() if key != missing} for missing in valid]
         cases += [{**valid, "AGENT_ROUTER_CONCURRENCY_CAP": 0}, {**valid, "AGENT_ROUTER_ATTEMPT_TIMEOUT_SECONDS": float("inf")}]
+        cases += [{**valid, "AGENT_ROUTER_MODEL_PRICES": {"m": []}},
+                  {**valid, "AGENT_ROUTER_MODEL_PRICES": {"m": [{"input": float("nan"), "output": 1,
+                      "cache_read": 0, "cache_write_5m": 1, "cache_write_1h": 1}]}}]
         def check(values):
             with self.assertRaises(ValidationError):
                 Settings(**values)
