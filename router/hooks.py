@@ -5,16 +5,20 @@ import re
 import sys
 
 from router.client import request
-from router.db import now_ms
 from router.dispatch import MUTATIONS, literal_payload
-from router.native import text
+from router.paths import configuration, delegation_target
 
 
 def submit(event: dict) -> dict:
+    values, _ = configuration()
+    if not delegation_target(event.get("cwd"), values.get("AGENT_ROUTER_REPOSITORIES", {})):
+        return {}
     if not event.get("session_id") or not event.get("prompt_id"):
         raise ValueError("Host submission lacks session_id/prompt_id; this host version is unsupported")
     result = request("submit", {"session_id": event["session_id"], "prompt_id": event["prompt_id"],
-                                "parent_cli": "claude"})
+                                "parent_cli": "claude", "cwd": event["cwd"]})
+    if not result.get("instruction_id"):
+        return {}
     return {"hookSpecificOutput": {"hookEventName": "UserPromptSubmit",
                                    "additionalContext": "ROUTER_INSTRUCTION_ID=" + result["instruction_id"]}}
 
@@ -40,6 +44,8 @@ def authorize(event: dict) -> dict:
 
 def observe(event: dict) -> dict:
     """Forward metadata only; observation failure must not block native work."""
+    from router.db import now_ms
+    from router.native import text
     name = event.get("hook_event_name")
     tool = event.get("tool_name")
     inputs = event.get("tool_input") or {}
@@ -93,8 +99,8 @@ def main() -> None:
             return
         if sys.argv[1] == "submit":
             # An unavailable router must not block unrelated conversation.
-            print(json.dumps({"hookSpecificOutput": {"hookEventName": "UserPromptSubmit",
-                "additionalContext": f"Agent Router delegation unavailable: {error}. Do not delegate until resolved."}}))
+            print(f"Agent Router delegation unavailable: {error}", file=sys.stderr)
+            print("{}")
             return
         print(f"Agent Router hook: {error}", file=sys.stderr)
         sys.exit(2)

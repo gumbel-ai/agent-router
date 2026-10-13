@@ -88,6 +88,12 @@ class Controller:
         self.store = Store(self.directory / "router.sqlite3")
         self.native = NativeObserver(self.store, settings.model_prices)
         self.changed = threading.Event()
+        self.lifecycle_lock = threading.Lock()
+        self.draining = False
+
+    def busy(self) -> int:
+        return sum(task["status"] in ACTIVE or not task["execution_stopped"] or task.get("cleanup_pending", False)
+                   for task in self.store.all())
 
     def handle(self, operation: str, payload: dict) -> dict | list:
         if not isinstance(payload, dict):
@@ -98,17 +104,31 @@ class Controller:
             return self.authorize(payload)
         if operation == "status":
             return self.status(payload)
+        if operation == "health":
+            from importlib.metadata import version
+            return {"version": version("agent-router"), "state_dir": str(self.directory),
+                    "delegation_enabled": self.settings.delegation_enabled,
+                    "active_tasks": self.busy()}
         if operation == "observe":
             return self.native.observe(payload)
         if operation not in MUTATIONS:
             raise ValueError("Unknown operation")
         if str(payload.get("task_id", "")).startswith("native-"):
             raise ValueError("Native agent is host-managed; Router cannot control it")
-        result = self.mutate(operation, payload)
+        if not self.settings.delegation_enabled and (operation == "start" or
+                operation == "review" and payload.get("outcome") in {"rejected", "continue"}):
+            raise ValueError("External delegation is not configured; run router init in the project")
+        with self.lifecycle_lock:
+            if self.draining:
+                raise ValueError("Router is stopping for maintenance; retry after it restarts")
+            result = self.mutate(operation, payload)
         self.changed.set()
         return public(result, self.store)
 
     def submit(self, payload: dict) -> dict:
+        from router.paths import delegation_target
+        if "cwd" in payload and (not self.settings.delegation_enabled or not delegation_target(payload["cwd"], self.settings.repositories)):
+            return {"instruction_id": None}
         session = required_text(payload, "session_id")
         prompt = required_text(payload, "prompt_id")
         with self.store.transaction() as db:
@@ -314,7 +334,7 @@ class Runtime:
         # In serve(), the single-instance daemon lock is already held here.
         self.control.native.reconcile_restart()
         for task in self.store.all():
-            if task["status"] != "closed" and task["max_attempts"] != self.control.settings.max_attempts:
+            if self.control.settings.max_attempts is not None and task["status"] != "closed" and task["max_attempts"] != self.control.settings.max_attempts:
                 self.store.update(task["task_id"], lambda t: t.update(max_attempts=self.control.settings.max_attempts))
             if task["status"] in {"validating", "preparing", "running", "cancelling"}:
                 record = task.get("process")
@@ -346,7 +366,8 @@ class Runtime:
                 with self.lock:
                     occupied = set(self.workers) | reserved
                     eligible = task["task_id"] not in self.workers and (
-                        task["status"] == "cancelling" or len(occupied) < self.control.settings.concurrency_cap)
+                        task["status"] == "cancelling" or task["status"] == "closed" and task.get("cleanup_requested") or
+                        len(occupied) < (self.control.settings.concurrency_cap or 0))
                 if not eligible:
                     continue
                 if task["status"] in {"created", "retrying", "cancelling"}:
@@ -691,6 +712,12 @@ class Handler(socketserver.StreamRequestHandler):
             message = json.loads(line)
             operation, payload = message["operation"], message["payload"]
             if operation == "daemon_stop":
+                if not isinstance(payload, dict) or set(payload) - {"only_if_idle"}:
+                    raise ValueError("Invalid daemon stop options")
+                with self.server.control.lifecycle_lock:
+                    if payload.get("only_if_idle") and self.server.control.busy():
+                        raise ValueError("Finish or explicitly cancel active Router tasks before maintenance")
+                    self.server.control.draining = True
                 result = {"stopping": True}
                 threading.Thread(target=self.server.shutdown, daemon=True).start()
             else:

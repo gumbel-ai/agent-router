@@ -90,6 +90,9 @@ class TransportTests(TransportHarness, unittest.TestCase):
     def test_restart_does_not_relaunch_live_child(self):
         task_id = self.start("hang")
         running = self.wait(task_id, {"running"})
+        with self.assertRaisesRegex(ValueError, "active Router tasks"):
+            request("daemon_stop", {"only_if_idle": True}, self.endpoint)
+        self.assertEqual(request("status", {"task_id": task_id}, self.endpoint)["status"], "running")
         while not (Path(running["worktree"]) / "session.json").exists():
             time.sleep(0.04)
         self.daemons[-1].kill()

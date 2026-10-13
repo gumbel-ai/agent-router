@@ -9,6 +9,8 @@ Monitoring shows every open Router task and up to 100 native observations per pa
 
 Delegate only when the user requests it. Do not replace a requested executor or model. The MVP supports OpenCode; unsupported targets fail without fallback. Semantic intent checking is your responsibility, not the router's.
 
+The globally installed plugin observes native Claude work without per-project setup. External delegation requires the operator to run `router init` in that project, approving its exact model, setup command, permissions, and limits. Use `router setup` for the managed macOS service, or explicit `router daemon start` for manual operation. Hooks never start the daemon or install dependencies. Never run setup, init, or uninstall on the user's behalf without explicit permission.
+
 The UserPromptSubmit hook supplies `ROUTER_INSTRUCTION_ID`. Use that ID for every delegation from this submission. If it is absent, do not invent it. Check that the operator has started the daemon and configured the repository, model alias, setup command, and explicit allow/deny permissions in `opencode.json`.
 
 Call each mutating operation as one standalone shell command in canonical literal form:
