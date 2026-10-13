@@ -9,6 +9,7 @@ from pathlib import Path
 from test_control import settings
 
 from router.child import launch
+from router.cli import table
 from router.daemon import Controller, Runtime
 from router.process import UncertainProcess, owned_state, stop_owned
 from router.snapshot import apply_delta, git
@@ -40,9 +41,9 @@ class RuntimeHarness:
         self.control.handle("authorize", {"session_id": "S", "prompt_id": "P", "operation": operation, "invocation": payload})
         return self.control.handle(operation, payload)
 
-    def start(self, prompt="flood", request="R"):
+    def start(self, prompt="flood", request="R", executor="opencode"):
         return self.mutate("start", {"request_version": "1", "request_id": request, "instruction_id": self.instruction,
-                                     "executor": "opencode", "model": "test", "task": prompt,
+                                     "executor": executor, "model": "test", "task": prompt,
                                      "parent_repo": str(self.repo), "parent_worktree": str(self.repo), "mode": "write"})["task_id"]
 
     def wait(self, task_id, states, seconds=15):
@@ -55,6 +56,136 @@ class RuntimeHarness:
         self.fail(f"Task did not reach {states}: {task}")
 
 class RuntimeTests(RuntimeHarness, unittest.TestCase):
+    def enable_codex(self, model="openai/gpt-5.3-codex"):
+        self.config.codex_command = self.config.opencode_command
+        self.config.models["test"] = model
+        self.config.repositories[str(self.repo.resolve())]["codex_sandbox"] = "workspace-write"
+        (self.repo / "opencode.json").unlink()
+
+    def test_codex_resume_telemetry_and_integration_without_opencode_permissions(self):
+        self.enable_codex()
+        task_id = self.start("codex", executor="codex")
+        first = self.wait(task_id, {"awaiting_review", "failed", "interrupted"})
+        self.assertEqual(first["status"], "awaiting_review", first)
+        self.assertEqual(first["child_session_id"], "12345678-1234-4321-8765-123456789abc")
+        self.assertEqual(first["usage"]["input_tokens"], 100)
+        self.assertEqual(first["usage"]["cached_input_tokens"], 40)
+        self.assertTrue(first["usage_complete"])
+        self.assertAlmostEqual(first["cost"], (60 * 1.75 + 40 * .175 + 20 * 14) / 1_000_000)
+        self.assertEqual(first["cost_source"], "token_estimate")
+        self.assertIn("excludes", first["cost_note"])
+        self.assertEqual(first["model_source"], "configured")
+        self.assertFalse((self.repo / "result.txt").exists())
+        self.mutate("review", {"task_id": task_id, "request_id": "codex-reject", "expected_attempt": 1,
+                               "outcome": "rejected", "feedback": "Correct the result"})
+        second = self.wait(task_id, {"awaiting_review", "failed", "interrupted"})
+        self.assertEqual(second["status"], "awaiting_review", second)
+        self.assertEqual(second["usage"]["input_tokens"], 250)
+        self.assertEqual(second["attempt_history"][1]["usage"]["input_tokens"], 150)
+        self.assertAlmostEqual(second["cost"], first["cost"] * 2.5)
+        commands = json.loads((Path(second["worktree"]) / "session.json").read_text())["commands"]
+        self.assertNotIn("resume", commands[0])
+        self.assertIn("resume", commands[1])
+        self.assertIn(first["child_session_id"], commands[1])
+        for command in commands:
+            self.assertIn('approval_policy="never"', command)
+            self.assertIn('sandbox_mode="workspace-write"', command)
+            self.assertNotIn("--dangerously-bypass-approvals-and-sandbox", command)
+            self.assertIn("--ignore-rules", command)
+        self.mutate("review", {"task_id": task_id, "request_id": "codex-accept", "expected_attempt": 2, "outcome": "accepted"})
+        apply_delta(self.repo, Path(second["patch"]))
+        self.assertEqual((self.repo / "result.txt").read_text(), "corrected\n")
+        self.mutate("close", {"task_id": task_id, "request_id": "codex-close", "disposition": "integrated"})
+        end = time.monotonic() + 5
+        while time.monotonic() < end and self.control.handle("status", {"task_id": task_id})["cleanup_pending"]:
+            time.sleep(.03)
+        self.assertFalse(Path(second["worktree"]).exists())
+
+    def test_codex_correction_requires_fresh_matching_thread_evidence(self):
+        self.enable_codex()
+        task_id = self.start("codex", executor="codex")
+        first = self.wait(task_id, {"awaiting_review", "failed"})
+        self.assertEqual(first["status"], "awaiting_review", first)
+        self.mutate("review", {"task_id": task_id, "request_id": "no-thread", "expected_attempt": 1,
+                               "outcome": "rejected", "feedback": "no thread"})
+        second = self.wait(task_id, {"awaiting_review", "failed"})
+        self.assertEqual(second["status"], "failed", second)
+
+    def test_codex_missing_pricing_or_usage_stays_unknown(self):
+        self.enable_codex("openai/unknown-model")
+        task_id = self.start("full usage", executor="codex")
+        task = self.wait(task_id, {"awaiting_review", "failed", "interrupted"})
+        self.assertEqual(task["status"], "awaiting_review", task)
+        self.assertIsNone(task["cost"])
+        self.assertTrue(task["usage_complete"])
+        self.assertIn("price unavailable", task["cost_note"])
+        self.config.models["test"] = "openai/gpt-5.3-codex"
+        partial_id = self.start("partial usage", "partial", executor="codex")
+        task = self.wait(partial_id, {"awaiting_review", "failed", "interrupted"})
+        self.assertEqual(task["status"], "awaiting_review", task)
+        self.assertIsNone(task["cost"])
+        self.assertEqual(task["usage"]["input_tokens"], 100)
+        self.assertNotIn("cached_input_tokens", task["usage"])
+        self.assertFalse(task["usage_complete"])
+        self.assertEqual(task["cost_source"], "unavailable")
+        self.assertIn("tokens (partial):", table([task]))
+
+    def test_codex_unapproved_sandbox_and_provider_never_launch(self):
+        self.enable_codex()
+        self.config.repositories[str(self.repo.resolve())].pop("codex_sandbox")
+        task_id = self.start("must not launch", executor="codex")
+        failed = self.wait(task_id, {"failed", "awaiting_review"})
+        self.assertEqual(failed["status"], "failed", failed)
+        self.assertNotIn("worktree", failed)
+        self.assertEqual(failed["attempts"], 0)
+        self.config.repositories[str(self.repo.resolve())]["codex_sandbox"] = "workspace-write"
+        self.config.models["test"] = "other/model"
+        other = self.start("must not launch", "bad-provider", executor="codex")
+        failed = self.wait(other, {"failed", "awaiting_review"})
+        self.assertEqual(failed["status"], "failed", failed)
+        self.assertNotIn("worktree", failed)
+
+    def test_codex_terminal_evidence_required_and_cancel_stops_descendants(self):
+        self.enable_codex()
+        task_id = self.start("no completion", executor="codex")
+        failed = self.wait(task_id, {"awaiting_review", "failed", "interrupted"})
+        self.assertEqual(failed["status"], "failed", failed)
+        self.assertIsNone(failed["cost"])
+        error_id = self.start("final error", "codex-error", executor="codex")
+        self.assertEqual(self.wait(error_id, {"failed", "awaiting_review"})["status"], "failed")
+        hanging = self.start("hang", "codex-hang", executor="codex")
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            ready = self.control.handle("status", {"task_id": hanging})
+            if ready.get("child_session_id"):
+                break
+            time.sleep(.03)
+        self.assertTrue(ready.get("child_session_id"))
+        self.mutate("cancel", {"task_id": hanging, "request_id": "codex-cancel"})
+        cancelled = self.wait(hanging, {"cancelled", "interrupted"})
+        self.assertEqual(cancelled["status"], "cancelled", cancelled)
+        self.assertTrue(cancelled["execution_stopped"])
+
+    def test_codex_forced_stop_cannot_claim_command_shutdown_or_be_closed(self):
+        self.enable_codex()
+        task_id = self.start("ignore interrupt hang", executor="codex")
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            task = self.control.handle("status", {"task_id": task_id})
+            if task.get("worktree") and (Path(task["worktree"]) / "interrupt-ready").exists():
+                break
+            time.sleep(.03)
+        self.assertTrue((Path(task["worktree"]) / "interrupt-ready").exists())
+        self.mutate("cancel", {"task_id": task_id, "request_id": "forced-cancel"})
+        stopped = self.wait(task_id, {"cancelled", "interrupted"})
+        self.assertEqual(stopped["status"], "interrupted", stopped)
+        self.assertFalse(stopped["execution_stopped"])
+        self.assertTrue(stopped["shutdown_unconfirmed"])
+        self.mutate("cancel", {"task_id": task_id, "request_id": "cannot-confirm"})
+        self.assertEqual(self.wait(task_id, {"cancelled", "interrupted"})["status"], "interrupted")
+        with self.assertRaisesRegex(ValueError, "uncertain"):
+            self.mutate("close", {"task_id": task_id, "request_id": "unsafe-close", "disposition": "discarded"})
+
     def test_full_cycle_same_session_and_cleanup(self):
         (self.repo / "tracked.txt").write_text("dirty parent\n")
         task_id = self.start()

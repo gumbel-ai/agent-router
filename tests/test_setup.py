@@ -61,6 +61,24 @@ class SetupTests(unittest.TestCase):
                 initialize(repo, "small=other/model", "true", None, 3, 600, 3)
         self.assertEqual((repo / "opencode.json").read_text(), original)
 
+    def test_codex_opt_in_needs_no_opencode_and_preserves_both_executors(self):
+        repo = self.repository("codex")
+        with patch("router.setup.shutil.which", side_effect=lambda name: "/usr/bin/" + name), patch("router.setup.refresh_service"):
+            initialize(repo, "codex=openai/gpt-5.3-codex", "true", None, 3, 600, 3,
+                       executor="codex", sandbox="workspace-write")
+            config, _ = load_settings()
+            self.assertTrue(config.delegation_enabled)
+            self.assertIsNone(config.opencode_command)
+            self.assertEqual(config.codex_command, ["/usr/bin/codex"])
+            self.assertFalse((repo / "opencode.json").exists())
+            self.assertEqual(config.repositories[str(repo.resolve())]["codex_sandbox"], "workspace-write")
+            initialize(repo, "open=provider/exact", "true", {"*": "deny"}, 3, 600, 3)
+            config, _ = load_settings()
+            self.assertEqual(config.repositories[str(repo.resolve())]["codex_sandbox"], "workspace-write")
+            self.assertEqual(set(config.models), {"codex", "open"})
+            self.assertIsNotNone(config.opencode_command)
+
+
     def test_launch_agent_uses_explicit_runtime_and_shared_private_state(self):
         interpreter = self.root / "managed" / "bin" / "python"
         interpreter.parent.mkdir(parents=True)

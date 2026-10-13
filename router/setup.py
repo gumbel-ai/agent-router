@@ -81,7 +81,7 @@ def setup(yes: bool = False, marketplace: str = MARKETPLACE) -> None:
     private_write(runtime_pointer(), str(Path(sys.executable).absolute()) + "\n")
     result = start(restart=bool(current))
     print(f"Agent Router ready ({result['version']}). Run ordinary claude in any project, and router status --watch in a terminal.")
-    print("OpenCode delegation is opt-in: run router init in each target project. Restart existing Claude sessions to load the plugin.")
+    print("External delegation is opt-in: run router init in each target project. Restart existing Claude sessions to load the plugin.")
 
 
 def permissions(value: object) -> bool:
@@ -89,7 +89,7 @@ def permissions(value: object) -> bool:
 
 
 def initialize(repo: Path, model: str, setup_command: str, permission: dict | None,
-               concurrency: int, timeout: float, attempts: int) -> None:
+               concurrency: int, timeout: float, attempts: int, *, executor: str = "opencode", sandbox: str | None = None) -> None:
     repo = Path(git(repo, "rev-parse", "--show-toplevel").strip()).resolve()
     validate_repository(repo)
     if not setup_command.strip() or "=" not in model:
@@ -97,16 +97,24 @@ def initialize(repo: Path, model: str, setup_command: str, permission: dict | No
     alias, exact = model.split("=", 1)
     if not alias.strip() or "/" not in exact or not exact.strip():
         raise ValueError("Model must be alias=provider/exact-model, without substitution")
-    executable = shutil.which("opencode")
+    if executor not in {"opencode", "codex"}:
+        raise ValueError("Unsupported executor; no fallback")
+    if executor == "codex" and (not exact.startswith("openai/") or not exact.removeprefix("openai/").strip()):
+        raise ValueError("Codex requires an exact openai/model ID; custom providers are unsupported")
+    if executor == "codex" and (sandbox not in {"read-only", "workspace-write"} or permission is not None):
+        raise ValueError("Codex requires an explicit read-only/workspace-write sandbox, not OpenCode permissions")
+    if executor == "opencode" and sandbox is not None:
+        raise ValueError("--sandbox is for Codex; OpenCode uses explicit permissions")
+    executable = shutil.which(executor)
     if not executable:
-        raise ValueError("Install OpenCode and configure its provider access before enabling delegation")
+        raise ValueError(f"Install {executor} and configure its provider access before enabling delegation")
     existing = repo / "opencode.json"
-    if existing.exists():
+    if executor == "opencode" and existing.exists():
         current = json.loads(existing.read_text()).get("permission")
         if permission is not None and permission != current:
             raise ValueError("Refusing to overwrite existing opencode.json permissions; edit and approve them explicitly")
         permission = current
-    if not isinstance(permission, dict) or not permissions(permission):
+    if executor == "opencode" and (not isinstance(permission, dict) or not permissions(permission)):
         raise ValueError("Supply an explicit nonempty allow/deny permission object; ask is unsupported")
     current_daemon = require_idle()
     if current_daemon:
@@ -130,21 +138,25 @@ def initialize(repo: Path, model: str, setup_command: str, permission: dict | No
             raise ValueError("Model alias already identifies another exact model in config.json; choose a new alias")
         values.update(AGENT_ROUTER_CONCURRENCY_CAP=concurrency, AGENT_ROUTER_ATTEMPT_TIMEOUT_SECONDS=timeout,
                       AGENT_ROUTER_MAX_ATTEMPTS=attempts)
-        values.setdefault("AGENT_ROUTER_OPENCODE_COMMAND", [executable])
+        command_key = "AGENT_ROUTER_" + executor.upper() + "_COMMAND"
+        values.setdefault(command_key, [executable])
         values.setdefault("AGENT_ROUTER_MODELS", {})[alias] = exact
-        values.setdefault("AGENT_ROUTER_REPOSITORIES", {})[str(repo)] = {"setup_command": setup_command}
+        target = {**values.get("AGENT_ROUTER_REPOSITORIES", {}).get(str(repo), {}), "setup_command": setup_command}
+        if executor == "codex":
+            target["codex_sandbox"] = sandbox
+        values.setdefault("AGENT_ROUTER_REPOSITORIES", {})[str(repo)] = target
         effective, _ = load_settings(values)
         for key, actual in (("AGENT_ROUTER_CONCURRENCY_CAP", effective.concurrency_cap),
                             ("AGENT_ROUTER_ATTEMPT_TIMEOUT_SECONDS", effective.attempt_timeout_seconds),
                             ("AGENT_ROUTER_MAX_ATTEMPTS", effective.max_attempts)):
             if actual != values[key]:
                 raise ValueError(f"{key} overrides this choice; update or unset it before router init")
-        if effective.models.get(alias) != exact or effective.repositories.get(str(repo)) != {"setup_command": setup_command}:
+        if effective.models.get(alias) != exact or effective.repositories.get(str(repo)) != target:
             raise ValueError("Environment configuration overrides this model or repository setup; update or unset it before router init")
-        expected, actual = values["AGENT_ROUTER_OPENCODE_COMMAND"], effective.opencode_command
+        expected, actual = values[command_key], getattr(effective, executor + "_command")
         if expected[1:] != actual[1:] or (shutil.which(expected[0]) or expected[0]) != (shutil.which(actual[0]) or actual[0]):
             raise ValueError("Environment configuration overrides the executor command; update or unset it before router init")
-        if not existing.exists():
+        if executor == "opencode" and not existing.exists():
             private_write(existing, json.dumps({"permission": permission}, indent=2) + "\n")
         private_write(directory / "config.json", json.dumps(values, indent=2) + "\n")
     try:
@@ -162,7 +174,12 @@ def init(args) -> None:
     setup_command = args.setup_command or input("Child dependency setup command (recorded, not run now): ").strip()
     repo = Path(git(Path.cwd(), "rev-parse", "--show-toplevel").strip())
     permission = json.loads(args.permissions) if args.permissions else None
-    if not (repo / "opencode.json").exists() and permission is None:
+    sandbox = args.sandbox
+    if args.executor == "codex" and sandbox is None:
+        if args.yes:
+            raise ValueError("Noninteractive Codex init requires --sandbox read-only or workspace-write")
+        sandbox = input("Codex sandbox (read-only or workspace-write): ").strip()
+    if args.executor == "opencode" and not (repo / "opencode.json").exists() and permission is None:
         if args.yes:
             raise ValueError("Noninteractive init requires --permissions or an existing explicit opencode.json")
         permission = json.loads(input('OpenCode permission object (explicit allow/deny JSON): '))
@@ -174,8 +191,8 @@ def init(args) -> None:
     cap = choice(args.concurrency, config.concurrency_cap, 3, "Global concurrency cap", int)
     timeout = choice(args.timeout, config.attempt_timeout_seconds, 600, "Per-attempt timeout seconds", float)
     attempts = choice(args.attempts, config.max_attempts, 3, "Maximum launches per task", int)
-    confirm(f"Enable OpenCode delegation for {repo} with {model}, setup {setup_command!r}, and limits {cap}/{timeout}s/{attempts}?", args.yes)
-    initialize(repo, model, setup_command, permission, cap, timeout, attempts)
+    confirm(f"Enable {args.executor} delegation for {repo} with {model}, permissions {sandbox or permission}, setup {setup_command!r}, and limits {cap}/{timeout}s/{attempts}?", args.yes)
+    initialize(repo, model, setup_command, permission, cap, timeout, attempts, executor=args.executor, sandbox=sandbox)
 
 
 def uninstall(yes: bool = False) -> None:

@@ -1,7 +1,7 @@
 {
   "name": "agent-router",
-  "version": "0.2.0",
-  "description": "Observe native Claude subagents and supervise OpenCode tasks in isolated Git worktrees",
+  "version": "0.3.0",
+  "description": "Observe native Claude subagents and supervise OpenCode or Codex tasks in isolated Git worktrees",
   "author": {"name": "gumbel-ai"},
   "homepage": "https://github.com/gumbel-ai/agent-router",
   "repository": "https://github.com/gumbel-ai/agent-router",

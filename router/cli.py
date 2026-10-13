@@ -34,7 +34,8 @@ def table(rows: list[dict]) -> str:
         if row.get("cwd"):
             lines.append(f"  directory: {text(row['cwd'])}")
         if row.get("usage") is not None:
-            lines.append(f"  tokens: {json.dumps(row['usage'], sort_keys=True)}")
+            partial = " (partial)" if row.get("usage_complete") is False or row.get("usage_partial") else ""
+            lines.append(f"  tokens{partial}: {json.dumps(row['usage'], sort_keys=True)}")
         if row.get("cost") is not None or row.get("cost_note"):
             lines.append(f"  cost source: {row.get('cost_source', 'unavailable')} | {row.get('cost_note', '')}")
         if row.get("last_event_at"):
@@ -69,7 +70,9 @@ def main() -> None:
     uninstall.add_argument("--yes", action="store_true")
     service = commands.add_parser("service", help="Manage the explicitly installed user service")
     service.add_argument("action", choices=["start", "stop", "restart", "status"])
-    init = commands.add_parser("init", help="Opt this Git project into OpenCode delegation")
+    init = commands.add_parser("init", help="Opt this Git project into external delegation")
+    init.add_argument("--executor", choices=["opencode", "codex"], default="opencode")
+    init.add_argument("--sandbox", choices=["read-only", "workspace-write"], help="Explicit Codex sandbox; required for noninteractive Codex init")
     init.add_argument("--model", help="alias=provider/exact-model")
     init.add_argument("--setup-command", help="Child dependency setup command; not run during init")
     init.add_argument("--permissions", help="Explicit allow/deny JSON; never overwrites existing permissions")

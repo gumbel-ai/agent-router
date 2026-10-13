@@ -13,12 +13,21 @@ import time
 import uuid
 from pathlib import Path
 
-from router.child import child_environment, launch, opencode_command
+from router.child import child_environment, executor_command, launch
+from router.codex import collect as collect_codex
+from router.codex import price_metadata
 from router.config import Settings
 from router.db import Store, now_ms
 from router.dispatch import MUTATIONS, canonical
 from router.native import NativeObserver
-from router.process import UncertainProcess, owned_state, stop_owned, supervised_state
+from router.process import (
+    UncertainProcess,
+    UnconfirmedShutdown,
+    owned_state,
+    stop_owned,
+    supervised_state,
+    verify_shutdown,
+)
 from router.snapshot import cleanup, git, validate_repository
 
 ACTIVE = {"created", "validating", "preparing", "running", "retrying", "cancelling"}
@@ -35,7 +44,8 @@ def required_text(payload: dict, key: str) -> str:
 
 def public(task: dict, store: Store | None = None) -> dict:
     result = {key: value for key, value in task.items() if key not in {
-        "session_id", "invocation", "feedback", "permission_profile", "setup_command", "cleanup_requested"}}
+        "session_id", "invocation", "feedback", "permission_profile", "setup_command", "cleanup_requested", "token_prices",
+        "codex_usage_baseline", "codex_usage_total", "codex_baseline_complete"}}
     history = store.history(task["task_id"]) if store is not None else []
     result.update(visibility(task, history))
     if store is not None:
@@ -52,7 +62,7 @@ def visibility(task: dict, history: list[dict]) -> dict:
     if "attempt_number" in task:
         attempts[task["attempt_number"]] = current
     frames = list(attempts.values()) or [current]
-    cost = sum(frame["cost"] for frame in frames) if all("cost" in frame for frame in frames) else None
+    cost = sum(frame["cost"] for frame in frames) if all(frame.get("cost") is not None for frame in frames) else None
     elapsed = sum(frame.get("duration_ms", 0) for frame in frames) if any("duration_ms" in frame for frame in frames) else None
     usage = {}
     def add_usage(destination, source):
@@ -68,11 +78,15 @@ def visibility(task: dict, history: list[dict]) -> dict:
             "started_at": task.get("attempt_started_at"),
             "elapsed_ms": elapsed,
             "models": [model] if model else [], "model_source": "configured" if model else None,
-            "cost": cost, "cost_source": "executor_reported" if cost is not None else "unavailable",
-            "cost_note": "Task-total executor estimate, not billed spend" if cost is not None else "Cost unavailable for one or more attempts",
-            "price_date": None, "price_source": None, "price_overrides_used": [], "price_sources": {},
+            "cost": cost, "cost_source": task.get("cost_source", "executor_reported") if cost is not None else "unavailable",
+            "cost_note": task.get("cost_note", "Task-total executor estimate, not billed spend") if cost is not None else
+                "Cost unavailable for one or more attempts" + (": " + task["cost_note"] if task.get("cost_note") else ""),
+            "price_date": task.get("price_date"), "price_source": task.get("price_source"),
+            "price_overrides_used": task.get("price_overrides_used", []), "price_sources": {},
             "usage": usage or None, "usage_source": "executor_reported" if usage else "unavailable",
-            "activity": task.get("phase"), "visibility_reason": None, "runtime_partial": False}
+            "usage_complete": all(frame.get("usage_complete", bool(frame.get("usage"))) for frame in frames),
+            "shutdown_unconfirmed": bool(task.get("shutdown_unconfirmed", False)),
+            "activity": task.get("executor_activity", task.get("phase")), "visibility_reason": None, "runtime_partial": False}
 
 
 class Controller:
@@ -342,7 +356,11 @@ class Runtime:
                                (owned_state(record) == "stopped" and Path(record["completion"]).exists())):
                     self.spawn(task, recovered=True)
                 elif task.get("cancel_requested") and (not record or owned_state(record) == "stopped"):
-                    self.store.update(task["task_id"], lambda t: t.update(status="cancelled", execution_stopped=True))
+                    if record and record.get("interrupt_first"):
+                        self.store.update(task["task_id"], lambda t: t.update(status="interrupted", execution_stopped=False,
+                            shutdown_unconfirmed=True, failure_reason="Codex shutdown evidence missing after restart; operator inspection required"))
+                    else:
+                        self.store.update(task["task_id"], lambda t: t.update(status="cancelled", execution_stopped=True))
                 else:
                     self.store.update(task["task_id"], lambda t: t.update(status="interrupted", execution_stopped=False,
                                                                          failure_reason="Restart could not establish execution outcome"))
@@ -385,8 +403,11 @@ class Runtime:
 
     def validate(self, task: dict) -> dict:
         invocation = task["invocation"]
-        if invocation["executor"] != "opencode":
-            raise ValueError("Only the OpenCode executor is supported; no fallback")
+        executor = invocation["executor"]
+        if executor not in {"opencode", "codex"}:
+            raise ValueError("Unsupported executor; no fallback")
+        if not getattr(self.control.settings, executor + "_command"):
+            raise ValueError(f"{executor} executor is not configured; no fallback")
         model = self.control.settings.models.get(invocation["model"])
         if model is None:
             raise ValueError("Unknown configured model alias; no fallback")
@@ -397,6 +418,12 @@ class Runtime:
         configured = self.control.settings.repositories.get(str(root))
         if configured is None or repo not in {root, common.parent}:
             raise ValueError("Repository/worktree is not an operator-configured target")
+        if executor == "codex":
+            sandbox = configured.get("codex_sandbox")
+            if sandbox not in {"read-only", "workspace-write"}:
+                raise ValueError("Project requires an explicit Codex sandbox; run router init --executor codex")
+            if not model.startswith("openai/") or not model.removeprefix("openai/").strip():
+                raise ValueError("Codex requires an exact openai/model ID; no provider fallback")
         credential_file = Path(self.control.environment.get("AGENT_ROUTER_ENV_FILE", "~/.agent-router/.env")).expanduser().resolve()
         if credential_file.is_relative_to(root):
             relative = str(credential_file.relative_to(root))
@@ -405,6 +432,10 @@ class Runtime:
             ignored = subprocess.run(["git", "-C", str(root), "check-ignore", "--quiet", "--", relative], check=False)
             if ignored.returncode != 0:
                 raise ValueError("The provider env file must be ignored when inside the repository")
+        if executor == "codex":
+            return {"executor": executor, "requested_model": invocation["model"], "resolved_model": model,
+                    "setup_command": configured["setup_command"], "permission_profile": {"sandbox": sandbox},
+                    **price_metadata(model, self.control.settings.model_prices)}
         permission_file = root / "opencode.json"
         try:
             permission = json.loads(permission_file.read_text())["permission"]
@@ -429,6 +460,7 @@ class Runtime:
             environment = child_environment(environment, task)
         process = None
         def register(record):
+            record["interrupt_first"] = name == "child" and task["executor"] == "codex"
             def persist(current):
                 if current.get("cancel_requested") and not collecting:
                     raise PhaseStopped("cancelled")
@@ -458,6 +490,7 @@ class Runtime:
             if state == "stopped":
                 self.events(task, record, offset, final=True)
                 completion = Path(record["completion"])
+                verify_shutdown(record)
                 if not completion.exists():
                     if task.get("cancel_requested"):
                         raise PhaseStopped("cancelled")
@@ -500,6 +533,9 @@ class Runtime:
             if values:
                 current["last_event_at"] = now_ms()
             for event in values:
+                if current["executor"] == "codex":
+                    collect_codex(current, event)
+                    continue
                 part = event.get("part", {})
                 if not isinstance(part, dict):
                     continue
@@ -570,11 +606,14 @@ class Runtime:
                         raise PhaseStopped("cancelled")
                     if current["attempts"] >= self.control.settings.max_attempts:
                         raise ValueError("Launch ceiling exhausted")
+                    if current["executor"] == "codex":
+                        current["codex_usage_baseline"] = current.get("codex_usage_total", {})
+                        current["codex_baseline_complete"] = not current["attempts"] or current.get("usage_complete", False)
                     current.update(status="preparing", attempt_number=current["attempts"] + 1,
                                    attempt_started_at=now_ms(), deadline_at=now_ms() + int(self.control.settings.attempt_timeout_seconds * 1000),
                                    artifact_dir=str(self.control.directory / "tasks" / task_id),
                                    max_attempts=self.control.settings.max_attempts)
-                    for key in ("final_tree", "patch", "execution_outcome", "failure_reason", "exit_code", "last_event_at", "summary", "cost", "usage", "execution_error", "event_offset", "process", "phase", "phase_started_at"):
+                    for key in ("final_tree", "patch", "execution_outcome", "failure_reason", "exit_code", "last_event_at", "summary", "cost", "usage", "usage_complete", "cost_note", "cost_source", "executor_completed", "thread_observed", "executor_activity", "execution_error", "event_offset", "process", "phase", "phase_started_at"):
                         current.pop(key, None)
                 self.store.update(task_id, begin)
                 task = self.store.get(task_id)
@@ -596,7 +635,7 @@ class Runtime:
                     if phase == "child":
                         self.store.update(task_id, lambda t: t.update(exit_code=result["exit_code"]))
                     task = self.store.get(task_id)
-                    failed = task.get("execution_error") or (phase == "child" and result["exit_code"] != 0)
+                    failed = self.child_failed(task) or (phase == "child" and result["exit_code"] != 0)
                     outcome = task.get("pending_outcome", "failed" if failed else "completed")
                     reason = task.get("pending_reason", "Executor failed" if failed else None)
                     self.finish(task_id, outcome, reason, already_captured=phase == "capture")
@@ -609,21 +648,22 @@ class Runtime:
                     raise ValueError("Dependency setup failed; child was not launched")
                 self.store.update(task_id, lambda t: t.update(setup_done=True))
             task = self.store.get(task_id)
-            result = self.phase(task_id, "child", opencode_command(self.control.settings.opencode_command, task), Path(task["worktree"]))
+            result = self.phase(task_id, "child", executor_command(self.control.settings, task), Path(task["worktree"]))
             self.store.update(task_id, lambda t: t.update(exit_code=result["exit_code"]))
-            if result["exit_code"] or self.store.get(task_id).get("execution_error"):
+            if result["exit_code"] or self.child_failed(self.store.get(task_id)):
                 outcome, reason = "failed", "Executor failed; inspect stdout/stderr artifacts"
         except PhaseStopped as stopped:
             outcome = "cancelled" if stopped.reason == "cancelled" else "failed"
             reason = stopped.reason
         except UncertainProcess as error:
             message = str(error)
-            self.store.update(task_id, lambda t: t.update(status="interrupted", execution_stopped=False, failure_reason=message))
+            unconfirmed = isinstance(error, UnconfirmedShutdown)
+            self.store.update(task_id, lambda t: t.update(status="interrupted", execution_stopped=False, failure_reason=message,
+                shutdown_unconfirmed=unconfirmed or t.get("shutdown_unconfirmed", False)))
             self.store.save_attempt(self.store.get(task_id))
             return
         except Exception as error:
             LOGGER.exception("Task phase failed: %s", task_id)
-            error_kind = type(error).__name__
             task = self.store.get(task_id)
             if not task["execution_stopped"]:
                 try:
@@ -633,11 +673,19 @@ class Runtime:
                     with self.lock:
                         self.processes.pop(task_id, None)
                     self.store.update(task_id, lambda t: t.update(execution_stopped=True))
-                except UncertainProcess:
-                    self.store.update(task_id, lambda t: t.update(status="interrupted", failure_reason=error_kind))
+                except UncertainProcess as stopping_error:
+                    message = str(stopping_error)
+                    unconfirmed = isinstance(stopping_error, UnconfirmedShutdown)
+                    self.store.update(task_id, lambda t: t.update(status="interrupted", execution_stopped=False,
+                        failure_reason=message, shutdown_unconfirmed=unconfirmed or t.get("shutdown_unconfirmed", False)))
                     return
             outcome, reason = "failed", str(error)
         self.finish(task_id, outcome, reason)
+
+    @staticmethod
+    def child_failed(task: dict) -> bool:
+        return bool(task.get("execution_error") or task["executor"] == "codex" and
+                    (not task.get("executor_completed") or not task.get("thread_observed")))
 
     def finish(self, task_id: str, outcome: str, reason: str | None, already_captured: bool = False) -> None:
         task = self.store.get(task_id)
