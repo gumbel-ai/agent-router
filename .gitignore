@@ -1,0 +1,11 @@
+# Local design and debate records are not release artifacts.
+debates/
+universal_agent_router_architecture.md
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.env
+.pytest_cache/

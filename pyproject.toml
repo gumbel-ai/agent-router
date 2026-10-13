@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agent-router"
+version = "0.1.0"
+description = "Local, parent-supervised delegation between coding agent CLIs"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = ["pydantic-settings>=2.10,<3"]
+
+[project.scripts]
+router = "router.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["router*"]
+
+[tool.setuptools.package-data]
+router = ["plugin/.claude-plugin/*.json", "plugin/hooks/*.json", "plugin/skills/*/*.md"]

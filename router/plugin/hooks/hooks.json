@@ -1,0 +1,6 @@
+{
+  "hooks": {
+    "UserPromptSubmit": [{"hooks": [{"type": "command", "command": "router hook submit", "timeout": 20}]}],
+    "PreToolUse": [{"matcher": "Bash", "hooks": [{"type": "command", "command": "router hook authorize", "timeout": 20}]}]
+  }
+}
