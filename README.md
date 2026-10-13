@@ -7,7 +7,7 @@ Delegate coding tasks to another agent while the parent stays in control.
 - Delegate across agent CLIs: Claude Code to OpenCode in v1.
 - Choose the exact child model, with no silent substitution.
 - Run tasks in parallel while the parent keeps working.
-- Watch native Claude subagents and Router-launched children together with `router status --watch`.
+- Watch native Claude subagents and Router-launched children across projects with `router status --watch`.
 - Give each child its own Git worktree and dependencies, not a security sandbox.
 - Start from your current files, including uncommitted changes.
 - Let the parent inspect, request corrections, accept, or discard the work.
@@ -21,26 +21,26 @@ Delegate coding tasks to another agent while the parent stays in control.
 
 ## Install
 
-Requires Git, uv, Python 3.14+, Claude Code, and OpenCode with provider access configured. macOS is verified; Linux needs live-host verification. Windows is unsupported.
+Requires Git, uv, and Claude Code 2.1.292+ (sign in to run agents). Automatic background-service setup supports macOS. Python 3.14 is installed by uv if needed. Linux supports manual daemon startup but needs live-host verification; Windows is unsupported.
 
 ```sh
-git clone https://github.com/gumbel-ai/agent-router.git
-cd agent-router
-uv tool install --python 3.14 .
+uvx --python 3.14 --from git+https://github.com/gumbel-ai/agent-router router setup
 ```
 
-Copy [the example configuration](examples/router.env.example) to `~/.agent-router/.env`, replace its repository path and model ID, and choose the limits and setup command. Keep the file private (`chmod 600 ~/.agent-router/.env`). The target repository needs an existing Git commit and explicit `allow`/`deny` permissions in `opencode.json`; `ask` is unsupported. Keep dependency folders and credentials untracked and ignored. Setup must create the child's own dependencies and must not launch detached processes.
-
-Start the daemon in one terminal:
+Approve the one-time user-scoped plugin and background-service installation. Then use ordinary `claude` in any project; no launch flags or project setup are needed for native visibility. Restart already-open Claude sessions. Watch all connected projects in another terminal:
 
 ```sh
-router daemon start
+router status --watch
 ```
 
-In your target repository, launch the parent in another terminal:
+For external delegation only, install OpenCode and configure its provider access, then run `router init` in each target Git repository. Confirm the exact model, child dependency setup command, explicit OpenCode permissions, and global limits. Init records setup; it does not run it. Keep dependencies and credentials untracked and ignored; setup must not launch detached processes. [Advanced environment configuration](examples/router.env.example) remains supported.
+
+`router service stop` stops the idle managed service; `router service start` starts it again. `router uninstall` removes the plugin, service, and CLI while retaining configuration and history. Installation/configuration changes refuse active Router work. Native subagents remain Claude-owned.
+
+The plugin is also installable through Claude's normal marketplace command after the Router runtime is installed:
 
 ```sh
-claude --plugin-dir "$(router plugin-path)"
+claude plugin install agent-router --marketplace gumbel-ai/agent-router --scope user
 ```
 
 License: [MIT](LICENSE).

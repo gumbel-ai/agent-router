@@ -10,14 +10,18 @@ from router.client import request
 
 class HookTests(TransportHarness, unittest.TestCase):
     def hook(self, event, name):
-        command = [sys.executable, "-m", "router.observer_hook"] if name == "observe" else [sys.executable, "-m", "router.cli", "hook", name]
+        command = [sys.executable, "-m", "router.observer_hook"] if name == "observe" else [sys.executable, "-m", "router.hooks", name]
         result = subprocess.run(command,
                                 env=self.environment, input=json.dumps(event), capture_output=True, text=True, check=False)
         self.assertEqual(result.returncode, 0, result.stderr)
         return json.loads(result.stdout)
 
     def test_offline_submission_and_nonliteral_dispatch(self):
-        event = {"session_id": "host", "prompt_id": "turn", "prompt": "never persist this body"}
+        event = {"session_id": "host", "prompt_id": "turn", "cwd": str(self.repo), "prompt": "never persist this body"}
+        unconfigured = {**event, "session_id": "unconfigured", "cwd": str(self.root / "other-project")}
+        self.assertEqual(self.hook(unconfigured, "submit"), {})
+        self.assertEqual(request("submit", {"session_id": "unconfigured", "prompt_id": "turn",
+                                           "cwd": unconfigured["cwd"]}, self.endpoint), {"instruction_id": None})
         submission = self.hook(event, "submit")
         self.assertIn("ROUTER_INSTRUCTION_ID=", submission["hookSpecificOutput"]["additionalContext"])
         ordinary = self.hook({**event, "tool_name": "Bash", "tool_input": {"command": "git status"}}, "authorize")
@@ -28,7 +32,8 @@ class HookTests(TransportHarness, unittest.TestCase):
         request("daemon_stop", {}, self.endpoint)
         self.daemons[-1].wait(timeout=15)
         offline = self.hook(event, "submit")
-        self.assertIn("unavailable", offline["hookSpecificOutput"]["additionalContext"])
+        self.assertEqual(offline, {})
+        self.assertEqual(self.hook(unconfigured, "submit"), {})
 
     def test_native_hooks_preserve_parent_and_allow_offline_native_work(self):
         event = {"session_id": "native-host", "prompt_id": "turn", "cwd": str(self.repo),

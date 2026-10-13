@@ -4,6 +4,7 @@ import argparse
 import json
 import sys
 import time
+from importlib.metadata import version
 from pathlib import Path
 
 from pydantic import ValidationError
@@ -47,6 +48,7 @@ def table(rows: list[dict]) -> str:
 
 def main() -> None:
     parser = argparse.ArgumentParser(prog="router", description="Agent Router: local, parent-supervised agent delegation")
+    parser.add_argument("--version", action="version", version=version("agent-router"))
     commands = parser.add_subparsers(dest="command", required=True)
     for operation in sorted(MUTATIONS):
         command = commands.add_parser(operation)
@@ -60,11 +62,42 @@ def main() -> None:
     daemon = commands.add_parser("daemon")
     daemon.add_argument("action", choices=["start", "stop"])
     commands.add_parser("plugin-path", help="Print the bundled Claude plugin directory")
+    setup = commands.add_parser("setup", help="Install the global Claude plugin and user background service")
+    setup.add_argument("--yes", action="store_true", help="Approve installation without prompting")
+    setup.add_argument("--marketplace", default="gumbel-ai/agent-router", help="Official Claude marketplace source (or a local source for development)")
+    uninstall = commands.add_parser("uninstall", help="Remove plugin, service and CLI, retaining private history")
+    uninstall.add_argument("--yes", action="store_true")
+    service = commands.add_parser("service", help="Manage the explicitly installed user service")
+    service.add_argument("action", choices=["start", "stop", "restart", "status"])
+    init = commands.add_parser("init", help="Opt this Git project into OpenCode delegation")
+    init.add_argument("--model", help="alias=provider/exact-model")
+    init.add_argument("--setup-command", help="Child dependency setup command; not run during init")
+    init.add_argument("--permissions", help="Explicit allow/deny JSON; never overwrites existing permissions")
+    init.add_argument("--concurrency", type=int)
+    init.add_argument("--timeout", type=float)
+    init.add_argument("--attempts", type=int)
+    init.add_argument("--yes", action="store_true", help="Approve supplied settings and displayed limit defaults")
     hook = commands.add_parser("hook", help="Host hook entry point (not a task operation)")
     hook.add_argument("event", choices=["submit", "authorize", "observe"])
     args = parser.parse_args()
     try:
-        if args.command == "hook":
+        if args.command in {"setup", "init", "uninstall"}:
+            from router import setup as installation
+            if args.command == "init":
+                installation.init(args)
+            elif args.command == "setup":
+                installation.setup(args.yes, args.marketplace)
+            else:
+                getattr(installation, args.command)(args.yes)
+        elif args.command == "service":
+            from router import service as services
+            if args.action in {"start", "restart"}:
+                print(json.dumps(services.start(restart=args.action == "restart")))
+            elif args.action == "stop":
+                services.stop()
+            else:
+                print(json.dumps(services.health() or {"running": False}))
+        elif args.command == "hook":
             from router.hooks import main as hook_main
             sys.argv = [sys.argv[0], args.event]
             hook_main()

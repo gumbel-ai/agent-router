@@ -8,9 +8,20 @@ from unittest.mock import patch
 from pydantic import ValidationError
 
 from router.config import Settings, load_settings, socket_path, state_dir
+from router.paths import runtime_pointer
 
 
 class ConfigTests(unittest.TestCase):
+    def test_observation_needs_no_executor_model_or_repository_configuration(self):
+        with tempfile.TemporaryDirectory(prefix="ar-observe-config-") as temp:
+            environment = {key: value for key, value in os.environ.items() if not key.startswith("AGENT_ROUTER_")}
+            environment.update(AGENT_ROUTER_ENV_FILE=str(Path(temp) / "missing.env"), AGENT_ROUTER_STATE_DIR=temp)
+            with patch.dict(os.environ, environment, clear=True):
+                config, _ = load_settings()
+                self.assertFalse(config.delegation_enabled)
+                self.assertEqual(config.repositories, {})
+                self.assertEqual(config.models, {})
+
     def test_required_operator_configuration_and_bounds(self):
         valid = {"AGENT_ROUTER_CONCURRENCY_CAP": 3, "AGENT_ROUTER_ATTEMPT_TIMEOUT_SECONDS": 30,
                  "AGENT_ROUTER_MAX_ATTEMPTS": 2, "AGENT_ROUTER_OPENCODE_COMMAND": ["opencode"],
@@ -44,4 +55,5 @@ class ConfigTests(unittest.TestCase):
                 self.assertEqual(environment["PROVIDER_TEST_KEY"], "not-a-real-credential")
                 self.assertEqual(state_dir(), root / "state")
                 self.assertEqual(socket_path(), root / "router.sock")
+                self.assertEqual(runtime_pointer(), Path(os.environ.get("AGENT_ROUTER_STATE_DIR", "~/.agent-router")).expanduser() / "python-path")
                 self.assertNotIn("PROVIDER_TEST_KEY", config.model_dump())

@@ -1,41 +1,37 @@
 """Startup-only configuration; provider credentials never enter task records."""
 
-import os
 from pathlib import Path
 
-from dotenv import dotenv_values
-from pydantic import Field, field_validator
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from router.paths import configuration, path_setting, socket_path, state_dir  # noqa: F401 - public path API
 from router.pricing import PriceTier
-
-
-def path_setting(name: str, fallback: str) -> Path:
-    value = os.environ.get(name)
-    if value is None:
-        env_file = Path(os.environ.get("AGENT_ROUTER_ENV_FILE", "~/.agent-router/.env")).expanduser()
-        value = dotenv_values(env_file).get(name)
-    return Path(value or fallback).expanduser()
-
-
-def state_dir() -> Path:
-    return path_setting("AGENT_ROUTER_STATE_DIR", "~/.agent-router")
-
-
-def socket_path() -> Path:
-    return path_setting("AGENT_ROUTER_SOCKET", str(state_dir() / "router.sock"))
 
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(extra="ignore", hide_input_in_errors=True)
 
-    concurrency_cap: int = Field(gt=0, validation_alias="AGENT_ROUTER_CONCURRENCY_CAP")
-    attempt_timeout_seconds: float = Field(gt=0, allow_inf_nan=False, validation_alias="AGENT_ROUTER_ATTEMPT_TIMEOUT_SECONDS")
-    max_attempts: int = Field(gt=0, validation_alias="AGENT_ROUTER_MAX_ATTEMPTS")
-    opencode_command: list[str] = Field(min_length=1, validation_alias="AGENT_ROUTER_OPENCODE_COMMAND")
-    models: dict[str, str] = Field(min_length=1, validation_alias="AGENT_ROUTER_MODELS")
-    repositories: dict[str, dict[str, str]] = Field(min_length=1, validation_alias="AGENT_ROUTER_REPOSITORIES")
+    concurrency_cap: int | None = Field(default=None, gt=0, validation_alias="AGENT_ROUTER_CONCURRENCY_CAP")
+    attempt_timeout_seconds: float | None = Field(default=None, gt=0, allow_inf_nan=False, validation_alias="AGENT_ROUTER_ATTEMPT_TIMEOUT_SECONDS")
+    max_attempts: int | None = Field(default=None, gt=0, validation_alias="AGENT_ROUTER_MAX_ATTEMPTS")
+    opencode_command: list[str] | None = Field(default=None, min_length=1, validation_alias="AGENT_ROUTER_OPENCODE_COMMAND")
+    models: dict[str, str] = Field(default_factory=dict, validation_alias="AGENT_ROUTER_MODELS")
+    repositories: dict[str, dict[str, str]] = Field(default_factory=dict, validation_alias="AGENT_ROUTER_REPOSITORIES")
     model_prices: dict[str, list[PriceTier]] = Field(default_factory=dict, validation_alias="AGENT_ROUTER_MODEL_PRICES")
+
+    @property
+    def delegation_enabled(self) -> bool:
+        return bool(self.models and self.repositories and self.opencode_command and self.concurrency_cap
+                    and self.attempt_timeout_seconds and self.max_attempts)
+
+    @model_validator(mode="after")
+    def complete_delegation(self):
+        values = (self.models, self.repositories, self.opencode_command, self.concurrency_cap,
+                  self.attempt_timeout_seconds, self.max_attempts)
+        if any(values) and not self.delegation_enabled:
+            raise ValueError("Delegation requires models, repositories, executor command, concurrency, timeout, and attempt limits; run router init")
+        return self
 
     @field_validator("model_prices")
     @classmethod
@@ -55,8 +51,8 @@ class Settings(BaseSettings):
 
     @field_validator("opencode_command")
     @classmethod
-    def command_parts(cls, value: list[str]) -> list[str]:
-        if any(not part.strip() for part in value):
+    def command_parts(cls, value: list[str] | None) -> list[str] | None:
+        if value is not None and any(not part.strip() for part in value):
             raise ValueError("Executor command arguments cannot be empty")
         return value
 
@@ -71,10 +67,7 @@ class Settings(BaseSettings):
         return result
 
 
-def load_settings() -> tuple[Settings, dict[str, str]]:
-    env_file = Path(os.environ.get("AGENT_ROUTER_ENV_FILE", "~/.agent-router/.env")).expanduser()
-    settings = Settings(_env_file=env_file)
-    # python-dotenv is the dotenv loader required by pydantic-settings.
-    environment = {key: value for key, value in dotenv_values(env_file).items() if value is not None}
-    environment.update(os.environ)
+def load_settings(registry_values: dict | None = None) -> tuple[Settings, dict[str, str]]:
+    values, environment = configuration(registry_values)
+    settings = Settings(**values)
     return settings, environment

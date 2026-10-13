@@ -1,0 +1,12 @@
+{
+  "name": "agent-router",
+  "description": "Agent Router: native subagent visibility and controlled cross-CLI delegation",
+  "owner": {"name": "gumbel-ai"},
+  "plugins": [
+    {
+      "name": "agent-router",
+      "source": "./",
+      "description": "One local view of native subagents and Router-controlled coding tasks"
+    }
+  ]
+}
