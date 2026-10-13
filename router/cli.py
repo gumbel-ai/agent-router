@@ -29,6 +29,10 @@ def table(rows: list[dict]) -> str:
                      f" | work: {text(row.get('task')) or 'unknown'}")
         if row.get("activity"):
             lines.append(f"  activity: {text(row['activity'])}")
+        if row.get("cleanup_error") is not None:
+            lines.append(f"  cleanup failed: {text(row['cleanup_error'])}")
+        elif row.get("cleanup_pending"):
+            lines.append("  cleanup pending")
         if "attempts" in row:
             lines.append(f"  attempts: {row['attempts']}/{row['max_attempts']}")
         if row.get("cwd"):
@@ -70,6 +74,9 @@ def main() -> None:
     uninstall.add_argument("--yes", action="store_true")
     service = commands.add_parser("service", help="Manage the explicitly installed user service")
     service.add_argument("action", choices=["start", "stop", "restart", "status"])
+    recover = commands.add_parser("recover", help="Interactively acknowledge an inspected Codex shutdown; daemon must be stopped")
+    recover.add_argument("task_id")
+    recover.add_argument("--reason", required=True, help="What was inspected and stopped; retained in task history")
     init = commands.add_parser("init", help="Opt this Git project into external delegation")
     init.add_argument("--executor", choices=["opencode", "codex"], default="opencode")
     init.add_argument("--sandbox", choices=["read-only", "workspace-write"], help="Explicit Codex sandbox; required for noninteractive Codex init")
@@ -92,6 +99,9 @@ def main() -> None:
                 installation.setup(args.yes, args.marketplace)
             else:
                 getattr(installation, args.command)(args.yes)
+        elif args.command == "recover":
+            from router.service import recover
+            print(json.dumps(recover(args.task_id, args.reason)))
         elif args.command == "service":
             from router import service as services
             if args.action in {"start", "restart"}:

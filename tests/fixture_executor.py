@@ -14,6 +14,16 @@ else:
     session = sys.argv[sys.argv.index("--session") + 1]
 model = sys.argv[sys.argv.index("--model") + 1]
 prompt = sys.argv[-1]
+sleeper = None
+
+
+def interrupt(*_):
+    if sleeper is not None and sleeper.poll() is None:
+        sleeper.terminate()
+        sleeper.wait(timeout=5)
+    sys.exit(130)
+
+
 if sys.stdin.read() != "":
     raise RuntimeError("stdin should be closed")
 record = Path("session.json")
@@ -29,14 +39,17 @@ if codex:
         signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
         Path("interrupt-ready").touch()
     else:
-        signal.signal(signal.SIGINT, lambda *_: sys.exit(130))
+        signal.signal(signal.SIGINT, interrupt)
 if codex and "no thread" not in prompt:
     print(json.dumps({"type": "thread.started", "thread_id": session}), flush=True)
     print(json.dumps({"type": "item.started", "item": {"type": "command_execution", "command": "run tests"}}), flush=True)
 if Path(".venv/bin/python").exists():
     subprocess.run([str(Path(".venv/bin/python").absolute()), "-m", "unittest", "discover", "-s", "tests"], check=True)
 if "hang" in prompt:
-    subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    separate_group = codex and "ignore interrupt" not in prompt
+    sleeper = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"], start_new_session=separate_group)
+    if separate_group:
+        Path("sleeper.pid").write_text(str(sleeper.pid))
     if "silent" not in prompt:
         print(json.dumps({"type": "text", "part": {"text": "working"}}), flush=True)
     time.sleep(60)

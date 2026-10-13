@@ -35,6 +35,11 @@ DECISIONS = {"awaiting_review", "blocked", "failed", "interrupted"}
 LOGGER = logging.getLogger(__name__)
 
 
+def blocks_maintenance(task: dict) -> bool:
+    return (task["status"] in ACTIVE or not task["execution_stopped"] or
+            bool(task.get("cleanup_requested") or task.get("cleanup_pending") and task.get("cleanup_error") is None))
+
+
 def required_text(payload: dict, key: str) -> str:
     value = payload.get(key)
     if not isinstance(value, str) or not value.strip():
@@ -85,6 +90,7 @@ def visibility(task: dict, history: list[dict]) -> dict:
             "price_overrides_used": task.get("price_overrides_used", []), "price_sources": {},
             "usage": usage or None, "usage_source": "executor_reported" if usage else "unavailable",
             "usage_complete": all(frame.get("usage_complete", bool(frame.get("usage"))) for frame in frames),
+            "cleanup_pending": bool(task.get("cleanup_pending", False)), "cleanup_error": task.get("cleanup_error"),
             "shutdown_unconfirmed": bool(task.get("shutdown_unconfirmed", False)),
             "activity": task.get("executor_activity", task.get("phase")), "visibility_reason": None, "runtime_partial": False}
 
@@ -106,8 +112,7 @@ class Controller:
         self.draining = False
 
     def busy(self) -> int:
-        return sum(task["status"] in ACTIVE or not task["execution_stopped"] or task.get("cleanup_pending", False)
-                   for task in self.store.all())
+        return sum(blocks_maintenance(task) for task in self.store.all())
 
     def handle(self, operation: str, payload: dict) -> dict | list:
         if not isinstance(payload, dict):
@@ -314,9 +319,9 @@ class Controller:
             return public(self.store.get(payload["task_id"]), self.store)
         if payload.get("filter") not in {None, "needs_decision"}:
             raise ValueError("Unknown status filter")
-        tasks = [task for task in self.store.all() if task["status"] != "closed"]
+        tasks = [task for task in self.store.all() if task["status"] != "closed" or task.get("cleanup_pending")]
         if payload.get("filter") == "needs_decision":
-            tasks = [task for task in tasks if task["status"] in DECISIONS or
+            tasks = [task for task in tasks if task["status"] in DECISIONS or task.get("cleanup_error") is not None or
                      (task["status"] == "awaiting_review" and task["attempts"] >= self.settings.max_attempts)]
         keys = {"task_id", "status", "attempts", "review_retries", "continuations", "last_event_at",
                 "executor", "requested_model", "resolved_model", "failure_reason", "execution_outcome", "max_attempts", "worktree"}
@@ -348,6 +353,8 @@ class Runtime:
         # In serve(), the single-instance daemon lock is already held here.
         self.control.native.reconcile_restart()
         for task in self.store.all():
+            if task["status"] == "closed" and task.get("cleanup_pending") and task.get("cleanup_error") is None:
+                self.store.update(task["task_id"], lambda t: t.update(cleanup_requested=True))
             if self.control.settings.max_attempts is not None and task["status"] != "closed" and task["max_attempts"] != self.control.settings.max_attempts:
                 self.store.update(task["task_id"], lambda t: t.update(max_attempts=self.control.settings.max_attempts))
             if task["status"] in {"validating", "preparing", "running", "cancelling"}:
@@ -391,7 +398,7 @@ class Runtime:
                 if task["status"] in {"created", "retrying", "cancelling"}:
                     self.spawn(task)
                 elif task["status"] == "closed" and task.get("cleanup_requested"):
-                    self.store.update(task["task_id"], lambda t: t.update(cleanup_requested=False))
+                    self.store.update(task["task_id"], lambda t: t.update(cleanup_requested=False, cleanup_error=None))
                     self.spawn(task, cleaning=True)
             self.control.changed.wait(0.1)
             self.control.changed.clear()

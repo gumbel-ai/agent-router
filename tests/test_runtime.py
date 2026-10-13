@@ -1,18 +1,22 @@
+import fcntl
 import json
 import os
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from test_control import settings
 
+from router import service
 from router.child import launch
 from router.cli import table
 from router.daemon import Controller, Runtime
-from router.process import UncertainProcess, owned_state, stop_owned
-from router.snapshot import apply_delta, git
+from router.process import UncertainProcess, creation_identity, owned_state, stop_owned
+from router.snapshot import apply_delta, cleanup, git
 
 
 class RuntimeHarness:
@@ -157,14 +161,21 @@ class RuntimeTests(RuntimeHarness, unittest.TestCase):
         deadline = time.monotonic() + 10
         while time.monotonic() < deadline:
             ready = self.control.handle("status", {"task_id": hanging})
-            if ready.get("child_session_id"):
+            pid_file = Path(ready["worktree"]) / "sleeper.pid" if ready.get("worktree") else None
+            if ready.get("child_session_id") and pid_file and pid_file.exists():
                 break
             time.sleep(.03)
         self.assertTrue(ready.get("child_session_id"))
+        sleeper = int(pid_file.read_text())
+        sleeper_record = {"pid": sleeper, "pgid": sleeper, "creation_identity": creation_identity(sleeper)}
+        self.addCleanup(lambda: stop_owned(sleeper_record))
+        self.assertEqual(os.getpgid(sleeper), sleeper)
         self.mutate("cancel", {"task_id": hanging, "request_id": "codex-cancel"})
         cancelled = self.wait(hanging, {"cancelled", "interrupted"})
         self.assertEqual(cancelled["status"], "cancelled", cancelled)
         self.assertTrue(cancelled["execution_stopped"])
+        with self.assertRaises(ProcessLookupError):
+            os.kill(sleeper, 0)
 
     def test_codex_forced_stop_cannot_claim_command_shutdown_or_be_closed(self):
         self.enable_codex()
@@ -185,6 +196,60 @@ class RuntimeTests(RuntimeHarness, unittest.TestCase):
         self.assertEqual(self.wait(task_id, {"cancelled", "interrupted"})["status"], "interrupted")
         with self.assertRaisesRegex(ValueError, "uncertain"):
             self.mutate("close", {"task_id": task_id, "request_id": "unsafe-close", "disposition": "discarded"})
+        self.runtime.stop()
+        self.config.concurrency_cap = 1
+        queued = self.start("queued", "after-recovery", executor="codex")
+        before = self.control.store.history(task_id)
+        directory = self.root / "state"
+        with patch("router.service.state_dir", return_value=directory), \
+                patch("router.service.sys.stdin.isatty", return_value=False), \
+                self.assertRaisesRegex(ValueError, "interactive"):
+            service.recover(task_id, "Inspected foreground commands")
+        with patch("router.service.state_dir", return_value=directory), \
+                patch("router.service.sys.stdin.isatty", return_value=True), \
+                patch("builtins.input", return_value="wrong"):
+            with self.assertRaisesRegex(ValueError, "No changes"):
+                service.recover(task_id, "Inspected foreground commands")
+            with (directory / "daemon.lock").open("a") as lock:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                with self.assertRaisesRegex(ValueError, "Stop the daemon"):
+                    service.recover(task_id, "Inspected foreground commands")
+            with patch("router.service.owned_state", return_value="live"), self.assertRaisesRegex(ValueError, "stopped"):
+                service.recover(task_id, "Inspected foreground commands")
+            with patch("builtins.input", return_value=task_id):
+                service.recover(task_id, "Inspected foreground commands")
+        resolved = self.control.store.get(task_id)
+        self.assertEqual(resolved["status"], "cancelled")
+        self.assertTrue(resolved["execution_stopped"])
+        self.assertTrue(resolved["shutdown_unconfirmed"])
+        self.assertEqual(resolved["operator_recovery"]["reason"], "Inspected foreground commands")
+        self.assertEqual(self.control.store.history(task_id), before)
+        self.assertTrue(Path(resolved["worktree"]).exists())
+        self.runtime = Runtime(self.control)
+        self.runtime.start()
+        self.addCleanup(self.runtime.stop)
+        self.assertEqual(self.wait(queued, {"awaiting_review", "failed"})["status"], "awaiting_review")
+
+    def test_codex_restart_without_shutdown_evidence_keeps_reservation(self):
+        self.enable_codex()
+        task_id = self.start("finished", executor="codex")
+        self.wait(task_id, {"awaiting_review"})
+        self.runtime.stop()
+        task = self.control.store.get(task_id)
+        record = {**task["process"], "interrupt_first": True, "completion": str(self.root / "missing-completion")}
+        self.assertEqual(owned_state(record), "stopped")
+        self.control.store.update(task_id, lambda t: t.update(status="cancelling", execution_stopped=False,
+            cancel_requested=True, process=record))
+        self.config.concurrency_cap = 1
+        queued = self.start("queued", "restart-queued", executor="codex")
+        self.runtime = Runtime(self.control)
+        self.runtime.start()
+        self.addCleanup(self.runtime.stop)
+        interrupted = self.wait(task_id, {"interrupted"})
+        self.assertTrue(interrupted["shutdown_unconfirmed"])
+        self.assertFalse(interrupted["execution_stopped"])
+        time.sleep(.15)
+        self.assertEqual(self.control.store.get(queued)["status"], "created")
 
     def test_full_cycle_same_session_and_cleanup(self):
         (self.repo / "tracked.txt").write_text("dirty parent\n")
@@ -241,6 +306,12 @@ class RuntimeTests(RuntimeHarness, unittest.TestCase):
         accepted = self.mutate("review", {"task_id": task_id, "request_id": "salvage", "expected_attempt": 1, "outcome": "accepted"})
         self.assertEqual(accepted["execution_outcome"], "failed")
         self.assertEqual(accepted["attempts"], 1)
+        self.enable_codex()
+        codex_task = self.start("silent hang", "codex-timeout", executor="codex")
+        stopped = self.wait(codex_task, {"failed", "interrupted"})
+        self.assertEqual(stopped["status"], "failed", stopped)
+        self.assertTrue(stopped["execution_stopped"])
+        self.assertEqual(stopped["failure_reason"], "router-timeout")
 
     def test_gate_registration_failure_releases_no_command(self):
         marker = self.root / "must-not-exist"
@@ -367,8 +438,28 @@ class RuntimeTests(RuntimeHarness, unittest.TestCase):
         self.assertTrue(partial["cleanup_pending"])
         self.assertTrue(partial["cleanup_error"])
         self.assertTrue(other.exists())
+        self.assertEqual(self.control.busy(), 0)
+        rows = self.control.handle("status", {"filter": "needs_decision"})
+        self.assertEqual([row["task_id"] for row in rows], [task_id])
+        self.assertEqual(rows[0]["cleanup_error"], partial["cleanup_error"])
+        self.assertIn("cleanup failed", table(rows))
+        with patch("router.service.state_dir", return_value=self.root / "state"), patch("router.service.health", return_value=None):
+            self.assertIsNone(service.require_idle())
         git(self.repo, "worktree", "remove", "--force", str(other))
-        self.control.handle("close", close)
+        entered, release = threading.Event(), threading.Event()
+        self.addCleanup(release.set)
+        def retry_cleanup(root, task):
+            entered.set()
+            release.wait(timeout=10)
+            cleanup(root, task)
+        with patch("router.daemon.cleanup", side_effect=retry_cleanup):
+            self.control.handle("close", close)
+            self.assertTrue(entered.wait(timeout=5))
+            self.assertGreater(self.control.busy(), 0)
+            with patch("router.service.state_dir", return_value=self.root / "state"), \
+                    patch("router.service.health", return_value=None), self.assertRaisesRegex(ValueError, "active"):
+                service.require_idle()
+            release.set()
         end = time.monotonic() + 5
         while time.monotonic() < end:
             closed = self.control.handle("status", {"task_id": task_id})
@@ -377,6 +468,28 @@ class RuntimeTests(RuntimeHarness, unittest.TestCase):
             time.sleep(0.03)
         self.assertFalse(closed["cleanup_pending"], closed)
         self.assertFalse(git(self.repo, "for-each-ref", "--format=%(refname)", "refs/router/").strip())
+
+    def test_restart_resumes_interrupted_cleanup_but_not_failed_cleanup(self):
+        interrupted = self.start("cleanup", "restart-cleanup")
+        failed = self.start("cleanup", "failed-cleanup")
+        for task_id in (interrupted, failed):
+            self.wait(task_id, {"awaiting_review"})
+        self.runtime.stop()
+        for task_id in (interrupted, failed):
+            self.mutate("close", {"task_id": task_id, "request_id": "close-" + task_id, "disposition": "discarded"})
+            self.control.store.update(task_id, lambda t: t.update(cleanup_requested=False))
+        self.control.store.update(failed, lambda t: t.update(cleanup_error="previous failure"))
+        self.runtime = Runtime(self.control)
+        self.runtime.start()
+        self.addCleanup(self.runtime.stop)
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and self.control.store.get(interrupted)["cleanup_pending"]:
+            time.sleep(.03)
+        self.assertFalse(self.control.store.get(interrupted)["cleanup_pending"])
+        self.assertTrue(self.control.store.get(failed)["cleanup_pending"])
+        self.assertEqual(self.control.store.get(failed)["cleanup_error"], "previous failure")
+        self.assertTrue(Path(self.control.store.get(failed)["worktree"]).exists())
+        self.assertEqual(self.control.busy(), 0)
 
 
 if __name__ == '__main__':

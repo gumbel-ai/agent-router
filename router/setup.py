@@ -63,12 +63,13 @@ def setup(yes: bool = False, marketplace: str = MARKETPLACE) -> None:
     current = require_idle()
     confirm("Install Agent Router's user-scoped Claude plugin and a background service? Local observation history stays on this machine.", yes)
     tool_dir = Path(run(["uv", "tool", "dir"])) / "agent-router"
+    if current:
+        label, _ = identity()
+        from router.service import domain, loaded
+        if not loaded(f"{domain()}/{label}"):
+            raise ValueError("Stop the manually started daemon before installing the managed service")
     if Path(sys.prefix).resolve() != tool_dir.resolve():
         if current:
-            label, _ = identity()
-            from router.service import domain, loaded
-            if not loaded(f"{domain()}/{label}"):
-                raise ValueError("Stop the manually started daemon before installing the managed service")
             stop()
         # uvx's temporary environment is not a durable service executable.
         run(["uv", "tool", "install", "--force", "--python", "3.14", "--from", source(), "agent-router"])
@@ -191,7 +192,8 @@ def init(args) -> None:
     cap = choice(args.concurrency, config.concurrency_cap, 3, "Global concurrency cap", int)
     timeout = choice(args.timeout, config.attempt_timeout_seconds, 600, "Per-attempt timeout seconds", float)
     attempts = choice(args.attempts, config.max_attempts, 3, "Maximum launches per task", int)
-    confirm(f"Enable {args.executor} delegation for {repo} with {model}, permissions {sandbox or permission}, setup {setup_command!r}, and limits {cap}/{timeout}s/{attempts}?", args.yes)
+    profile = sandbox if args.executor == "codex" else permission if permission is not None else "existing opencode.json permissions"
+    confirm(f"Enable {args.executor} delegation for {repo} with {model}, permissions {profile}, setup {setup_command!r}, and limits {cap}/{timeout}s/{attempts}?", args.yes)
     initialize(repo, model, setup_command, permission, cap, timeout, attempts, executor=args.executor, sandbox=sandbox)
 
 
