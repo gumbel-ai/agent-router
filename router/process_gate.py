@@ -19,8 +19,9 @@ def main() -> None:
         os.close(fd)
     if release != b"1":
         sys.exit(125)
-    # Remain the identifiable leader while the whole group receives SIGTERM.
+    # Remain the identifiable leader during graceful interruption/termination.
     signal.signal(signal.SIGTERM, lambda *_: None)
+    signal.signal(signal.SIGINT, lambda *_: None)
     try:
         child = subprocess.Popen(command, stdin=subprocess.DEVNULL)
         code = child.wait()

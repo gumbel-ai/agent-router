@@ -46,7 +46,7 @@ def configuration(values: dict | None = None) -> tuple[dict, dict[str, str]]:
     maps = {"AGENT_ROUTER_MODELS", "AGENT_ROUTER_REPOSITORIES", "AGENT_ROUTER_MODEL_PRICES"}
     for key, value in environment.items():
         if key.startswith("AGENT_ROUTER_"):
-            value = json.loads(value) if key in maps or key == "AGENT_ROUTER_OPENCODE_COMMAND" else value
+            value = json.loads(value) if key in maps or key in {"AGENT_ROUTER_OPENCODE_COMMAND", "AGENT_ROUTER_CODEX_COMMAND"} else value
             if key in maps:
                 if not isinstance(value, dict):
                     raise ValueError(f"{key} must be a JSON object")

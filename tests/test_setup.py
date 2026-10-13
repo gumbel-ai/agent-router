@@ -6,13 +6,15 @@ import sys
 import tempfile
 import time
 import unittest
+from argparse import Namespace
 from pathlib import Path
 from unittest.mock import patch
 
 from router.client import request
 from router.config import load_settings
-from router.service import definition
-from router.setup import initialize, setup
+from router.db import Store
+from router.service import definition, start
+from router.setup import init, initialize, setup
 from router.snapshot import git
 
 
@@ -60,6 +62,35 @@ class SetupTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "already"):
                 initialize(repo, "small=other/model", "true", None, 3, 600, 3)
         self.assertEqual((repo / "opencode.json").read_text(), original)
+
+    def test_init_confirmation_identifies_existing_opencode_permissions(self):
+        repo = self.repository("existing")
+        (repo / "opencode.json").write_text('{"permission":{"*":"deny"}}')
+        args = Namespace(yes=True, model="small=provider/exact", setup_command="true", permissions=None,
+                         sandbox=None, executor="opencode", concurrency=3, timeout=600, attempts=3)
+        with patch("router.setup.git", return_value=str(repo)), patch("router.setup.initialize"), \
+                patch("router.setup.confirm") as confirmation:
+            init(args)
+        self.assertIn("existing opencode.json permissions", confirmation.call_args.args[0])
+        self.assertNotIn("permissions None", confirmation.call_args.args[0])
+
+    def test_codex_opt_in_needs_no_opencode_and_preserves_both_executors(self):
+        repo = self.repository("codex")
+        with patch("router.setup.shutil.which", side_effect=lambda name: "/usr/bin/" + name), patch("router.setup.refresh_service"):
+            initialize(repo, "codex=openai/gpt-5.3-codex", "true", None, 3, 600, 3,
+                       executor="codex", sandbox="workspace-write")
+            config, _ = load_settings()
+            self.assertTrue(config.delegation_enabled)
+            self.assertIsNone(config.opencode_command)
+            self.assertEqual(config.codex_command, ["/usr/bin/codex"])
+            self.assertFalse((repo / "opencode.json").exists())
+            self.assertEqual(config.repositories[str(repo.resolve())]["codex_sandbox"], "workspace-write")
+            initialize(repo, "open=provider/exact", "true", {"*": "deny"}, 3, 600, 3)
+            config, _ = load_settings()
+            self.assertEqual(config.repositories[str(repo.resolve())]["codex_sandbox"], "workspace-write")
+            self.assertEqual(set(config.models), {"codex", "open"})
+            self.assertIsNotNone(config.opencode_command)
+
 
     def test_launch_agent_uses_explicit_runtime_and_shared_private_state(self):
         interpreter = self.root / "managed" / "bin" / "python"
@@ -120,6 +151,28 @@ class SetupTests(unittest.TestCase):
         self.assertEqual(pointer.read_text().strip(), str(runtime / "bin" / "python"))
         self.assertEqual(pointer.stat().st_mode & 0o777, 0o600)
 
+    def test_service_start_recovers_offline_tasks_without_killing_a_loaded_job(self):
+        state = self.root / "state"
+        store = Store(state / "router.sqlite3")
+        with store.transaction() as db:
+            store.put(db, {"task_id": "interrupted", "session_id": "S", "status": "interrupted", "execution_stopped": False})
+        label, path = "test.agent-router", self.root / "service.plist"
+        ready = {"version": "0.3.0", "active_tasks": 1}
+        for present in (True, False):
+            with self.subTest(loaded=present), patch("router.service.definition", return_value=(label, path, b"plist")), \
+                    patch("router.service.domain", return_value="gui/test"), patch("router.service.loaded", return_value=present), \
+                    patch("router.service.run") as command, \
+                    patch("router.service.health", side_effect=lambda: ready if command.called else None):
+                self.assertEqual(start(), ready)
+                expected = ["launchctl", "kickstart", f"gui/test/{label}"] if present else ["launchctl", "bootstrap", "gui/test", str(path)]
+                self.assertEqual(command.call_args.args[0], expected)
+                self.assertEqual(command.call_count, 1)
+        with patch("router.service.definition", return_value=(label, path, b"plist")), \
+                patch("router.service.domain", return_value="gui/test"), patch("router.service.health", return_value=ready), \
+                patch("router.service.run") as command, self.assertRaisesRegex(ValueError, "active Router"):
+            start(restart=True)
+        command.assert_not_called()
+
     def test_observation_only_daemon_and_published_hooks_span_two_projects(self):
         state = self.root / "state"
         state.mkdir()
@@ -158,14 +211,18 @@ class SetupTests(unittest.TestCase):
             self.assertEqual({row["parent_session_id"] for row in rows}, {"session-0", "session-1"})
             self.assertTrue(all(row["control_mode"] == "observe" for row in rows))
             self.assertNotIn("DO NOT STORE", json.dumps(rows))
-            (state / "python-path").unlink()
-            with patch("router.setup.run", return_value=str(self.root / "tools")), \
-                    patch("router.setup.shutil.which", return_value="/usr/bin/tool"), \
-                    patch("router.service.sys.platform", "darwin"), \
-                    patch("router.service.domain", return_value="gui/test"), \
-                    patch("router.service.loaded", return_value=False), \
-                    self.assertRaisesRegex(ValueError, "manually started daemon"):
-                setup(yes=True)
+            for prefix in (self.root / "temporary", self.root / "tools" / "agent-router"):
+                (state / "python-path").unlink(missing_ok=True)
+                with patch("router.setup.run", return_value=str(self.root / "tools")) as command, \
+                        patch("router.setup.sys.prefix", str(prefix)), \
+                        patch("router.setup.shutil.which", return_value="/usr/bin/tool"), \
+                        patch("router.service.sys.platform", "darwin"), \
+                        patch("router.service.domain", return_value="gui/test"), \
+                        patch("router.service.loaded", return_value=False), \
+                        self.assertRaisesRegex(ValueError, "manually started daemon"):
+                    setup(yes=True)
+                self.assertEqual([call.args[0] for call in command.call_args_list], [["uv", "tool", "dir"]])
+                self.assertFalse((state / "python-path").exists())
             with self.assertRaisesRegex(ValueError, "not configured"):
                 request("start", {})
             request("daemon_stop", {"only_if_idle": True})

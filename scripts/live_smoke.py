@@ -1,7 +1,8 @@
 """Opt-in real-host/provider verification on a generated, disposable repository.
 
 Run with the installed router environment: python scripts/live_smoke.py --model
-<exact OpenCode provider/model>. This makes four Claude turns and two child runs.
+<exact provider/model> [--executor codex]. This makes four Claude turns and two
+child runs. It uses existing CLI authentication and may incur provider charges.
 Artifacts remain in the printed scratch directory for diagnosis.
 """
 
@@ -25,6 +26,7 @@ from router.snapshot import apply_delta, git
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", required=True)
+    parser.add_argument("--executor", choices=["opencode", "codex"], default="opencode")
     parser.add_argument("--parent-model", default="haiku")
     args = parser.parse_args()
     directory = Path(tempfile.mkdtemp(prefix="ar-live-", dir="/tmp")).resolve()
@@ -50,12 +52,18 @@ def main() -> None:
     index = repo / git(repo, "rev-parse", "--git-path", "index").strip()
     index_hash = hashlib.sha256(index.read_bytes()).hexdigest()
     endpoint = directory / "router.sock"
-    environment = os.environ.copy()
+    environment = {key: value for key, value in os.environ.items() if not key.startswith("AGENT_ROUTER_")}
     environment.update(AGENT_ROUTER_STATE_DIR=str(directory / "state"), AGENT_ROUTER_SOCKET=str(endpoint),
+                       AGENT_ROUTER_ENV_FILE=str(directory / "missing.env"),
                        AGENT_ROUTER_CONCURRENCY_CAP="1", AGENT_ROUTER_ATTEMPT_TIMEOUT_SECONDS="120",
                        AGENT_ROUTER_MAX_ATTEMPTS="2", AGENT_ROUTER_OPENCODE_COMMAND='["opencode"]',
                        AGENT_ROUTER_MODELS=json.dumps({"live": args.model}),
                        AGENT_ROUTER_REPOSITORIES=json.dumps({str(repo): {"setup_command": f"{shlex.quote(sys.executable)} -m venv .venv"}}))
+    if args.executor == "codex":
+        environment.pop("AGENT_ROUTER_OPENCODE_COMMAND", None)
+        environment["AGENT_ROUTER_CODEX_COMMAND"] = '["codex"]'
+        environment["AGENT_ROUTER_REPOSITORIES"] = json.dumps({str(repo): {
+            "setup_command": f"{shlex.quote(sys.executable)} -m venv .venv", "codex_sandbox": "workspace-write"}})
     environment["PATH"] = str(Path(sys.executable).parent) + os.pathsep + environment.get("PATH", os.defpath)
     plugin = Path(__file__).resolve().parents[1] / "router" / "plugin"
     session = str(uuid.uuid4())
@@ -104,14 +112,17 @@ def main() -> None:
                     raise RuntimeError("Daemon failed; inspect daemon.stderr")
                 time.sleep(0.05)
         invocation = {"request_version": "1", "request_id": "live-start", "instruction_id": "USE_THE_HOOK_SUPPLIED_ID",
-                      "executor": "opencode", "model": "live", "parent_repo": str(repo), "parent_worktree": str(repo), "mode": "write",
+                      "executor": args.executor, "model": "live", "parent_repo": str(repo), "parent_worktree": str(repo), "mode": "write",
                       "task": "Change app.answer() to return 2. Run .venv/bin/python -m unittest discover -s tests. Do not commit. Remember the token " + token + " for the next attempt."}
         try:
             request("start", invocation, endpoint)
             raise AssertionError("Unauthorized start was accepted")
         except ValueError:
             pass
-        parent("Use Agent Router to delegate exactly the following invocation. Replace USE_THE_HOOK_SUPPLIED_ID with ROUTER_INSTRUCTION_ID from the host hook. Run exactly one canonical router start --json command through Bash, then report its task ID and stop. Do not execute the child task yourself. Invocation: " + json.dumps(invocation))
+        parent("Run exactly the following standalone Bash command. Replace only USE_THE_HOOK_SUPPLIED_ID with the ROUTER_INSTRUCTION_ID supplied in hook context. "
+               "Do not probe the environment or inspect the CLI: the command below already supplies the exact binary and JSON argument syntax. "
+               "Report the returned task ID and stop; do not execute the child task yourself. Command: " +
+               shlex.join(["router", "start", "--json", json.dumps(invocation)]))
         store = Store(directory / "state" / "router.sqlite3")
         all_tasks = store.all()
         if len(all_tasks) != 1:
@@ -135,6 +146,14 @@ def main() -> None:
         second = wait_task(task_id)
         assert second["status"] == "awaiting_review" and second["attempts"] == 2, second
         assert second["child_session_id"] == first["child_session_id"] and second["worktree"] == first["worktree"]
+        if args.executor == "codex":
+            stdout = next((Path(second["artifact_dir"]) / "attempt-2" / "child").glob("*.stdout"))
+            events = [json.loads(line) for line in stdout.read_text().splitlines() if line.startswith("{")]
+            reported = [event["usage"] for event in events if event.get("type") == "turn.completed"][-1]
+            assert second["usage"] == reported, "Router totals must equal the latest cumulative Codex counters"
+            assert second["usage_complete"] and second["cost"] is not None, second
+            assert second["cost_source"] == "token_estimate", second
+            print(f"Codex usage: {json.dumps(second['usage'], sort_keys=True)}; estimated USD {second['cost']:.8f}", flush=True)
         assert (Path(second["worktree"]) / "continuity.txt").read_text().strip() == token
         subprocess.run([str(Path(second["worktree"]) / ".venv" / "bin" / "python"), "-m", "unittest", "discover", "-s", "tests"], cwd=second["worktree"], check=True)
         accept = {"task_id": task_id, "request_id": "live-accept", "expected_attempt": 2, "outcome": "accepted"}
@@ -154,7 +173,8 @@ def main() -> None:
         assert closed["status"] == "closed" and not closed["cleanup_pending"], closed
         assert not Path(second["worktree"]).exists()
         print("PASS: real hooks, trusted registration, exact model, isolated setup, native resume, parent-index preservation, integration, and cleanup", flush=True)
-        (directory / "verification.json").write_text(json.dumps({"task_id": task_id, "model": args.model, "status": "passed", "attempts": 2}, indent=2))
+        (directory / "verification.json").write_text(json.dumps({"task_id": task_id, "model": args.model, "status": "passed", "attempts": 2,
+            "child_session_id": second["child_session_id"], "usage": second["usage"], "cost": second["cost"], "cost_source": second["cost_source"]}, indent=2))
     finally:
         if daemon.poll() is None:
             request("daemon_stop", {}, endpoint)

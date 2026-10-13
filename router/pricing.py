@@ -15,6 +15,7 @@ class PriceTier(BaseModel):
     cache_read: float = Field(ge=0, allow_inf_nan=False)
     cache_write_5m: float = Field(ge=0, allow_inf_nan=False)
     cache_write_1h: float = Field(ge=0, allow_inf_nan=False)
+    cache_write: float | None = Field(default=None, ge=0, allow_inf_nan=False)
     fast_multiplier: float | None = Field(default=None, gt=0, allow_inf_nan=False)
 
 
@@ -26,6 +27,19 @@ DEFAULT_PRICES = {
         PriceTier(above_input_tokens=100_000, input=.5, output=2.5, cache_read=.05, cache_write_5m=.625, cache_write_1h=1)],
     "claude-sonnet-5-5": [PriceTier(input=2, output=10, cache_read=.1, cache_write_5m=2.5, cache_write_1h=4)],
     "claude-opus-5-5": [PriceTier(input=4, output=20, cache_read=.2, cache_write_5m=5, cache_write_1h=8, fast_multiplier=2)],
+}
+
+# Standard short-context input/cache-read/output/cache-write rates, checked on PRICE_DATE.
+# Codex exec reports cumulative thread usage, not per-request context sizes.
+# These are a scoped API-equivalent estimate, not full cost or Codex credit billing.
+CODEX_PRICE_SOURCE = "https://developers.openai.com/api/docs/pricing"
+CODEX_PRICES = {
+    "openai/gpt-5.3-codex": (1.75, .175, 14, 1.75),
+    "openai/gpt-6.1-sol": (2, .1, 10, 2.5),
+    "openai/gpt-6-sol": (2, .2, 10, 2.5),
+    "openai/gpt-6-luna": (.1, .01, .5, .125),
+    "openai/gpt-6-astra": (10, 1, 50, 12.5),
+    "openai/gpt-5.6-sol": (4, .4, 20, 5),
 }
 
 

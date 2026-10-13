@@ -4,7 +4,7 @@ Delegate coding tasks to another agent while the parent stays in control.
 
 ## What you get
 
-- Delegate across agent CLIs: Claude Code to OpenCode in v1.
+- Delegate across agent CLIs: Claude Code to OpenCode or Codex.
 - Choose the exact child model, with no silent substitution.
 - Run tasks in parallel while the parent keeps working.
 - Watch native Claude subagents and Router-launched children across projects with `router status --watch`.
@@ -35,7 +35,11 @@ router status --watch
 
 For external delegation only, install OpenCode and configure its provider access, then run `router init` in each target Git repository. Confirm the exact model, child dependency setup command, explicit OpenCode permissions, and global limits. Init records setup; it does not run it. Keep dependencies and credentials untracked and ignored; setup must not launch detached processes. [Advanced environment configuration](examples/router.env.example) remains supported.
 
-`router service stop` stops the idle managed service; `router service start` starts it again. `router uninstall` removes the plugin, service, and CLI while retaining configuration and history. Installation/configuration changes refuse active Router work. Native subagents remain Claude-owned.
+For Codex instead, install and sign in to the Codex CLI, then run `router init --executor codex`. Confirm an exact `alias=openai/model-id` and a `read-only` or `workspace-write` sandbox. Router uses the CLI's saved login and ignores Router provider-key/endpoint overrides; it does not create or request an API key. The integration targets CLI 0.162.1. Codex children do not spawn native subagents in this version. Cost is a labelled token estimate, including reported cache writes; unreported charges are excluded and missing data stays unknown. Dependency setup runs outside the Codex sandbox.
+
+`router service stop` stops the idle managed service; `router service start` starts it again and lets it recover interrupted work. `router uninstall` removes the plugin, service, and CLI while retaining configuration and history. Installation/configuration changes refuse active Router work or pending cleanup; failed cleanup stays visible without blocking maintenance. Native subagents remain Claude-owned.
+
+If a Codex shutdown stays unconfirmed, an operator must inspect and stop its remaining commands. Stop the daemon with `router daemon stop`, then run `router recover TASK_ID --reason 'what you inspected'` in an interactive terminal. Recovery requires the recorded process group to be stopped and a typed acknowledgement; it releases the slot but preserves uncertainty evidence and the worktree. Restart the service afterward. Agents must not perform recovery.
 
 The plugin is also installable through Claude's normal marketplace command after the Router runtime is installed:
 

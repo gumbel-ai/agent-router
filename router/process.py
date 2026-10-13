@@ -1,6 +1,7 @@
 """POSIX ownership checks, with creation identity rather than PID alone."""
 
 import ctypes
+import json
 import os
 import signal
 import subprocess
@@ -11,6 +12,24 @@ from pathlib import Path
 
 class UncertainProcess(RuntimeError):
     pass
+
+
+class UnconfirmedShutdown(UncertainProcess):
+    pass
+
+
+def verify_shutdown(record: dict) -> None:
+    if not record.get("interrupt_first"):
+        return
+    try:
+        if Path(record["completion"]).with_suffix(".escalated").exists():
+            raise UnconfirmedShutdown("Codex required forced termination; foreground command shutdown is unconfirmed. Operator inspection required.")
+        completion = json.loads(Path(record["completion"]).read_text())
+        if completion["exit_code"] >= 0:
+            return
+    except (OSError, ValueError, KeyError, TypeError):
+        pass
+    raise UnconfirmedShutdown("Codex ended abruptly; foreground command shutdown is unconfirmed. Operator inspection required.")
 
 
 def creation_identity(pid: int) -> str:
@@ -64,11 +83,36 @@ def supervised_state(record: dict, process: subprocess.Popen | None) -> str:
 
 
 def stop_owned(record: dict, process: subprocess.Popen | None = None) -> None:
+    _stop_group(record, process)
+    verify_shutdown(record)
+
+
+def _stop_group(record: dict, process: subprocess.Popen | None = None) -> None:
     state = supervised_state(record, process)
     if state == "stopped":
         return
     if state != "live":
         raise UncertainProcess("Process ownership or liveness is uncertain; no signal sent")
+    if record.get("interrupt_first"):
+        # Codex owns foreground commands in separate groups; Ctrl-C lets its
+        # harness close them before we terminate the owned CLI group.
+        try:
+            os.killpg(record["pgid"], signal.SIGINT)
+        except ProcessLookupError:
+            return
+        limit = time.monotonic() + 3
+        while time.monotonic() < limit:
+            if supervised_state(record, process) == "stopped":
+                return
+            time.sleep(0.02)
+        if supervised_state(record, process) != "live":
+            raise UncertainProcess("Ownership became uncertain during interruption; artifacts retained")
+        # Persist before escalation: a normal exit code from a launcher must not
+        # erase forced-shutdown uncertainty, even after a daemon restart.
+        try:
+            Path(record["completion"]).with_suffix(".escalated").touch(mode=0o600)
+        except OSError as error:
+            raise UncertainProcess("Cannot record forced termination; no escalation sent, operator inspection required") from error
     try:
         os.killpg(record["pgid"], signal.SIGTERM)
     except ProcessLookupError:
