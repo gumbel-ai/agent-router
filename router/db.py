@@ -41,7 +41,12 @@ class Store:
                 CREATE TABLE IF NOT EXISTS attempts (
                     task_id TEXT NOT NULL, number INTEGER NOT NULL, data TEXT NOT NULL,
                     PRIMARY KEY(task_id, number));
+                CREATE TABLE IF NOT EXISTS observations (
+                    task_id TEXT PRIMARY KEY, session_id TEXT NOT NULL, data TEXT NOT NULL);
             """)
+            # Additive migration for databases created before caller attribution.
+            if "parent_agent_id" not in {row[1] for row in db.execute("PRAGMA table_info(authorizations)")}:
+                db.execute("ALTER TABLE authorizations ADD COLUMN parent_agent_id TEXT")
         path.chmod(0o600)
 
     @contextmanager

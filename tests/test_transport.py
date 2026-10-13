@@ -72,12 +72,20 @@ class TransportTests(TransportHarness, unittest.TestCase):
     def test_socket_permissions_and_no_auto_spawn(self):
         self.assertEqual(self.endpoint.stat().st_mode & 0o777, 0o600)
         self.assertEqual(len(request("status", {}, self.endpoint)), 0)
+        observed = request("observe", {"source": "claude", "session_id": "native", "agent_id": "child",
+                                       "kind": "start", "observed_at": int(time.time() * 1000)}, self.endpoint)
+        second = subprocess.run([sys.executable, "-m", "router.cli", "daemon", "start"], env=self.environment,
+                                capture_output=True, text=True, timeout=15, check=False)
+        self.assertNotEqual(second.returncode, 0)
+        self.assertEqual(request("status", {"task_id": observed["task_id"]}, self.endpoint)["status"], "running")
         request("daemon_stop", {}, self.endpoint)
         self.daemons[-1].wait(timeout=15)
         result = subprocess.run([sys.executable, "-m", "router.cli", "status"], env=self.environment, capture_output=True, text=True, check=False)
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("router daemon start", result.stderr)
         self.assertFalse(self.endpoint.exists())
+        self.boot()
+        self.assertEqual(request("status", {"task_id": observed["task_id"]}, self.endpoint)["status"], "unknown")
 
     def test_restart_does_not_relaunch_live_child(self):
         task_id = self.start("hang")

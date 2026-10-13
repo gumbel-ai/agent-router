@@ -1,10 +1,13 @@
+import sqlite3
 import tempfile
 import unittest
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import closing
 from pathlib import Path
 
 from router.config import Settings
 from router.daemon import Controller
+from router.db import Store
 
 
 def settings(root: Path, cap: int = 3, timeout: float = 30, attempts: int = 2, command=None) -> Settings:
@@ -32,6 +35,18 @@ class ControlTests(unittest.TestCase):
     def authorize(self, payload, session="S", prompt="P", operation="start"):
         return self.router.handle("authorize", {"session_id": session, "prompt_id": prompt,
                                                "operation": operation, "invocation": payload})
+
+    def test_existing_authorizations_survive_additive_attribution_migration(self):
+        path = self.root / "legacy.sqlite3"
+        with closing(sqlite3.connect(path)) as db:
+            db.execute("CREATE TABLE authorizations(session_id TEXT,request_id TEXT,operation TEXT,payload TEXT,instruction_id TEXT,consumed INTEGER,PRIMARY KEY(session_id,request_id))")
+            db.execute("INSERT INTO authorizations VALUES('S','old','start','{}','original',0)")
+            db.commit()
+        for _ in range(2):
+            store = Store(path)
+            with store.connect() as db:
+                row = db.execute("SELECT request_id,instruction_id,parent_agent_id FROM authorizations").fetchone()
+                self.assertEqual(tuple(row), ("old", "original", None))
 
     def test_binding_consumption_and_idempotent_replay(self):
         first = self.submission()
