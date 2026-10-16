@@ -1,6 +1,7 @@
 import fcntl
 import json
 import os
+import queue
 import sys
 import tempfile
 import threading
@@ -14,7 +15,7 @@ from test_control import settings
 from router import service
 from router.child import launch
 from router.cli import table
-from router.daemon import Controller, Runtime
+from router.daemon import Controller, Runtime, serve
 from router.process import UncertainProcess, creation_identity, owned_state, stop_owned
 from router.snapshot import apply_delta, cleanup, git
 
@@ -60,6 +61,113 @@ class RuntimeHarness:
         self.fail(f"Task did not reach {states}: {task}")
 
 class RuntimeTests(RuntimeHarness, unittest.TestCase):
+    def test_lifecycle_failure_reports_not_persisted_and_writer_continues(self):
+        at = int(time.time() * 1000)
+        oversized_cost = 10**10_000
+        failed = self.control.handle("lifecycle_observe", {
+            "session": {"source": "claude", "session_id": "partial-write",
+                        "kind": "session_start", "observed_at": at},
+            "native": {"source": "claude", "session_id": "S", "agent_id": "oversized",
+                       "kind": "result", "observed_at": at, "cost": oversized_cost},
+        })
+        self.assertEqual(failed, {"accepted": True, "persisted": False})
+        failed_snapshot = self.control.handle("snapshot", {})
+        self.assertIn("partial-write", {session["session_id"] for session in failed_snapshot["sessions"]})
+        self.assertTrue(failed_snapshot["partial"])
+        self.assertIn("1 write failures", failed_snapshot["errors"]["lifecycle"])
+        following = self.control.handle("lifecycle_observe", {"session": {
+            "source": "claude", "session_id": "following", "kind": "session_start",
+            "observed_at": at + 1,
+        }})
+        self.assertEqual(following, {"accepted": True, "persisted": True})
+        self.assertIn("following", {
+            session["session_id"] for session in self.control.handle("snapshot", {})["sessions"]
+        })
+
+    def test_lifecycle_queue_overflow_is_reported_in_snapshot_health(self):
+        with patch.object(self.control.lifecycle_queue, "put_nowait", side_effect=queue.Full):
+            result = self.control.handle("lifecycle_observe", {"session": {
+                "source": "claude", "session_id": "full", "kind": "session_start",
+                "observed_at": int(time.time() * 1000),
+            }})
+        self.assertFalse(result["accepted"])
+        snapshot = self.control.handle("snapshot", {})
+        self.assertTrue(snapshot["partial"])
+        self.assertIn("1 queue overflows", snapshot["errors"]["lifecycle"])
+
+    def test_lifecycle_shutdown_closes_admission_before_writer_sentinel(self):
+        entered = threading.Event()
+        release = threading.Event()
+        original = self.control.sessions.observe
+
+        def blocked(event, timeout=10):
+            entered.set()
+            release.wait(1)
+            return original(event, timeout)
+
+        with patch.object(self.control.sessions, "observe", side_effect=blocked):
+            first = self.control.handle("lifecycle_observe", {"session": {
+                "source": "claude", "session_id": "accepted-first", "kind": "session_start",
+                "observed_at": int(time.time() * 1000),
+            }})
+            self.assertTrue(first["accepted"])
+            self.assertTrue(entered.wait(1))
+            second = self.control.handle("lifecycle_observe", {"session": {
+                "source": "claude", "session_id": "accepted-second", "kind": "session_start",
+                "observed_at": int(time.time() * 1000),
+            }})
+            self.assertTrue(second["accepted"])
+            stopper = threading.Thread(target=self.control.stop_lifecycle_writer)
+            stopper.start()
+            deadline = time.monotonic() + 1
+            while not self.control.lifecycle_stopping and time.monotonic() < deadline:
+                time.sleep(.01)
+            rejected = self.control.handle("lifecycle_observe", {"session": {
+                "source": "claude", "session_id": "rejected", "kind": "session_start",
+                "observed_at": int(time.time() * 1000),
+            }})
+            self.assertEqual(rejected["accepted"], False)
+            self.assertIn("stopping", rejected["reason"])
+            release.set()
+            stopper.join(timeout=3)
+        self.assertFalse(stopper.is_alive())
+        self.assertIsNone(self.control.lifecycle_thread)
+        session_ids = {
+            session["session_id"] for session in self.control.handle("snapshot", {})["sessions"]
+        }
+        self.assertIn("accepted-first", session_ids)
+        self.assertIn("accepted-second", session_ids)
+
+    def test_lifecycle_shutdown_is_bounded_during_database_contention(self):
+        import sqlite3
+
+        with sqlite3.connect(self.control.store.path, timeout=0) as locked:
+            locked.execute("BEGIN IMMEDIATE")
+            result = self.control.handle("lifecycle_observe", {"session": {
+                "source": "claude", "session_id": "contended", "kind": "session_start",
+                "observed_at": int(time.time() * 1000),
+            }})
+            started = time.monotonic()
+            self.control.stop_lifecycle_writer()
+            elapsed = time.monotonic() - started
+        self.assertEqual(result, {"accepted": True, "persisted": False})
+        self.assertLess(elapsed, 3)
+        self.assertIsNone(self.control.lifecycle_thread)
+        self.assertIn("write failures", self.control.lifecycle_health())
+
+    def test_second_daemon_checks_lock_before_database_startup_work(self):
+        directory = self.root / "blocked-state"
+        directory.mkdir()
+        database = directory / "router.sqlite3"
+        import sqlite3
+        with sqlite3.connect(database) as connection:
+            connection.execute("CREATE TABLE observations(task_id TEXT PRIMARY KEY, session_id TEXT, data TEXT)")
+            connection.execute("INSERT INTO observations VALUES('bad','S','not-json')")
+        with (directory / "daemon.lock").open("a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            with self.assertRaisesRegex(ValueError, "already running"):
+                serve(self.config, os.environ.copy(), directory, self.root / "blocked.sock")
+
     def enable_codex(self, model="openai/gpt-5.3-codex"):
         self.config.codex_command = self.config.opencode_command
         self.config.models["test"] = model

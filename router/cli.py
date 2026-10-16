@@ -20,11 +20,14 @@ def table(rows: list[dict]) -> str:
     if any(row.get("control_mode") == "observe" for row in rows):
         lines.append("Native observations: up to 100 per page; use --native-offset N for more. Router tasks are not paged.")
     for row in rows:
-        owner = f"{row.get('executor', '?')}/{row.get('control_mode', 'control')}"
+        task_id = _cell(row["task_id"], 43)
+        owner = _cell(f"{row.get('executor', '?')}/{row.get('control_mode', 'control')}", 17)
+        state = _cell(row["status"], 17)
+        model = _cell(row.get("resolved_model") or "unknown", 24)
         elapsed = row.get("elapsed_ms")
         duration = f"{elapsed / 1000:.1f}s" if elapsed is not None else "unknown"
         cost = f"{row['cost']:.6f}" if row.get("cost") is not None else "unknown"
-        lines.append(f"{row['task_id']:<43} {owner:<17} {row['status']:<17} {row.get('resolved_model') or 'unknown':<24} {duration:<10} {cost}")
+        lines.append(f"{task_id:<43} {owner:<17} {state:<17} {model:<24} {duration:<10} {cost}")
         lines.append(f"  parent {text(row.get('parent_session_id')) or 'unknown'}/{text(row.get('parent_agent_id')) or 'unknown'}"
                      f" | work: {text(row.get('task')) or 'unknown'}")
         if row.get("activity"):
@@ -41,13 +44,72 @@ def table(rows: list[dict]) -> str:
             partial = " (partial)" if row.get("usage_complete") is False or row.get("usage_partial") else ""
             lines.append(f"  tokens{partial}: {json.dumps(row['usage'], sort_keys=True)}")
         if row.get("cost") is not None or row.get("cost_note"):
-            lines.append(f"  cost source: {row.get('cost_source', 'unavailable')} | {row.get('cost_note', '')}")
+            lines.append(f"  cost source: {_cell(row.get('cost_source', 'unavailable'))} | {_cell(row.get('cost_note', ''))}")
         if row.get("last_event_at"):
             lines.append(f"  last event {max(0, int(time.time() - row['last_event_at'] / 1000))}s ago")
         if row.get("visibility_reason"):
-            lines.append(f"  visibility: {row['visibility_reason']}")
+            lines.append(f"  visibility: {_cell(row['visibility_reason'])}")
         if row.get("runtime_partial"):
             lines.append("  runtime: observed segments only; an unconfirmed interval is omitted")
+    return "\n".join(lines)
+
+
+def _size(value: int | None) -> str:
+    if value is None:
+        return "—"
+    for suffix in ("B", "K", "M", "G", "T"):
+        if value < 1024 or suffix == "T":
+            return f"{value:.0f}{suffix}" if suffix == "B" else f"{value:.1f}{suffix}"
+        value /= 1024
+    return "—"
+
+
+def _cell(value: object, limit: int | None = None) -> str:
+    cleaned = "".join(character for character in str(value)
+                      if not (ord(character) < 32 or 127 <= ord(character) <= 159))
+    return cleaned[:limit] if limit is not None else cleaned
+
+
+def fleet_table(result: dict, capacity_only: bool = False) -> str:
+    lines = ["HOST       CAPACITY   SESSION              AGENT                STATE        ACTIVITY                 CPU    LOAD   MEM FREE DISK FREE"]
+    for record in result["hosts"]:
+        name = _cell(record["name"], 10)
+        if not record["ok"]:
+            error = _cell("error: " + record["error"], 24)
+            lines.append(f"{name:<10} {'offline':<10} {'—':<20} {'—':<20} {'—':<12} {error:<24} {'—':<6} {'—':<6} {'—':<8} {'—'}")
+            continue
+        snapshot = record["snapshot"]
+        capacity = snapshot.get("capacity", {})
+        state = _cell(capacity.get("capacity_state", "unknown"), 10)
+        cpu = f"{capacity['cpu_busy_pct']:.0f}%" if isinstance(capacity.get("cpu_busy_pct"), (int, float)) else "—"
+        load = f"{capacity['load_1m']:.1f}" if isinstance(capacity.get("load_1m"), (int, float)) else "—"
+        memory = _size(capacity.get("memory_available_bytes"))
+        disk = _size(capacity.get("disk_available_bytes"))
+        if capacity_only:
+            reason = _cell("; ".join(capacity.get("capacity_reasons", [])) or "capacity thresholds satisfied", 24)
+            lines.append(f"{name:<10} {state:<10} {'—':<20} {'—':<20} {'—':<12} {reason:<24} {cpu:<6} {load:<6} {memory:<8} {disk}")
+            continue
+        sessions = snapshot.get("sessions", [])
+        agents = snapshot.get("agents", [])
+        if not sessions and not agents:
+            lines.append(f"{name:<10} {state:<10} {'—':<20} {'—':<20} {'—':<12} {'no active sessions':<24} {cpu:<6} {load:<6} {memory:<8} {disk}")
+            continue
+        for index, session in enumerate(sessions):
+            display_state = _cell("needs_input" if session.get("needs_input") else session.get("status", "unknown"), 12)
+            activity = _cell(session.get("activity") or f"last: {session.get('last_event') or 'unknown'}", 24)
+            lines.append(f"{name if index == 0 else '':<10} {state if index == 0 else '':<10} "
+                         f"{_cell(session.get('session_id', '—'), 20):<20} {'main':<20} {display_state:<12} "
+                         f"{activity:<24} {cpu if index == 0 else '—':<6} {load if index == 0 else '—':<6} "
+                         f"{memory if index == 0 else '—':<8} {disk if index == 0 else '—'}")
+        for index, agent in enumerate(agents):
+            first = not sessions and index == 0
+            lines.append(f"{name if first else '':<10} {state if first else '':<10} "
+                         f"{_cell(agent.get('parent_session_id', '—'), 20):<20} "
+                         f"{_cell(agent.get('agent_type') or agent.get('agent_id') or 'unknown', 20):<20} "
+                         f"{_cell(agent.get('status', 'unknown'), 12):<12} "
+                         f"{_cell(agent.get('activity') or '—', 24):<24} "
+                         f"{cpu if first else '—':<6} {load if first else '—':<6} "
+                         f"{memory if first else '—':<8} {disk if first else '—'}")
     return "\n".join(lines)
 
 
@@ -64,6 +126,25 @@ def main() -> None:
     status.add_argument("--json", action="store_true")
     status.add_argument("--watch", action="store_true")
     status.add_argument("--native-offset", type=int, default=0, help="Native observation page offset (100 per page)")
+    snapshot = commands.add_parser("snapshot", help="Print a bounded read-only local host snapshot")
+    snapshot.add_argument("--json", action="store_true", required=True)
+    snapshot.add_argument("--history-limit", type=int, default=100)
+    fleet = commands.add_parser("fleet", help="Read configured local and SSH host snapshots")
+    fleet_commands = fleet.add_subparsers(dest="fleet_command", required=True)
+    fleet_status = fleet_commands.add_parser("status")
+    fleet_status.add_argument("--json", action="store_true")
+    fleet_status.add_argument("--watch", action="store_true")
+    fleet_status.add_argument("--strict", action="store_true")
+    fleet_status.add_argument("--config", type=Path)
+    fleet_capacity = fleet_commands.add_parser("capacity")
+    fleet_capacity.add_argument("--json", action="store_true")
+    fleet_capacity.add_argument("--strict", action="store_true")
+    fleet_capacity.add_argument("--config", type=Path)
+    fleet_host = fleet_commands.add_parser("host")
+    fleet_host.add_argument("name")
+    fleet_host.add_argument("--json", action="store_true")
+    fleet_host.add_argument("--strict", action="store_true")
+    fleet_host.add_argument("--config", type=Path)
     daemon = commands.add_parser("daemon")
     daemon.add_argument("action", choices=["start", "stop"])
     commands.add_parser("plugin-path", help="Print the bundled Claude plugin directory")
@@ -124,6 +205,38 @@ def main() -> None:
                 settings, environment = load_settings()
                 directory = state_dir()
                 serve(settings, environment, directory, socket_path())
+        elif args.command == "snapshot":
+            print(json.dumps(request("snapshot", {"history_limit": args.history_limit}), separators=(",", ":")))
+        elif args.command == "fleet":
+            from router.fleet import (
+                DEFAULT_CONFIG,
+                capacity_projection,
+                fleet_exit_ok,
+                load_fleet_config,
+                query_fleet,
+            )
+            from router.fleet_snapshot import AlertHistory
+            config = load_fleet_config(args.config or DEFAULT_CONFIG)
+            only = args.name if args.fleet_command == "host" else None
+            alert_history = AlertHistory()
+            while True:
+                result = query_fleet(config, only=only, alert_history=alert_history)
+                if args.json:
+                    output = capacity_projection(result) if args.fleet_command == "capacity" else result
+                    if getattr(args, "watch", False):
+                        print(json.dumps(output, separators=(",", ":")), flush=True)
+                    else:
+                        print(json.dumps(output, indent=2), flush=True)
+                else:
+                    if getattr(args, "watch", False) and sys.stdout.isatty():
+                        print("\033[2J\033[H", end="")
+                    print(fleet_table(result, capacity_only=args.fleet_command == "capacity"), flush=True)
+                if not fleet_exit_ok(result, args.strict) and not getattr(args, "watch", False):
+                    raise ValueError("Fleet snapshot failed for all hosts" if not any(host["ok"] for host in result["hosts"])
+                                     else "A required fleet host is unavailable")
+                if not getattr(args, "watch", False):
+                    break
+                time.sleep(config.refresh_seconds)
         elif args.command == "status":
             payload = {key: value for key, value in {"task_id": args.task_id, "filter": args.filter, "native_offset": args.native_offset}.items() if value}
             while True:

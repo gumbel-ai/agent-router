@@ -37,7 +37,11 @@ class NativeTests(unittest.TestCase):
         self.assertEqual(self.event("stop", at=2000)["status"], "stopped")
         self.assertEqual(stopped["duration_ms"], 1000)
         # A synchronous Agent result is delivered after SubagentStop.
-        self.assertEqual(self.event("launch", at=2100, parent_agent_id="main")["status"], "stopped")
+        result = self.event("result", at=2100, parent_agent_id="main", task="Fix parser",
+                            requested_model="opus", resolved_model="claude-opus", cost=.25)
+        self.assertEqual(result["status"], "stopped")
+        self.assertEqual((result["task"], result["resolved_model"], result["cost"]),
+                         ("Fix parser", "claude-opus", .25))
         self.assertEqual(stopped["control_mode"], "observe")
         self.assertIsNone(stopped["cost"])
         other = self.event("start", session="different")

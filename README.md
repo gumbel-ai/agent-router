@@ -8,6 +8,7 @@ Delegate coding tasks to another agent while the parent stays in control.
 - Choose the exact child model, with no silent substitution.
 - Run tasks in parallel while the parent keeps working.
 - Watch native Claude subagents and Router-launched children across projects with `router status --watch`.
+- View configured macOS and Linux hosts, Claude sessions, subagents, and available capacity with `router fleet status --watch`.
 - Give each child its own Git worktree and dependencies, not a security sandbox.
 - Start from your current files, including uncommitted changes.
 - Let the parent inspect, request corrections, accept, or discard the work.
@@ -46,5 +47,53 @@ The plugin is also installable through Claude's normal marketplace command after
 ```sh
 claude plugin install agent-router --marketplace gumbel-ai/agent-router --scope user
 ```
+
+## Fleet monitoring
+
+Fleet monitoring is read-only and independent of external delegation. Each host keeps its own lifecycle history and capacity sample; the viewing machine pulls bounded JSON snapshots concurrently through the user's existing SSH configuration. An unavailable host is shown as offline and does not hide healthy hosts.
+
+Create `~/.agent-router/fleet.toml` on the viewing machine:
+
+```toml
+schema_version = 1
+ssh_timeout_seconds = 3
+refresh_seconds = 2
+
+[capacity_defaults]
+minimum_available_memory_gib = 4
+maximum_cpu_busy_for_available_pct = 65
+maximum_load_per_logical_cpu_for_available = 0.75
+minimum_disk_available_gib = 10
+
+[[host]]
+name = "laptop"
+transport = "local"
+
+[[host]]
+name = "ryzen"
+transport = "ssh"
+target = "ryzen"
+tags = ["numeric", "canonical-research-host"]
+minimum_available_memory_gib = 12
+```
+
+Run `router snapshot --json` for the local bounded schema, `router fleet status --watch` for the combined table, or `router fleet status --json` for machine-readable output. Combining `--watch --json` emits one compact JSON document per line. `router fleet capacity` shows only capacity summaries, and `router fleet host ryzen --json` returns one configured host. Add `--strict` when automation must fail if any host marked `required = true` is unavailable.
+
+The fleet command invokes only `router snapshot --json` remotely. It does not copy SQLite files, change SSH configuration, schedule work, kill processes, or write project state. Capacity states are summaries over explicit CPU, load, memory, and disk thresholds; inspect the accompanying raw measurements and reason list for job-specific decisions. Milestone A intentionally leaves `managed_processes` and `inferred_processes` empty until process visibility is implemented.
+
+An external coordinator can reserve a host without granting Router any control authority by atomically writing `~/.agent-router/reservation.json` on that host:
+
+```json
+{
+  "schema_version": 1,
+  "reserved_by": "research-scheduler",
+  "reserved_until": 1792173600000,
+  "reserved_cpu_slots": 8,
+  "reserved_memory_bytes": 34359738368,
+  "reservation_source": "experiment-queue"
+}
+```
+
+`reserved_until` is a Unix timestamp in milliseconds. Router only reads this file. An active reservation prevents the host from being classified as `available`; a reservation consuming every logical CPU or leaving critically little unreserved memory makes it `saturated`. Missing files mean no reservation, while malformed files mark capacity `unknown` and the snapshot partial. Writers should replace the file atomically so readers never observe a partial record.
 
 License: [MIT](LICENSE).

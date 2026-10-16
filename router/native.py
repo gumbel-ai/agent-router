@@ -8,6 +8,7 @@ from pathlib import Path
 from router.db import Store, now_ms
 from router.dispatch import canonical
 from router.pricing import DEFAULT_PRICES, PRICE_DATE, PRICE_SOURCE, estimate
+from router.redaction import redact_secrets
 
 STALE_AFTER_MS = 60_000
 TOKEN_KEYS = ("input_tokens", "output_tokens", "cache_read_input_tokens", "cache_creation_input_tokens")
@@ -20,22 +21,26 @@ def text(value: object, limit: int = 240) -> str | None:
 
 
 class NativeObserver:
-    def __init__(self, store: Store, prices=None):
+    def __init__(self, store: Store, prices=None, host_id: str | None = None):
         self.store = store
+        self.host_id = host_id or "unknown"
         self.prices = {**DEFAULT_PRICES, **(prices or {})}
         self.price_override_models = set(prices or {})
 
     def reconcile_restart(self) -> None:
         # A daemon restart is not evidence that host-owned execution continued.
         with self.store.transaction() as db:
-            for row in db.execute("SELECT data FROM observations").fetchall():
+            for row in db.execute("""SELECT data FROM observations
+                    WHERE json_extract(data,'$.host_id')=? AND json_extract(data,'$.source')='claude'""",
+                    (self.host_id,)).fetchall():
                 record = json.loads(row[0])
-                if record["status"] == "running":
+                if record["status"] in {"running", "idle", "needs_input"}:
                     record.update(status="unknown", visibility_reason="Router restarted; awaiting native lifecycle evidence")
                     self.put(db, record)
 
     def put(self, db, record: dict) -> None:
-        db.execute("INSERT INTO observations VALUES(?,?,?) ON CONFLICT(task_id) DO UPDATE SET data=excluded.data",
+        db.execute("""INSERT INTO observations(task_id,session_id,data) VALUES(?,?,?)
+            ON CONFLICT(task_id) DO UPDATE SET data=excluded.data""",
                    (record["task_id"], record["parent_session_id"], canonical(record)))
 
     def get(self, task_id: str, db=None) -> dict:
@@ -47,27 +52,36 @@ class NativeObserver:
             raise ValueError("Unknown observed agent")
         return json.loads(row[0])
 
-    def observe(self, event: dict) -> dict:
+    def observe(self, event: dict, timeout: float = 10) -> dict:
         source, session, kind = (event.get(key) for key in ("source", "session_id", "kind"))
         at = event.get("observed_at")
-        if source != "claude" or not text(session) or kind not in {"start", "launch", "result", "activity", "stop", "session_end"}:
+        if source != "claude" or not text(session) or kind not in {
+                "start", "launch", "result", "activity", "stop", "session_end", "idle", "needs_input", "failed"}:
             raise ValueError("Unsupported native observation")
         if not isinstance(at, int) or isinstance(at, bool) or at < 0:
             raise ValueError("Native observation requires a timestamp")
-        with self.store.transaction() as db:
+        with self.store.transaction(timeout) as db:
             if kind == "session_end":
-                for row in db.execute("SELECT data FROM observations WHERE session_id=?", (session,)).fetchall():
+                for row in db.execute("""SELECT data FROM observations WHERE session_id=?
+                        AND json_extract(data,'$.host_id')=? AND json_extract(data,'$.source')=?""",
+                        (session, self.host_id, source)).fetchall():
                     record = json.loads(row[0])
-                    if record["status"] != "stopped" and at >= record["state_at"]:
-                        record.update(status="unknown", continuity_uncertain=True, visibility_reason="Host session ended without observed agent stop")
+                    if record["status"] in {"running", "idle", "needs_input"} and at >= record["state_at"]:
+                        record.update(status="unknown", continuity_uncertain=True,
+                                      visibility_reason="Host session ended without observed agent stop",
+                                      state_at=at, last_event_at=max(record["last_event_at"] or 0, at))
                         self.put(db, record)
                 return {"observed": True}
             agent = event.get("agent_id")
             if not text(agent):
                 raise ValueError("Native observation requires agent_id")
             task_id = "native-" + uuid.uuid5(uuid.NAMESPACE_URL, canonical([source, session, agent])).hex
-            row = db.execute("SELECT data FROM observations WHERE task_id=?", (task_id,)).fetchone()
+            row = db.execute("""SELECT data FROM observations
+                    WHERE json_extract(data,'$.host_id')=? AND json_extract(data,'$.source')=?
+                      AND session_id=? AND json_extract(data,'$.agent_id')=?""",
+                    (self.host_id, source, session, agent)).fetchone()
             record = json.loads(row[0]) if row else {
+                "host_id": self.host_id, "source": source,
                 "task_id": task_id, "agent_id": agent, "executor": source, "owner": source, "control_mode": "observe",
                 "parent_session_id": session, "parent_agent_id": None, "task": None, "agent_type": None,
                 "requested_model": None, "resolved_model": None, "models": [], "model_source": None,
@@ -79,9 +93,14 @@ class NativeObserver:
                 "cost_note": "Token usage unavailable", "price_date": None, "price_source": None, "price_overrides_used": [],
                 "price_sources": {}, "usage_partial": False, "transcript_pending": False, "transcript_eof": False,
                 "skip_line": False, "transcript": None, "transcript_offset": 0, "messages": {}, "visibility_reason": None}
+            terminal_metadata_only = record["status"] in {"stopped", "failed"} and kind == "result"
+            if record["status"] in {"stopped", "failed"} and kind not in {"start", "result"}:
+                return self.view(record)
             for key in ("parent_agent_id", "task", "agent_type", "requested_model", "cwd", "activity", "summary"):
                 value = text(event.get(key), 800 if key == "summary" else 240)
                 if value is not None:
+                    if key == "task":
+                        value = redact_secrets(value, 240)
                     record[key] = value
             for key in ("transcript", "worktree"):
                 if isinstance(event.get(key), str):
@@ -100,7 +119,8 @@ class NativeObserver:
             if kind == "stop":
                 # The final API response may have arrived after the last poll.
                 record["transcript_eof"] = False
-            if at >= record["state_at"] and not (kind == "launch" and record["last_observed_status"] == "stopped"):
+            if (not terminal_metadata_only and at >= record["state_at"]
+                    and not (kind == "launch" and record["last_observed_status"] == "stopped")):
                 if kind == "result":
                     if record["status"] != "stopped":
                         record.update(status="unknown", continuity_uncertain=True, visibility_reason="Host returned a result without observed stop")
@@ -113,12 +133,26 @@ class NativeObserver:
                     record["transcript_eof"] = False
                     if record["started_at"] is None:
                         record["started_at"] = at
-                else:
+                elif kind == "stop":
                     if record["status"] != "stopped" and record["run_started_at"] is not None:
                         record["duration_ms"] = (record["duration_ms"] or 0) + max(0, at - record["run_started_at"])
                     record.update(status="stopped", last_observed_status="stopped", finished_at=at, run_started_at=None,
                                   continuity_uncertain=False, visibility_reason=None)
-                if kind in {"start", "activity", "stop"}:
+                elif kind == "idle":
+                    if record.get("run_started_at") is not None:
+                        record["duration_ms"] = (record["duration_ms"] or 0) + max(0, at - record["run_started_at"])
+                    record.update(status="idle", last_observed_status="idle", run_started_at=None, visibility_reason=None)
+                elif kind == "needs_input":
+                    if record.get("run_started_at") is not None:
+                        record["duration_ms"] = (record["duration_ms"] or 0) + max(0, at - record["run_started_at"])
+                    record.update(status="needs_input", last_observed_status="needs_input", run_started_at=None,
+                                  visibility_reason="Claude reported that the agent needs input")
+                else:
+                    if record.get("run_started_at") is not None:
+                        record["duration_ms"] = (record["duration_ms"] or 0) + max(0, at - record["run_started_at"])
+                    record.update(status="failed", last_observed_status="failed", finished_at=at, run_started_at=None,
+                                  visibility_reason=text(event.get("failure_reason"), 500) or "Agent turn failed")
+                if kind in {"start", "activity", "stop", "idle", "needs_input", "failed"}:
                     record["state_at"] = at
             record["last_event_at"] = max(record["last_event_at"] or 0, at)
             self.put(db, record)
@@ -247,14 +281,16 @@ class NativeObserver:
     def view(record: dict) -> dict:
         result = {key: value for key, value in record.items() if key not in {
             "messages", "transcript_offset", "state_at", "run_started_at", "skip_line", "transcript_eof", "continuity_uncertain"}}
+        if isinstance(result.get("task"), str):
+            result["task"] = redact_secrets(result["task"], 240)
         if (record.get("usage_partial") or record.get("transcript_pending")) and record["cost_source"] != "host_reported_estimate":
             result.update(cost=None, cost_source="unavailable", cost_note="Transcript usage incomplete or not yet fully read")
         now = now_ms()
         age = max(0, now - record["last_event_at"]) if record["last_event_at"] is not None else None
         result["observation_age_ms"] = age
         result["elapsed_ms"] = None
-        if record["status"] == "running" and age is not None and age > STALE_AFTER_MS:
-            result.update(status="unknown", visibility_reason="No recent native lifecycle evidence; last observed running")
+        if record["status"] in {"running", "idle", "needs_input"} and age is not None and age > STALE_AFTER_MS:
+            result.update(status="unknown", visibility_reason="No recent native lifecycle evidence; last observed nonterminal state")
         elif record["status"] == "running" and record["run_started_at"] is not None:
             result["elapsed_ms"] = (record["duration_ms"] or 0) + max(0, now - record["run_started_at"])
         elif record["status"] == "stopped":
@@ -270,3 +306,17 @@ class NativeObserver:
                 json_extract(data,'$.last_event_at') DESC LIMIT 100 OFFSET ?""", (offset,))]
         return [{key: value for key, value in self.view(self.refresh(identity)).items() if key not in {
             "files_touched", "summary", "transcript", "price_sources"}} for identity in identities]
+
+    def snapshot(self, limit: int = 100) -> list[dict]:
+        """Bounded status view without transcript I/O on the snapshot hot path."""
+        cutoff = now_ms() - 300_000
+        with self.store.connect() as db:
+            records = [json.loads(row[0]) for row in db.execute("""SELECT data FROM observations
+                WHERE json_extract(data,'$.host_id')=? AND
+                    (json_extract(data,'$.status') IN ('running','idle','needs_input') OR
+                     json_extract(data,'$.last_event_at')>=?)
+                ORDER BY CASE json_extract(data,'$.status')
+                    WHEN 'running' THEN 0 WHEN 'needs_input' THEN 1 WHEN 'unknown' THEN 2 ELSE 3 END,
+                    json_extract(data,'$.last_event_at') DESC LIMIT ?""", (self.host_id, cutoff, limit))]
+        return [{key: value for key, value in self.view(record).items() if key not in {
+            "files_touched", "summary", "transcript", "price_sources", "messages"}} for record in records]

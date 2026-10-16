@@ -4,8 +4,10 @@ import fcntl
 import json
 import logging
 import os
+import queue
 import socket
 import socketserver
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -13,12 +15,15 @@ import time
 import uuid
 from pathlib import Path
 
+from router.capacity import CapacitySampler
 from router.child import child_environment, executor_command, launch
 from router.codex import collect as collect_codex
 from router.codex import price_metadata
 from router.config import Settings
 from router.db import Store, now_ms
 from router.dispatch import MUTATIONS, canonical
+from router.fleet_snapshot import AlertHistory
+from router.host import HostIdentity
 from router.native import NativeObserver
 from router.process import (
     UncertainProcess,
@@ -28,11 +33,13 @@ from router.process import (
     supervised_state,
     verify_shutdown,
 )
+from router.sessions import SessionObserver
 from router.snapshot import cleanup, git, validate_repository
 
 ACTIVE = {"created", "validating", "preparing", "running", "retrying", "cancelling"}
 DECISIONS = {"awaiting_review", "blocked", "failed", "interrupted"}
 LOGGER = logging.getLogger(__name__)
+LIFECYCLE_STOP_TIMEOUT_SECONDS = 2.5
 
 
 def blocks_maintenance(task: dict) -> bool:
@@ -105,11 +112,110 @@ class Controller:
         if any(self.directory.is_relative_to(Path(root)) for root in settings.repositories):
             raise ValueError("Router state must be outside every configured parent worktree")
         self.directory.mkdir(parents=True, exist_ok=True, mode=0o700)
-        self.store = Store(self.directory / "router.sqlite3")
-        self.native = NativeObserver(self.store, settings.model_prices)
+        self.directory.chmod(0o700)
+        self.host = HostIdentity(self.directory)
+        self.store = Store(self.directory / "router.sqlite3", self.host.host_id)
+        with self.store.transaction() as db:
+            db.execute("INSERT INTO hosts(host_id,data) VALUES(?,?) ON CONFLICT(host_id) DO UPDATE SET data=excluded.data",
+                       (self.host.host_id, canonical(self.host.view(now_ms()))))
+        self.native = NativeObserver(self.store, settings.model_prices, self.host.host_id)
+        self.sessions = SessionObserver(self.store, self.host.host_id)
+        self.capacity = CapacitySampler(self.directory)
+        self.alert_history = AlertHistory()
+        self.lifecycle_queue: queue.Queue[tuple[dict, threading.Event, dict] | None] = queue.Queue(maxsize=1024)
+        self.lifecycle_thread: threading.Thread | None = None
+        self.lifecycle_stopping = False
+        self.lifecycle_failures = 0
+        self.lifecycle_dropped = 0
+        self.lifecycle_health_lock = threading.Lock()
         self.changed = threading.Event()
         self.lifecycle_lock = threading.Lock()
         self.draining = False
+
+    def start_lifecycle_writer(self) -> None:
+        with self.lifecycle_lock:
+            if self.lifecycle_thread is not None:
+                return
+            self.lifecycle_stopping = False
+            self.lifecycle_thread = threading.Thread(
+                target=self._write_lifecycle, name="router-lifecycle", daemon=True,
+            )
+            self.lifecycle_thread.start()
+
+    def _write_lifecycle(self) -> None:
+        while True:
+            work = self.lifecycle_queue.get()
+            completed = None
+            try:
+                if work is None:
+                    return
+                payload, completed, outcome = work
+                requested = 0
+                persisted = 0
+                for key, observer in (("session", self.sessions), ("native", self.native)):
+                    event = payload.get(key)
+                    if event is None:
+                        continue
+                    requested += 1
+                    try:
+                        observer.observe(event, timeout=0 if self.lifecycle_stopping else 1)
+                    except (sqlite3.Error, ValueError, KeyError, TypeError, OSError, OverflowError) as error:
+                        LOGGER.warning("Lifecycle %s observation could not be persisted: %s", key, error)
+                        with self.lifecycle_health_lock:
+                            self.lifecycle_failures += 1
+                    # Protect the long-lived writer from unexpected observer bugs.
+                    except Exception:
+                        LOGGER.exception("Unexpected lifecycle %s observation failure", key)
+                        with self.lifecycle_health_lock:
+                            self.lifecycle_failures += 1
+                    else:
+                        persisted += 1
+                outcome["persisted"] = requested > 0 and persisted == requested
+            # One malformed work item must not kill the writer.
+            except Exception:
+                LOGGER.exception("Unexpected lifecycle work item failure")
+                with self.lifecycle_health_lock:
+                    self.lifecycle_failures += 1
+            finally:
+                if completed is not None:
+                    completed.set()
+                self.lifecycle_queue.task_done()
+
+    def stop_lifecycle_writer(self) -> None:
+        with self.lifecycle_lock:
+            thread = self.lifecycle_thread
+            if thread is None:
+                return
+            self.lifecycle_stopping = True
+        # Admission is closed under lifecycle_lock, so the sentinel is ordered
+        # after every accepted observation. Graceful shutdown must not discard
+        # work that callers were already told was accepted.
+        deadline = time.monotonic() + LIFECYCLE_STOP_TIMEOUT_SECONDS
+        try:
+            self.lifecycle_queue.put(None, timeout=LIFECYCLE_STOP_TIMEOUT_SECONDS)
+        except queue.Full:
+            LOGGER.error(
+                "Lifecycle writer could not begin shutdown; %d accepted observations remain queued",
+                self.lifecycle_queue.qsize(),
+            )
+            return
+        thread.join(timeout=max(0, deadline - time.monotonic()))
+        if thread.is_alive():
+            LOGGER.error(
+                "Lifecycle writer did not stop within %.1f seconds; accepted observations remain pending",
+                LIFECYCLE_STOP_TIMEOUT_SECONDS,
+            )
+            return
+        with self.lifecycle_lock:
+            if self.lifecycle_thread is thread:
+                self.lifecycle_thread = None
+
+    def lifecycle_health(self) -> str | None:
+        with self.lifecycle_health_lock:
+            failures, dropped = self.lifecycle_failures, self.lifecycle_dropped
+        if not failures and not dropped:
+            return None
+        return f"Lifecycle observations not persisted: {failures} write failures, {dropped} queue overflows"
 
     def busy(self) -> int:
         return sum(blocks_maintenance(task) for task in self.store.all())
@@ -130,6 +236,35 @@ class Controller:
                     "active_tasks": self.busy()}
         if operation == "observe":
             return self.native.observe(payload)
+        if operation == "session_observe":
+            return self.sessions.observe(payload)
+        if operation == "lifecycle_observe":
+            if set(payload) - {"session", "native"}:
+                raise ValueError("Unknown lifecycle observation field")
+            if not any(payload.get(key) is not None for key in ("session", "native")):
+                raise ValueError("Lifecycle observation is empty")
+            completed = threading.Event()
+            outcome = {"persisted": False}
+            with self.lifecycle_lock:
+                if (self.lifecycle_stopping or self.lifecycle_thread is None
+                        or not self.lifecycle_thread.is_alive()):
+                    return {"accepted": False, "reason": "Lifecycle observation writer is stopping"}
+                try:
+                    self.lifecycle_queue.put_nowait((dict(payload), completed, outcome))
+                except queue.Full:
+                    with self.lifecycle_health_lock:
+                        self.lifecycle_dropped += 1
+                    return {"accepted": False, "reason": "Lifecycle observation queue is full"}
+            completed.wait(.04)
+            return {"accepted": True, "persisted": completed.is_set() and outcome["persisted"]}
+        if operation == "snapshot":
+            if set(payload) - {"history_limit"}:
+                raise ValueError("Unknown snapshot option")
+            history_limit = payload.get("history_limit", 100)
+            if not isinstance(history_limit, int) or isinstance(history_limit, bool) or not 1 <= history_limit <= 1000:
+                raise ValueError("history_limit must be an integer from 1 to 1000")
+            from router.fleet_snapshot import compose
+            return compose(self, history_limit=history_limit)
         if operation not in MUTATIONS:
             raise ValueError("Unknown operation")
         if str(payload.get("task_id", "")).startswith("native-"):
@@ -352,6 +487,9 @@ class Runtime:
     def start(self) -> None:
         # In serve(), the single-instance daemon lock is already held here.
         self.control.native.reconcile_restart()
+        self.control.sessions.reconcile_restart()
+        self.control.start_lifecycle_writer()
+        self.control.capacity.start()
         for task in self.store.all():
             if task["status"] == "closed" and task.get("cleanup_pending") and task.get("cleanup_error") is None:
                 self.store.update(task["task_id"], lambda t: t.update(cleanup_requested=True))
@@ -739,6 +877,8 @@ class Runtime:
 
     def stop(self) -> None:
         self.stopping.set()
+        self.control.stop_lifecycle_writer()
+        self.control.capacity.stop()
         self.control.changed.set()
         self.scheduler.join(timeout=2)
         for task in self.store.all():
@@ -794,7 +934,7 @@ class Server(socketserver.ThreadingUnixStreamServer):
 
 
 def serve(settings: Settings, environment: dict[str, str], directory: Path, endpoint: Path) -> None:
-    controller = Controller(settings, environment, directory)
+    directory.mkdir(parents=True, exist_ok=True, mode=0o700)
     directory.chmod(0o700)
     endpoint.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     with (directory / "daemon.lock").open("a") as lock:
@@ -802,6 +942,7 @@ def serve(settings: Settings, environment: dict[str, str], directory: Path, endp
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as error:
             raise ValueError("Agent Router is already running") from error
+        controller = Controller(settings, environment, directory)
         if endpoint.exists():
             import stat
             endpoint_info = endpoint.lstat()

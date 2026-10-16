@@ -1,6 +1,10 @@
 {
   "hooks": {
-    "UserPromptSubmit": [{"hooks": [{"type": "command", "command": "sh \"${CLAUDE_PLUGIN_ROOT}/hook.sh\" submit", "timeout": 20}]}],
+    "SessionStart": [{"hooks": [{"type": "command", "command": "sh \"${CLAUDE_PLUGIN_ROOT}/hook.sh\" observe", "timeout": 2}]}],
+    "UserPromptSubmit": [{"hooks": [
+      {"type": "command", "command": "sh \"${CLAUDE_PLUGIN_ROOT}/hook.sh\" submit", "timeout": 20},
+      {"type": "command", "command": "sh \"${CLAUDE_PLUGIN_ROOT}/hook.sh\" observe", "timeout": 2}
+    ]}],
     "PreToolUse": [
       {"matcher": "Bash", "hooks": [{"type": "command", "command": "sh \"${CLAUDE_PLUGIN_ROOT}/hook.sh\" authorize", "timeout": 20}]},
       {"hooks": [{"type": "command", "command": "sh \"${CLAUDE_PLUGIN_ROOT}/hook.sh\" observe", "timeout": 2}]}
@@ -9,6 +13,12 @@
     "PostToolUseFailure": [{"hooks": [{"type": "command", "command": "sh \"${CLAUDE_PLUGIN_ROOT}/hook.sh\" observe", "timeout": 2}]}],
     "SubagentStart": [{"hooks": [{"type": "command", "command": "sh \"${CLAUDE_PLUGIN_ROOT}/hook.sh\" observe", "timeout": 2}]}],
     "SubagentStop": [{"hooks": [{"type": "command", "command": "sh \"${CLAUDE_PLUGIN_ROOT}/hook.sh\" observe", "timeout": 2}]}],
+    "TaskCreated": [{"hooks": [{"type": "command", "command": "sh \"${CLAUDE_PLUGIN_ROOT}/hook.sh\" observe", "timeout": 2}]}],
+    "TaskCompleted": [{"hooks": [{"type": "command", "command": "sh \"${CLAUDE_PLUGIN_ROOT}/hook.sh\" observe", "timeout": 2}]}],
+    "TeammateIdle": [{"hooks": [{"type": "command", "command": "sh \"${CLAUDE_PLUGIN_ROOT}/hook.sh\" observe", "timeout": 2}]}],
+    "Stop": [{"hooks": [{"type": "command", "command": "sh \"${CLAUDE_PLUGIN_ROOT}/hook.sh\" observe", "timeout": 2}]}],
+    "StopFailure": [{"hooks": [{"type": "command", "command": "sh \"${CLAUDE_PLUGIN_ROOT}/hook.sh\" observe", "timeout": 2}]}],
+    "Notification": [{"hooks": [{"type": "command", "command": "sh \"${CLAUDE_PLUGIN_ROOT}/hook.sh\" observe", "timeout": 2}]}],
     "SessionEnd": [{"hooks": [{"type": "command", "command": "sh \"${CLAUDE_PLUGIN_ROOT}/hook.sh\" observe", "timeout": 2}]}]
   }
 }
