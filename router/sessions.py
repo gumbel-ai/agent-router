@@ -50,10 +50,23 @@ class SessionObserver:
         row = db.execute("SELECT data FROM sessions WHERE host_id=? AND source=? AND session_id=?",
                          (self.host_id, source, session_id)).fetchone()
         if row:
-            return json.loads(row[0])
+            record = json.loads(row[0])
+            process_values = (
+                record.get("claude_pid"), record.get("claude_process_start_time"),
+                record.get("claude_creation_identity"),
+            )
+            record.setdefault(
+                "process_visibility_reason",
+                None if all(value is not None for value in process_values)
+                else "Claude process identity has not been observed",
+            )
+            return record
         return {"host_id": self.host_id, "source": source, "session_id": session_id,
                 "parent_session_id": None, "status": "unknown", "cwd": None,
                 "started_at": at, "last_event_at": at, "finished_at": None, "model": None,
+                "claude_pid": None, "claude_process_start_time": None,
+                "claude_creation_identity": None,
+                "process_visibility_reason": "Claude process identity has not been observed",
                 "coordinator_role": "unknown", "visibility_reason": "SessionStart was not observed",
                 "activity": None, "needs_input": False, "last_event": None,
                 "inflight_tools": [], "tool_event_at": {}, "tool_finished_at": {},
@@ -146,6 +159,26 @@ class SessionObserver:
                     record[key] = value
             if event.get("parent_session_id") is not None:
                 record["parent_session_id"] = identifier(event["parent_session_id"], "parent_session_id")
+            process_values = (
+                event.get("claude_pid"), event.get("claude_process_start_time"),
+                event.get("claude_creation_identity"),
+            )
+            if any(value is not None for value in process_values):
+                pid, start_time, identity = process_values
+                if (not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0
+                        or not isinstance(start_time, str) or not start_time or len(start_time) > 240
+                        or not isinstance(identity, str) or not identity or len(identity) > 240):
+                    raise ValueError("Session process evidence is invalid")
+                current_process_values = (
+                    record.get("claude_pid"), record.get("claude_process_start_time"),
+                    record.get("claude_creation_identity"),
+                )
+                if kind == "session_start" or not any(
+                        value is not None for value in current_process_values):
+                    record.update(
+                        claude_pid=pid, claude_process_start_time=start_time,
+                        claude_creation_identity=identity, process_visibility_reason=None,
+                    )
             if kind == "session_start":
                 record.update(status="running", finished_at=None, visibility_reason=None,
                               activity="session " + (safe_text(event.get("start_source"), 240) or "start"),
@@ -345,7 +378,7 @@ class SessionObserver:
                    (self.host_id, session["source"], session["session_id"], task_id, canonical(task)))
 
     @staticmethod
-    def view(record: dict, at: int | None = None) -> dict:
+    def view(record: dict, at: int | None = None, *, managed_active: bool = False) -> dict:
         for key in ("host_id", "source", "session_id", "parent_session_id"):
             if record.get(key) is not None:
                 identifier(record[key], key)
@@ -382,6 +415,13 @@ class SessionObserver:
                 and not active_tool and age > STALE_AFTER_MS):
             result.update(status="unknown", needs_input=False,
                           visibility_reason="No recent session lifecycle evidence; last observed nonterminal state")
+        if (managed_active and record["status"] != "stopped"
+                and not result.get("needs_input")):
+            result.update(
+                status="running", needs_input=False,
+                activity=result.get("activity") or "managed process",
+                visibility_reason="Related managed process is running",
+            )
         return result
 
     def sessions(self, limit: int = 100) -> list[dict]:
@@ -393,29 +433,54 @@ class SessionObserver:
         cutoff = at - RECENT_HISTORY_MS
         with self.store.connect() as db:
             db.execute("BEGIN")
-            records = [json.loads(row[0]) for row in db.execute(
-                """SELECT data FROM sessions WHERE host_id=? AND
-                    (json_extract(data,'$.status') IN ('running','idle','unknown') OR
-                     json_extract(data,'$.needs_input')=1 OR json_extract(data,'$.last_event_at')>=?)
-                    ORDER BY json_extract(data,'$.last_event_at') DESC LIMIT ?""",
-                (self.host_id, cutoff, limit))]
+            records = [
+                (json.loads(row["data"]), bool(row["managed_active"]))
+                for row in db.execute(
+                    """WITH visible AS (
+                        SELECT s.data,
+                            EXISTS(SELECT 1 FROM managed_processes mp
+                                WHERE mp.host_id=s.host_id AND mp.status='running'
+                                AND json_extract(mp.data,'$.session_id')=s.session_id)
+                                AS managed_active
+                        FROM sessions s WHERE s.host_id=?
+                    )
+                    SELECT data,managed_active FROM visible WHERE
+                        json_extract(data,'$.status') IN ('running','idle','unknown') OR
+                        json_extract(data,'$.needs_input')=1 OR
+                        json_extract(data,'$.last_event_at')>=? OR managed_active=1
+                    ORDER BY managed_active DESC,
+                        json_extract(data,'$.last_event_at') DESC LIMIT ?""",
+                    (self.host_id, cutoff, limit),
+                )
+            ]
             future_or_partial = db.execute("""SELECT COUNT(*) FROM sessions WHERE host_id=? AND (
                     json_extract(data,'$.last_event_at')>? OR
                     json_extract(data,'$.tool_overflow_active')=1 OR
                     (json_extract(data,'$.tool_correlation_partial')=1 AND
                      COALESCE(json_extract(data,'$.tool_correlation_partial_until'),?)>=?))""",
                                            (self.host_id, at, at, at)).fetchone()[0]
-            fresh_active = db.execute("""SELECT COUNT(*) FROM sessions WHERE host_id=? AND
+            fresh_active = {row["session_id"] for row in db.execute("""SELECT session_id FROM sessions WHERE host_id=? AND
                     (json_extract(data,'$.status')='running' OR json_extract(data,'$.needs_input')=1) AND
                     json_extract(data,'$.last_event_at') BETWEEN ? AND ?""",
-                                      (self.host_id, at - STALE_AFTER_MS, at)).fetchone()[0]
-            active_tools = db.execute("""SELECT COUNT(*) FROM sessions WHERE host_id=? AND
+                                      (self.host_id, at - STALE_AFTER_MS, at))}
+            managed_active = {row["session_id"] for row in db.execute(
+                """SELECT DISTINCT s.session_id FROM sessions s
+                    JOIN managed_processes mp ON mp.host_id=s.host_id
+                    AND json_extract(mp.data,'$.session_id')=s.session_id
+                    WHERE s.host_id=? AND mp.status='running'
+                    AND json_extract(s.data,'$.status')!='stopped'""",
+                (self.host_id,),
+            )}
+            active_tools = {row["session_id"] for row in db.execute("""SELECT session_id FROM sessions WHERE host_id=? AND
                     json_extract(data,'$.status')='running' AND
                     json_extract(data,'$.last_event_at')<? AND
                     json_extract(data,'$.tool_active_until')>=?""",
-                                      (self.host_id, at - STALE_AFTER_MS, at)).fetchone()[0]
-        active = None if future_or_partial else fresh_active + active_tools
-        return [self.view(record, at) for record in records], active
+                                      (self.host_id, at - STALE_AFTER_MS, at))}
+        active = None if future_or_partial else len(fresh_active | managed_active | active_tools)
+        return [
+            self.view(record, at, managed_active=is_managed_active)
+            for record, is_managed_active in records
+        ], active
 
     def active_count(self) -> int | None:
         return self.fleet_records(0)[1]

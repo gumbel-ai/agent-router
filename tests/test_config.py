@@ -21,6 +21,7 @@ class ConfigTests(unittest.TestCase):
                 self.assertFalse(config.delegation_enabled)
                 self.assertEqual(config.repositories, {})
                 self.assertEqual(config.models, {})
+                self.assertEqual(config.process_sample_interval_seconds, 5)
 
     def test_required_operator_configuration_and_bounds(self):
         valid = {"AGENT_ROUTER_CONCURRENCY_CAP": 3, "AGENT_ROUTER_ATTEMPT_TIMEOUT_SECONDS": 30,
@@ -34,6 +35,8 @@ class ConfigTests(unittest.TestCase):
         cases += [{**valid, "AGENT_ROUTER_MODEL_PRICES": {"m": []}},
                   {**valid, "AGENT_ROUTER_MODEL_PRICES": {"m": [{"input": float("nan"), "output": 1,
                       "cache_read": 0, "cache_write_5m": 1, "cache_write_1h": 1}]}}]
+        cases += [{**valid, "AGENT_ROUTER_PROCESS_SAMPLE_INTERVAL_SECONDS": 0},
+                  {**valid, "AGENT_ROUTER_PROCESS_SAMPLE_INTERVAL_SECONDS": float("nan")}]
         def check(values):
             with self.assertRaises(ValidationError):
                 Settings(**values)

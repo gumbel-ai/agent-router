@@ -4,6 +4,7 @@ import hashlib
 import json
 import math
 import os
+import re
 import selectors
 import signal
 import subprocess
@@ -56,6 +57,23 @@ MIN_SSH_TIMEOUT_SECONDS = 0.1
 MAX_SSH_TIMEOUT_SECONDS = 60.0
 MIN_REFRESH_SECONDS = 0.1
 MAX_REFRESH_SECONDS = 3600.0
+_SAFE_ENVIRONMENT_NAMES = frozenset({"LANG", "LC_ALL", "LC_CTYPE", "TERM", "TZ"})
+_MANAGED_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
+_MANAGED_PROCESS_FIELDS = frozenset({
+    "managed_process_id", "host_id", "boot_id", "pid", "pgid", "process_start_time",
+    "creation_identity", "group_creation_identity", "label", "session_id", "agent_id",
+    "attribution", "executable", "argument_hash", "argument_count", "cwd",
+    "environment_allowlist", "status", "registered_at", "started_at", "last_sample_at",
+    "finished_at", "exit_status", "signal", "elapsed_ms", "cpu_pct", "rss_bytes",
+    "peak_rss_bytes", "cpu_seconds", "shutdown_uncertain", "shutdown_was_uncertain",
+    "descendant_tracking_truncated", "visibility_reason",
+    "worker_count",
+})
+_INFERRED_PROCESS_FIELDS = frozenset({
+    "host_id", "boot_id", "pid", "pgid", "process_start_time", "creation_identity",
+    "session_id", "agent_id", "attribution", "executable", "status", "observed_at",
+    "cpu_pct", "rss_bytes",
+})
 
 
 @dataclass(frozen=True)
@@ -244,7 +262,8 @@ def _project_record(record: dict, allowed: frozenset[str], required: tuple[str, 
     omitted = len(set(record) - allowed)
     identity_fields = {
         "host_id", "source", "session_id", "parent_session_id", "agent_id",
-        "parent_agent_id", "task_id", "managed_id",
+        "parent_agent_id", "task_id", "managed_id", "claude_process_start_time",
+        "claude_creation_identity",
     }
     text_fields = {
         "host_id", "source", "session_id", "parent_session_id", "agent_id", "parent_agent_id", "task_id",
@@ -253,8 +272,9 @@ def _project_record(record: dict, allowed: frozenset[str], required: tuple[str, 
         "executor", "owner", "control_mode", "cost_source", "cost_note", "usage_source",
         "price_source", "price_date", "subject", "teammate_name", "failure_reason", "label", "command",
         "worktree", "last_observed_status", "managed_id", "transcript_error",
+        "claude_process_start_time", "claude_creation_identity", "process_visibility_reason",
     }
-    positive_integer_fields = {"pid", "pgid"}
+    positive_integer_fields = {"pid", "pgid", "claude_pid"}
     nonnegative_integer_fields = {
         "started_at", "last_event_at", "finished_at", "duration_ms", "observation_age_ms",
         "elapsed_ms", "inflight_tool_count", "created_at", "completed_at",
@@ -263,22 +283,31 @@ def _project_record(record: dict, allowed: frozenset[str], required: tuple[str, 
                       "tool_visibility_partial"}
     number_fields = {"cost"}
     usage_invalid = False
+    session_process_fields = {
+        "claude_pid", "claude_process_start_time", "claude_creation_identity",
+        "process_visibility_reason",
+    }
     for key in allowed & record.keys():
         value = record[key]
+        field_name = (
+            f"{collection} process {key}"
+            if collection == "sessions" and key in session_process_fields
+            else f"{collection} {key}"
+        )
         if key in text_fields:
             limit = 2000 if key in {"cwd", "worktree"} else 500 if key in {
                 "visibility_reason", "cost_note", "failure_reason", "subject", "transcript_error",
             } else 240
             if key in identity_fields:
                 projected[key] = _wire_identity(
-                    value, f"{collection} {key}", limit, key in required,
+                    value, field_name, limit, key in required,
                 )
             else:
-                projected[key] = _wire_text(value, f"{collection} {key}", limit)
+                projected[key] = _wire_text(value, field_name, limit)
                 changed += projected[key] != value
         elif key in positive_integer_fields:
             if value is not None and not is_wire_integer(value, minimum=1):
-                raise ValueError(f"Host snapshot has invalid {collection} {key}")
+                raise ValueError(f"Host snapshot has invalid {field_name}")
             projected[key] = value
         elif key in nonnegative_integer_fields:
             if value is not None and not is_wire_integer(value):
@@ -437,6 +466,158 @@ def _capacity_semantic_reasons(capacity: dict, collections: dict[str, list[dict]
     return list(dict.fromkeys(reasons))
 
 
+def _process_text(record: dict, key: str, maximum: int = MAX_IDENTITY_LENGTH,
+                  required: bool = True, reject_secrets: bool = False) -> str | None:
+    value = record.get(key)
+    if value is None and not required:
+        return None
+    if (not isinstance(value, str) or not value or len(value) > maximum
+            or any(ord(character) < 32 or ord(character) == 127 for character in value)):
+        raise ValueError(f"Host snapshot process has invalid {key}")
+    if reject_secrets and redact_secrets(value, maximum) != value:
+        raise ValueError(f"Host snapshot process has unsafe {key}")
+    return value
+
+
+def _validate_process(record: dict, host: dict, managed: bool) -> None:
+    allowed = _MANAGED_PROCESS_FIELDS if managed else _INFERRED_PROCESS_FIELDS
+    if set(record) - allowed:
+        raise ValueError("Host snapshot process contains unknown fields")
+    _process_text(record, "host_id")
+    _process_text(record, "boot_id")
+    _process_text(record, "process_start_time")
+    _process_text(record, "executable", 2000)
+    if record["host_id"] != host["host_id"] or record["boot_id"] != host["boot_id"]:
+        raise ValueError("Host snapshot process identity does not match its host")
+    for key in ("pid", "pgid"):
+        value = record.get(key)
+        if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+            raise ValueError(f"Host snapshot process has invalid {key}")
+    if record.get("attribution") not in {"exact", "session", "host"}:
+        raise ValueError("Host snapshot process has invalid attribution")
+    if record.get("status") not in {"running", "stopped", "failed", "unknown"}:
+        raise ValueError("Host snapshot process has invalid status")
+    for key in ("session_id", "agent_id"):
+        _process_text(record, key, required=False, reject_secrets=True)
+    creation_identity = _process_text(record, "creation_identity", reject_secrets=True)
+    platform = host["platform"]
+    if platform == "linux":
+        expected_identity = f"linux:{host['boot_id']}:{record['process_start_time']}"
+    elif platform == "macos":
+        expected_identity = f"darwin:{record['process_start_time']}"
+    else:
+        raise ValueError("Host snapshot process uses an unsupported platform")
+    if creation_identity != expected_identity:
+        raise ValueError("Host snapshot process has mismatched creation identity")
+    attribution = record["attribution"]
+    session_id = record.get("session_id")
+    agent_id = record.get("agent_id")
+    if (attribution == "exact" and (session_id is None or agent_id is None)):
+        raise ValueError("Host snapshot exact process attribution lacks session or agent evidence")
+    if attribution == "session" and (session_id is None or agent_id is not None):
+        raise ValueError("Host snapshot session process attribution lacks session evidence")
+    if attribution == "host" and (session_id is not None or agent_id is not None):
+        raise ValueError("Host snapshot host process attribution claims session or agent evidence")
+    for key in ("cpu_pct", "rss_bytes", "peak_rss_bytes", "elapsed_ms", "cpu_seconds"):
+        if record.get(key) is not None:
+            _nonnegative_number(record[key], f"process {key}")
+    for key in ("started_at", "registered_at", "last_sample_at", "finished_at", "observed_at"):
+        if record.get(key) is not None:
+            value = record[key]
+            if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+                raise ValueError(f"Host snapshot process has invalid {key}")
+    if managed:
+        _process_text(record, "managed_process_id", reject_secrets=True)
+        if not _MANAGED_ID.fullmatch(record["managed_process_id"]):
+            raise ValueError("Host snapshot process has invalid managed_process_id")
+        group_identity = _process_text(
+            record, "group_creation_identity", reject_secrets=True,
+        )
+        expected_group_prefix = (
+            f"linux:{host['boot_id']}:" if platform == "linux" else "darwin:"
+        )
+        if not group_identity.startswith(expected_group_prefix) or (
+                group_identity == expected_group_prefix):
+            raise ValueError("Host snapshot process has invalid group creation identity")
+        _process_text(record, "label")
+        _process_text(record, "cwd", 2000)
+        _process_text(record, "visibility_reason", 1000, required=False)
+        argument_hash = _process_text(record, "argument_hash")
+        if len(argument_hash) != 64 or any(character not in "0123456789abcdef" for character in argument_hash):
+            raise ValueError("Host snapshot process has invalid argument_hash")
+        argument_count = record.get("argument_count")
+        if not isinstance(argument_count, int) or isinstance(argument_count, bool) or argument_count < 0:
+            raise ValueError("Host snapshot process has invalid argument_count")
+        worker_count = record.get("worker_count")
+        if (not isinstance(worker_count, int) or isinstance(worker_count, bool)
+                or worker_count < 0):
+            raise ValueError("Host snapshot process has invalid worker_count")
+        if any(record.get(key) is None for key in ("registered_at", "started_at", "elapsed_ms")):
+            raise ValueError("Host snapshot managed process lacks lifecycle timestamps")
+        for key in ("shutdown_uncertain", "shutdown_was_uncertain",
+                    "descendant_tracking_truncated"):
+            if not isinstance(record.get(key), bool):
+                raise ValueError(  # noqa: TRY004 - public wire validation
+                    f"Host snapshot process has invalid {key}"
+                )
+        exit_status = record.get("exit_status")
+        if (exit_status is not None and
+                (not isinstance(exit_status, int) or isinstance(exit_status, bool)
+                 or exit_status < 0)):
+            raise ValueError("Host snapshot process has invalid exit_status")
+        process_signal = record.get("signal")
+        if (process_signal is not None and
+                (not isinstance(process_signal, int) or isinstance(process_signal, bool)
+                 or process_signal <= 0)):
+            raise ValueError("Host snapshot process has invalid signal")
+        if exit_status is not None and process_signal is not None:
+            raise ValueError("Host snapshot process cannot have both exit_status and signal")
+        status = record["status"]
+        finished_at = record.get("finished_at")
+        completion_present = finished_at is not None or exit_status is not None or process_signal is not None
+        completion_valid = (
+            finished_at is not None and ((exit_status is not None) != (process_signal is not None))
+        )
+        if completion_present and not completion_valid:
+            raise ValueError("Host snapshot process has incomplete completion evidence")
+        if status == "running" and (completion_present or record["shutdown_uncertain"]):
+            raise ValueError("Host snapshot running process has contradictory completion evidence")
+        if status == "stopped" and not (
+            completion_valid and exit_status == 0 and process_signal is None
+            and not record["shutdown_uncertain"]
+        ):
+            raise ValueError("Host snapshot stopped process has contradictory completion evidence")
+        if status == "failed" and not (
+            completion_valid and (process_signal is not None or exit_status > 0)
+            and not record["shutdown_uncertain"]
+        ):
+            raise ValueError("Host snapshot failed process has contradictory completion evidence")
+        if status == "unknown" and not record["shutdown_uncertain"]:
+            raise ValueError("Host snapshot unknown process lacks shutdown uncertainty")
+        if finished_at is not None and finished_at < record.get("started_at", 0):
+            raise ValueError("Host snapshot process completion predates its start")
+        allowlist = record.get("environment_allowlist")
+        if (allowlist not in ({}, [])
+                and (not isinstance(allowlist, list)
+                     or len(allowlist) > len(_SAFE_ENVIRONMENT_NAMES)
+                     or any(not isinstance(name, str) or name not in _SAFE_ENVIRONMENT_NAMES
+                            for name in allowlist)
+                     or len(set(allowlist)) != len(allowlist))):
+            raise ValueError("Host snapshot process has invalid environment_allowlist")
+        for key, limit in (("label", 240), ("executable", 2000), ("cwd", 2000),
+                           ("visibility_reason", 1000)):
+            if record.get(key) is not None:
+                record[key] = redact_secrets(record[key], limit)
+    else:
+        if attribution != "session" or session_id is None or agent_id is not None:
+            raise ValueError("Inferred process lacks session attribution")
+        if record["status"] != "running":
+            raise ValueError("Inferred process must be running")
+        if record.get("observed_at") is None:
+            raise ValueError("Host snapshot inferred process lacks observed_at")
+        record["executable"] = redact_secrets(record["executable"], 2000)
+
+
 def _validate_snapshot(payload: bytes) -> dict:
     if len(payload) > MAX_SNAPSHOT_BYTES:
         raise ValueError("Host snapshot exceeds one MiB")
@@ -500,7 +681,9 @@ def _validate_snapshot(payload: bytes) -> dict:
         "sessions": frozenset({"host_id", "source", "session_id", "parent_session_id", "status", "cwd",
                                "started_at", "last_event_at", "finished_at", "model", "coordinator_role",
                                "visibility_reason", "activity", "needs_input", "last_event",
-                               "observation_age_ms", "inflight_tool_count", "tool_visibility_partial"}),
+                               "observation_age_ms", "inflight_tool_count", "tool_visibility_partial",
+                               "claude_pid", "claude_process_start_time", "claude_creation_identity",
+                               "process_visibility_reason"}),
         "agents": frozenset({"host_id", "source", "parent_session_id", "parent_agent_id", "agent_id",
                              "task_id", "executor", "owner", "control_mode", "task", "agent_type",
                              "requested_model", "resolved_model", "models", "model_source", "status",
@@ -511,10 +694,6 @@ def _validate_snapshot(payload: bytes) -> dict:
                              "transcript_error", "visibility_reason", "observation_age_ms", "elapsed_ms"}),
         "tasks": frozenset({"host_id", "source", "session_id", "task_id", "status", "created_at",
                             "last_event_at", "completed_at", "subject", "teammate_name", "agent_id"}),
-        "managed_processes": frozenset({"host_id", "managed_id", "status", "label", "pid", "pgid",
-                                        "started_at", "finished_at", "exit_code", "visibility_reason"}),
-        "inferred_processes": frozenset({"host_id", "pid", "pgid", "status", "label", "started_at",
-                                         "visibility_reason"}),
     }
     projected_collections = {}
     collection_projection_partial = False
@@ -529,12 +708,8 @@ def _validate_snapshot(payload: bytes) -> dict:
             _project_record(record, record_fields[collection], required, collection, host["host_id"])
             for record in snapshot[collection]
         ]
-    for collection in ("managed_processes", "inferred_processes"):
-        projected_collections[collection] = [
-            _project_record(record, record_fields[collection], ("host_id",), collection, host["host_id"])
-            for record in snapshot[collection]
-        ]
-    for collection, records in projected_collections.items():
+    for collection in identity_fields:
+        records = projected_collections[collection]
         changed = 0
         omitted = 0
         for record in records:
@@ -543,6 +718,52 @@ def _validate_snapshot(payload: bytes) -> dict:
             changed += bool(record.pop("_projection_partial", False))
         collection_projection_evidence[collection] = changed, omitted
         collection_projection_partial |= bool(changed or omitted)
+    for record in snapshot["sessions"]:
+        process_reason = record.get("process_visibility_reason")
+        if (process_reason is not None
+                and (not isinstance(process_reason, str) or not process_reason
+                     or len(process_reason) > 1000
+                     or any(ord(character) < 32 or ord(character) == 127
+                            for character in process_reason)
+                     or redact_secrets(process_reason, 1000) != process_reason)):
+            raise ValueError("Host snapshot session has invalid process visibility reason")
+        process_evidence = (
+            record.get("claude_pid"), record.get("claude_process_start_time"),
+            record.get("claude_creation_identity"),
+        )
+        if any(value is not None for value in process_evidence):
+            pid, start_time, identity = process_evidence
+            if (not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0
+                    or not isinstance(start_time, str) or not start_time
+                    or len(start_time) > MAX_IDENTITY_LENGTH
+                    or not isinstance(identity, str) or not identity
+                    or len(identity) > MAX_IDENTITY_LENGTH
+                    or any(ord(character) < 32 or ord(character) == 127
+                           for value in (start_time, identity) for character in value)):
+                raise ValueError("Host snapshot session has invalid process evidence")
+            if (redact_secrets(start_time, MAX_IDENTITY_LENGTH) != start_time
+                    or redact_secrets(identity, MAX_IDENTITY_LENGTH) != identity):
+                raise ValueError("Host snapshot session has unsafe process evidence")
+            expected_identity = (
+                f"linux:{host['boot_id']}:{start_time}"
+                if host["platform"] == "linux"
+                else f"darwin:{start_time}"
+                if host["platform"] == "macos"
+                else None
+            )
+            if identity != expected_identity:
+                raise ValueError("Host snapshot session has mismatched process evidence")
+    for collection, managed in (("managed_processes", True), ("inferred_processes", False)):
+        projected_records = []
+        changed = 0
+        for record in snapshot[collection]:
+            projected_record = dict(record)
+            _validate_process(projected_record, host, managed=managed)
+            changed += projected_record != record
+            projected_records.append(projected_record)
+        projected_collections[collection] = projected_records
+        collection_projection_evidence[collection] = changed, 0
+        collection_projection_partial |= bool(changed)
     projected_alerts = []
     alert_projection_changes = 0
     alert_projection_omissions = 0
@@ -551,6 +772,7 @@ def _validate_snapshot(payload: bytes) -> dict:
     })
     alert_entity_fields = frozenset({
         "source", "session_id", "parent_session_id", "agent_id", "task_id", "configured_host",
+        "managed_process_id",
     })
     for alert in snapshot["alerts"]:
         alert_id = _wire_identity(alert.get("alert_id"), "alert identity", required=True)
@@ -648,6 +870,7 @@ def _validate_snapshot(payload: bytes) -> dict:
         "host", "sessions", "agents", "tasks", "managed_processes", "inferred_processes",
         "capacity", "alerts", "lifecycle", "lifecycle_consistency", "output", "projection",
         "session_active_count", "agent_active_count", "managed_process_active_count",
+        "processes", "session_processes",
     }
     for key, value in errors.items():
         if key in recognized_error_sections:
@@ -790,7 +1013,9 @@ def _prefix_identities(snapshot: dict) -> dict:
     host_id = snapshot["host"]["host_id"]
     for collection, keys in (("sessions", ("source", "session_id")),
                              ("agents", ("source", "parent_session_id", "agent_id")),
-                             ("tasks", ("source", "session_id", "task_id"))):
+                             ("tasks", ("source", "session_id", "task_id")),
+                             ("managed_processes", ("managed_process_id",)),
+                             ("inferred_processes", ("boot_id", "pid", "process_start_time"))):
         for record in snapshot.get(collection, []):
             if isinstance(record, dict):
                 parts = [host_id] + [str(record.get(key) or "unknown") for key in keys]

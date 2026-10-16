@@ -79,7 +79,25 @@ minimum_available_memory_gib = 12
 
 Run `router snapshot --json` for the local bounded schema, `router fleet status --watch` for the combined table, or `router fleet status --json` for machine-readable output. Combining `--watch --json` emits one compact JSON document per line. `router fleet capacity` shows only capacity summaries, and `router fleet host ryzen --json` returns one configured host. Add `--strict` when automation must fail if any host marked `required = true` is unavailable.
 
-The fleet command invokes only `router snapshot --json` remotely. It does not copy SQLite files, change SSH configuration, schedule work, kill processes, or write project state. Capacity states are summaries over explicit CPU, load, memory, and disk thresholds; inspect the accompanying raw measurements and reason list for job-specific decisions. Milestone A intentionally leaves `managed_processes` and `inferred_processes` empty until process visibility is implemented.
+The fleet command invokes only `router snapshot --json` remotely. It does not copy SQLite files, change SSH configuration, schedule work, kill processes, or write project state. Capacity states are summaries over explicit CPU, load, memory, and disk thresholds; inspect the accompanying raw measurements and reason list for job-specific decisions.
+
+Router samples known Claude process trees and displays their current CPU and memory use with `session` attribution. Use the foreground managed-command wrapper when exact session-and-agent attribution is required:
+
+```sh
+router run --label freeze-suite --session "$CLAUDE_SESSION_ID" --agent "$CLAUDE_AGENT_ID" -- pytest tests/freeze
+```
+
+The wrapper preserves the command's arguments and inherited terminal I/O, runs it in a distinct process group, and returns its shell-compatible exit status. Registration is durable before the command begins. Snapshots retain the executable name, argument count and hash, working directory, completion status, elapsed time, aggregate process-group CPU/RSS, and worker count; they do not retain full arguments or environment values. A wrapper exit is not treated as proof that its descendants stopped, and uncertain shutdown remains visible. Omitting both attribution flags records host-level attribution; `--agent` requires `--session`, and exact attribution requires both. Terminal evidence is retained for seven days, capped at the latest 10,000 completed records per host; completion files are removed after their evidence is durably committed to SQLite.
+
+Process monitoring is observational only: it adds no fleet cancellation or kill operation. Inferred descendants never receive agent attribution. Processes that detach before any sample can observe them remain an explicit visibility limitation. A coordinator can explicitly register an already-running configured project process with `router process register --json JSON`. The version-1 object requires `request_version`, `managed_process_id`, `label`, PID and PGID, process and group creation identities, process start time, executable, argument count and SHA-256 hash, working directory, an empty or approved-name environment allowlist, and wall-clock `started_at`. Router verifies the live identities and assigns host attribution; coordinator registration cannot claim session or agent ownership. It does not guess ownership from command text or process names. When an externally registered process exits without trusted completion evidence, the default snapshot shows the uncertainty for five minutes and SQLite retains the evidence for seven days.
+
+```json
+{"request_version":"1","managed_process_id":"configured-build-1","label":"project build","pid":4102,"pgid":4102,"process_start_time":"928112","creation_identity":"linux:BOOT_ID:928112","group_creation_identity":"linux:BOOT_ID:928112","executable":"pytest","argument_count":2,"argument_hash":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","cwd":"/work/project","environment_allowlist":{},"started_at":1792180000000}
+```
+
+`argument_count` excludes the executable. `argument_hash` is lowercase SHA-256 over the bytes `agent-router-managed-argv-v1\0` followed by canonical UTF-8 JSON for `{"arguments": ARGV_WITHOUT_EXECUTABLE}` (sorted keys, compact separators, and no NaN values). `managed_process_id` is 1–128 ASCII characters, begins with an alphanumeric character, and otherwise contains only alphanumerics, `.`, `_`, or `-`. Other IDs and creation identities are non-empty bounded strings; PID, PGID, argument count, and timestamps are non-negative JSON integers, with PID and PGID strictly positive. Approved environment-name entries are `LANG`, `LC_ALL`, `LC_CTYPE`, `TERM`, and `TZ`; values are never accepted.
+
+Configured registration always follows the registered PID's descendant tree. Router includes other members of the supplied process group only when the registered PID is that group's leader (`pid == pgid`); a shared shell process group does not make sibling jobs part of the configured process.
 
 An external coordinator can reserve a host without granting Router any control authority by atomically writing `~/.agent-router/reservation.json` on that host:
 

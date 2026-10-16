@@ -76,7 +76,7 @@ def capacity_alerts(host: dict, capacity: dict, thresholds: CapacityThresholds,
 
 
 def alerts(host: dict, capacity: dict, sessions: list[dict], agents: list[dict],
-           thresholds: CapacityThresholds, limit: int,
+           managed_processes: list[dict], thresholds: CapacityThresholds, limit: int,
            observed_at: int | None = None) -> list[dict]:
     result = capacity_alerts(host, capacity, thresholds, observed_at)
     if len(result) >= limit:
@@ -92,6 +92,27 @@ def alerts(host: dict, capacity: dict, sessions: list[dict], agents: list[dict],
         if record.get("status") == "unknown":
             result.append(_alert(host_id, "agent_visibility_unknown", "warning", record.get("visibility_reason") or "Lifecycle visibility is uncertain",
                                  entity, record.get("last_event_at"), observed_at))
+            if len(result) >= limit:
+                return result
+    for process in managed_processes:
+        entity = {"managed_process_id": process["managed_process_id"]}
+        if process.get("status") == "failed":
+            evidence = (f"Managed process {process.get('label') or process['managed_process_id']} "
+                        f"failed with " + (f"signal {process['signal']}" if process.get("signal")
+                                           else f"exit status {process.get('exit_status')}"))
+            result.append(_alert(
+                host_id, "managed_process_failed", "warning", evidence, entity,
+                process.get("finished_at"), observed_at,
+            ))
+            if len(result) >= limit:
+                return result
+        if process.get("shutdown_uncertain"):
+            result.append(_alert(
+                host_id, "managed_process_shutdown_uncertain", "warning",
+                process.get("visibility_reason") or "Managed process shutdown is uncertain",
+                entity, process.get("finished_at") or process.get("last_sample_at")
+                or process.get("started_at"), observed_at,
+            ))
             if len(result) >= limit:
                 return result
     return result
@@ -186,14 +207,44 @@ def compose(controller, thresholds: CapacityThresholds | None = None, history_li
     _collection(snapshot, "tasks", controller.sessions.tasks, history_limit)
     sessions = snapshot["sessions"]
     agents = snapshot["agents"]
+    missing_session_processes = sum(
+        1 for record in sessions
+        if record.get("status") != "stopped"
+        and record.get("process_visibility_reason")
+    )
+    if missing_session_processes:
+        snapshot["partial"] = True
+        snapshot.setdefault("errors", {})["session_processes"] = (
+            f"{missing_session_processes} visible Claude session"
+            f"{'s lack' if missing_session_processes != 1 else ' lacks'} process identity evidence"
+        )
+    process_monitor = getattr(controller, "process_monitor", None)
+    if process_monitor is None:
+        snapshot["managed_processes"] = []
+        snapshot["inferred_processes"] = []
+        active_managed = 0
+    else:
+        active_managed = _observed_collection(
+            snapshot, "managed_processes", process_monitor.fleet_records, history_limit,
+            "managed_process_active_count",
+        )
+        _collection(snapshot, "inferred_processes", process_monitor.inferred, history_limit)
+        process_health = process_monitor.health()
+        if process_health.get("partial") is True:
+            snapshot["partial"] = True
+            snapshot.setdefault("errors", {})["processes"] = str(
+                process_health.get("error") or "Process sample is partial"
+            )[:500]
+            snapshot.setdefault("errors", {})["managed_process_active_count"] = (
+                "Exact active count is unavailable"
+            )
+            active_managed = None
     _section(snapshot, "capacity", lambda: controller.capacity.view(
         thresholds,
         active_claude_sessions=active_sessions,
         active_agents=active_agents,
-        active_managed_processes=0,
+        active_managed_processes=active_managed,
     ), {})
-    snapshot["managed_processes"] = []
-    snapshot["inferred_processes"] = []
     if hasattr(controller, "lifecycle_health"):
         lifecycle_error = controller.lifecycle_health()
         if lifecycle_error:
@@ -235,8 +286,9 @@ def compose(controller, thresholds: CapacityThresholds | None = None, history_li
         state, reasons = classify(capacity, thresholds, interval_seconds * 3000)
         capacity.update(capacity_state=state, capacity_reasons=reasons)
     _collection(snapshot, "alerts", lambda limit: alerts(
-        snapshot["host"], snapshot["capacity"], sessions, agents, thresholds, limit,
-        generated_at), MAX_ALERTS, "alert_limit")
+        snapshot["host"], snapshot["capacity"], sessions, agents,
+        snapshot["managed_processes"], thresholds, limit, generated_at),
+        MAX_ALERTS, "alert_limit")
     if hasattr(controller, "alert_history"):
         snapshot["alerts"] = controller.alert_history.track(snapshot["alerts"])
     return bound(snapshot)
@@ -255,7 +307,7 @@ def bound(snapshot: dict, maximum_bytes: int = MAX_SNAPSHOT_BYTES) -> dict:
     result = dict(snapshot)
     result["partial"] = True
     result.setdefault("errors", {})["output"] = "Snapshot truncated to configured one MiB bound"
-    for key in ("tasks", "agents", "sessions", "alerts"):
+    for key in ("tasks", "managed_processes", "inferred_processes", "agents", "sessions", "alerts"):
         values = list(result.get(key, []))
         while values and len(canonical({**result, key: values}).encode()) > maximum_bytes:
             values = values[:len(values) // 2]

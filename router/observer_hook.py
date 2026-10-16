@@ -1,6 +1,7 @@
 """Cheap hook gate: ordinary parent tool calls load only the standard library."""
 
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -21,6 +22,27 @@ def text(value: object, limit: int | None = 240) -> str | None:
 def redacted_text(value: object, limit: int) -> str | None:
     normalized = text(value, None)
     return redact_secrets(normalized, limit) if normalized is not None else None
+
+
+def process_evidence() -> dict:
+    """Identify the structured parent that invoked this exec-based hook."""
+    from router.process import creation_identity
+    pid = os.getppid()
+    try:
+        identity = creation_identity(pid)
+    except (OSError, ValueError):
+        return {}
+    if identity.startswith("linux:"):
+        start_time = identity.rsplit(":", 1)[-1]
+    elif identity.startswith("darwin:"):
+        start_time = identity.removeprefix("darwin:")
+    else:
+        return {}
+    return {
+        "claude_pid": pid,
+        "claude_process_start_time": start_time,
+        "claude_creation_identity": identity,
+    }
 
 
 def observe(event: dict) -> dict:
@@ -49,6 +71,8 @@ def observe(event: dict) -> dict:
                            "background_tasks": event.get("background_tasks"), "task_id": event.get("task_id"),
                            "task_subject": redacted_text(event.get("task_subject"), 500),
                            "teammate_name": event.get("teammate_name"), "agent_id": event.get("agent_id")}
+        if name in {"SessionStart", "UserPromptSubmit", "Stop"}:
+            session_payload.update(process_evidence())
     payload = {"source": "claude", "session_id": event.get("session_id"), "observed_at": at,
                "agent_id": event.get("agent_id"), "agent_type": event.get("agent_type"), "cwd": event.get("cwd")}
     main_transcript = event.get("transcript_path")

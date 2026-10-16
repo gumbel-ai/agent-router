@@ -186,6 +186,46 @@ class HookTests(TransportHarness, unittest.TestCase):
                 else:
                     self.assertIn(expected_error, error.getvalue())
 
+    def test_session_start_forwards_structured_hook_parent_identity(self):
+        requests = []
+
+        def send(operation, payload, timeout):
+            requests.append((operation, payload))
+            return {"accepted": True}
+
+        with patch("router.observer_hook.os.getppid", return_value=4321), \
+                patch("router.process.creation_identity",
+                      return_value="linux:boot-id:98765"), \
+                patch("router.observer_hook.request", side_effect=send):
+            observe({"hook_event_name": "SessionStart", "session_id": "S"})
+
+        session = requests[0][1]["session"]
+        self.assertEqual(session["claude_pid"], 4321)
+        self.assertEqual(session["claude_process_start_time"], "98765")
+        self.assertEqual(session["claude_creation_identity"], "linux:boot-id:98765")
+
+    def test_prompt_and_stop_retry_missing_session_process_identity(self):
+        requests = []
+
+        def send(operation, payload, timeout):
+            requests.append(payload["session"])
+            return {"accepted": True}
+
+        with patch("router.observer_hook.process_evidence", side_effect=[
+                {},
+                {"claude_pid": 4321, "claude_process_start_time": "98765",
+                 "claude_creation_identity": "linux:boot-id:98765"},
+                {"claude_pid": 4321, "claude_process_start_time": "98765",
+                 "claude_creation_identity": "linux:boot-id:98765"},
+        ]), patch("router.observer_hook.request", side_effect=send):
+            observe({"hook_event_name": "SessionStart", "session_id": "S"})
+            observe({"hook_event_name": "UserPromptSubmit", "session_id": "S"})
+            observe({"hook_event_name": "Stop", "session_id": "S"})
+
+        self.assertNotIn("claude_pid", requests[0])
+        self.assertEqual(requests[1]["claude_pid"], 4321)
+        self.assertEqual(requests[2]["claude_creation_identity"], "linux:boot-id:98765")
+
 
 if __name__ == '__main__':
     unittest.main()

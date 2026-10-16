@@ -137,12 +137,20 @@ def classify(sample: dict, thresholds: CapacityThresholds, stale_after_ms: float
     missing = [key for key in required if sample.get(key) is None]
     if missing:
         return "unknown", ["capacity data unavailable: " + ", ".join(missing)]
-    activity_fields = ("active_claude_sessions", "active_agents", "active_managed_processes")
-    if any(field in sample for field in activity_fields):
-        invalid_activity = [field for field in activity_fields
-                            if not is_wire_integer(sample.get(field))]
+    active_fields = (
+        ("active_claude_sessions", "Claude sessions", "Claude sessions"),
+        ("active_agents", "native agent", "native agents"),
+        ("active_managed_processes", "managed process", "managed processes"),
+    )
+    if any(field in sample for field, _singular, _plural in active_fields):
+        invalid_activity = [
+            field for field, _singular, _plural in active_fields
+            if field in sample and not is_wire_integer(sample[field])
+        ]
         if invalid_activity:
-            return "unknown", ["active workload totals unavailable: " + ", ".join(invalid_activity)]
+            return "unknown", [
+                "active workload totals unavailable: " + ", ".join(invalid_activity)
+            ]
     reservation_values = [sample.get(field) for field in RESERVATION_FIELDS]
     reservation_active = sample.get("reservation_active")
     if any(value is not None for value in reservation_values):
@@ -157,6 +165,10 @@ def classify(sample: dict, thresholds: CapacityThresholds, stale_after_ms: float
     memory_gib = unreserved_memory / GIB
     disk_gib = sample["disk_available_bytes"] / GIB
     available_reasons = []
+    for field, singular, plural in active_fields:
+        count = sample.get(field, 0)
+        if count:
+            available_reasons.append(f"{count} active {singular if count == 1 else plural}")
     if sample["cpu_busy_pct"] > thresholds.maximum_cpu_busy_for_available_pct:
         available_reasons.append(f"cpu_busy_pct {sample['cpu_busy_pct']:.1f} exceeds {thresholds.maximum_cpu_busy_for_available_pct:.1f}")
     if load_ratio > thresholds.maximum_load_per_logical_cpu_for_available:
@@ -169,13 +181,6 @@ def classify(sample: dict, thresholds: CapacityThresholds, stale_after_ms: float
         available_reasons.append(
             f"reserved by {redact_secrets(sample['reserved_by'], 240)} until {sample['reserved_until']}"
         )
-    active_reasons = []
-    for field, label in (("active_claude_sessions", "Claude sessions"),
-                         ("active_agents", "native agents"),
-                         ("active_managed_processes", "managed processes")):
-        if sample.get(field, 0) > 0:
-            active_reasons.append(f"{sample[field]} active {label}")
-    available_reasons.extend(active_reasons)
     reserved_slots = sample.get("reserved_cpu_slots", 0) if sample.get("reservation_active") else 0
     saturated = (
         sample["cpu_busy_pct"] > thresholds.maximum_cpu_busy_for_saturated_pct

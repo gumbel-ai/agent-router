@@ -29,6 +29,7 @@ from router.cli import fleet_table
 from router.cli import main as cli_main
 from router.client import request
 from router.db import Store
+from router.dispatch import canonical
 from router.fleet import (
     MAX_COLLECTION_RECORDS,
     FleetConfig,
@@ -45,6 +46,7 @@ from router.fleet import (
 from router.fleet_snapshot import MAX_SNAPSHOT_BYTES, AlertHistory, bound, compose
 from router.host import HostIdentity, current_boot_id, stable_host_id
 from router.native import NativeObserver
+from router.process import creation_identity
 from router.sessions import MAX_EXACT_INFLIGHT_TOOLS, SessionObserver
 from router.validation import HOST_STRING_LIMITS
 
@@ -67,6 +69,40 @@ def snapshot(host_id="host-1"):
                         "agent_id": "child", "status": "running", "started_at": 0,
                         "last_event_at": 1}],
             "tasks": [], "managed_processes": [], "inferred_processes": [], "alerts": []}
+
+
+class EmptyProcessMonitor:
+    def fleet_records(self, limit): return [], 0
+    def inferred(self, limit): return []
+    def health(self): return {"partial": False, "error": None, "observed_at": 1}
+
+
+def managed_process(host_id="host-1", managed_id="managed-1"):
+    return {
+        "managed_process_id": managed_id, "host_id": host_id, "boot_id": "boot-1",
+        "pid": 101, "pgid": 100, "process_start_time": "1234",
+        "creation_identity": "linux:boot-1:1234",
+        "group_creation_identity": "linux:boot-1:1000", "label": "test suite",
+        "session_id": "same", "agent_id": "child", "attribution": "exact",
+        "executable": "python", "argument_hash": "a" * 64, "argument_count": 2,
+        "cwd": "/project", "environment_allowlist": {}, "status": "running",
+        "registered_at": 1, "started_at": 1, "last_sample_at": 1,
+        "finished_at": None, "exit_status": None, "signal": None, "elapsed_ms": 10,
+        "cpu_pct": 12.5, "rss_bytes": 4096, "peak_rss_bytes": 4096,
+        "worker_count": 0,
+        "shutdown_uncertain": False, "shutdown_was_uncertain": False,
+        "descendant_tracking_truncated": False, "visibility_reason": None,
+    }
+
+
+def inferred_process(host_id="host-1"):
+    return {
+        "host_id": host_id, "boot_id": "boot-1", "pid": 202, "pgid": 202,
+        "process_start_time": "5678", "creation_identity": "linux:boot-1:5678",
+        "session_id": "same", "agent_id": None, "attribution": "session",
+        "executable": "pytest", "status": "running", "observed_at": 1,
+        "cpu_pct": 25.0, "rss_bytes": 8192,
+    }
 
 
 class HostAndMigrationTests(unittest.TestCase):
@@ -258,6 +294,38 @@ class HostAndMigrationTests(unittest.TestCase):
         self.assertIsNotNone(index)
         self.assertIn("sessions_active_tool_deadline", " ".join(str(item) for row in plan for item in row))
 
+    def test_process_inference_queries_have_recent_and_pid_indexes(self):
+        with tempfile.TemporaryDirectory() as temp:
+            store = Store(Path(temp) / "router.sqlite3", "host")
+            with store.connect() as db:
+                indexes = {
+                    row[0] for row in db.execute(
+                        "SELECT name FROM sqlite_master WHERE type='index'"
+                    )
+                }
+                recent_plan = " ".join(
+                    row[3] for row in db.execute(
+                        """EXPLAIN QUERY PLAN SELECT session_id,data FROM sessions
+                            WHERE host_id=? AND source='claude'
+                            AND json_extract(data,'$.status') IN ('running','idle','unknown')
+                            AND json_extract(data,'$.last_event_at')>=?""",
+                        ("host", 1),
+                    )
+                )
+                pid_plan = " ".join(
+                    row[3] for row in db.execute(
+                        """EXPLAIN QUERY PLAN SELECT session_id,data FROM sessions
+                            WHERE host_id=? AND source='claude'
+                            AND json_extract(data,'$.status') IN ('running','idle','unknown')
+                            AND json_extract(data,'$.claude_pid') IN (?,?)""",
+                        ("host", 1, 2),
+                    )
+                )
+        self.assertIn("sessions_process_recent", indexes)
+        self.assertIn("sessions_process_pid", indexes)
+        self.assertIn("sessions_process_recent", recent_plan)
+        self.assertIn("sessions_process_pid", pid_plan)
+
 
 class SessionAndCapacityTests(unittest.TestCase):
     def setUp(self):
@@ -272,7 +340,16 @@ class SessionAndCapacityTests(unittest.TestCase):
                                       "observed_at": values.pop("observed_at", self.now), **values})
 
     def test_session_tasks_needs_input_stop_and_restart_uncertainty(self):
-        self.assertEqual(self.event("session_start", cwd="/project")["status"], "running")
+        started = self.event(
+            "session_start", cwd="/project", claude_pid=4321,
+            claude_process_start_time="98765",
+            claude_creation_identity="linux:boot-id:98765",
+        )
+        self.assertEqual(started["status"], "running")
+        self.assertEqual(
+            (started["claude_pid"], started["claude_process_start_time"]),
+            (4321, "98765"),
+        )
         self.event("task_created", task_id="T", task_subject="Safe subject", task_description="PRIVATE")
         waiting = self.event("notification", notification_type="agent_needs_input")
         self.assertTrue(waiting["needs_input"])
@@ -285,6 +362,82 @@ class SessionAndCapacityTests(unittest.TestCase):
         self.assertIn("restart", restarted["visibility_reason"])
         self.assertNotIn("PRIVATE", json.dumps(self.observer.tasks()))
         self.assertEqual(self.event("session_end")["status"], "stopped")
+
+    def test_session_start_rejects_partial_or_malformed_process_evidence(self):
+        for evidence in (
+                {"claude_pid": 4321},
+                {"claude_pid": True, "claude_process_start_time": "1",
+                 "claude_creation_identity": "linux:boot:1"},
+                {"claude_pid": 4321, "claude_process_start_time": "",
+                 "claude_creation_identity": "linux:boot:1"}):
+            with self.subTest(evidence=evidence), self.assertRaisesRegex(
+                    ValueError, "process evidence"):
+                self.event("session_start", **evidence)
+
+    def test_prompt_backfills_process_identity_when_session_start_lacked_it(self):
+        started = self.event("session_start")
+        self.assertIsNone(started["claude_pid"])
+        self.assertIn("not been observed", started["process_visibility_reason"])
+
+        class Host:
+            def view(self, at):
+                return {"host_id": "host", "observed_at": at}
+
+        class Native:
+            def fleet_records(self, limit):
+                return [], 0
+
+        class Capacity:
+            def view(self, thresholds, **counts):
+                return counts
+
+        controller = type("Controller", (), {
+            "host": Host(), "sessions": self.observer, "native": Native(),
+            "process_monitor": EmptyProcessMonitor(), "capacity": Capacity(),
+        })()
+        incomplete = compose(controller)
+        self.assertTrue(incomplete["partial"])
+        self.assertIn("session_processes", incomplete["errors"])
+        recovered = self.event(
+            "prompt", observed_at=self.now + 1, claude_pid=4321,
+            claude_process_start_time="98765",
+            claude_creation_identity="linux:boot-id:98765",
+        )
+        self.assertEqual(recovered["claude_pid"], 4321)
+        self.assertIsNone(recovered["process_visibility_reason"])
+        self.assertNotIn("session_processes", compose(controller).get("errors", {}))
+
+    def test_running_managed_process_keeps_related_quiet_session_active(self):
+        old = self.now - 61_001
+        self.event("session_start", observed_at=old)
+        process_record = {
+            **managed_process("host"), "session_id": "S", "agent_id": "A",
+        }
+        with self.store.transaction() as db:
+            db.execute(
+                """INSERT INTO managed_processes(
+                    managed_process_id,host_id,boot_id,pid,process_start_time,
+                    status,monitor_active,finished_at,sort_at,data
+                ) VALUES(?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    process_record["managed_process_id"], "host", "boot-1", 101, "1234",
+                    "running", 1, None, self.now, canonical(process_record),
+                ),
+            )
+        sessions, active = self.observer.fleet_records(10)
+        self.assertEqual(sessions[0]["status"], "running")
+        self.assertEqual(sessions[0]["activity"], "session start")
+        self.assertEqual(sessions[0]["visibility_reason"], "Related managed process is running")
+        self.assertEqual(active, 1)
+
+        self.event(
+            "notification", observed_at=self.now,
+            notification_type="agent_needs_input",
+        )
+        waiting = self.observer.fleet_records(10)[0][0]
+        self.assertEqual(waiting["status"], "idle")
+        self.assertTrue(waiting["needs_input"])
+        self.assertEqual(waiting["visibility_reason"], "Claude is waiting for input")
 
     def test_restart_unknown_records_remain_visible_until_terminal_evidence(self):
         old = self.now - 301_000
@@ -397,6 +550,14 @@ class SessionAndCapacityTests(unittest.TestCase):
                                                   "memory_available_bytes": 8 * 1024**3,
                                                   "disk_available_bytes": 20 * 1024**3}, CapacityThresholds())
         self.assertEqual((available, available_reasons), ("available", []))
+        active, active_reasons = classify({
+            **sample, "load_1m": 1, "cpu_busy_pct": 20,
+            "memory_available_bytes": 8 * 1024**3,
+            "disk_available_bytes": 20 * 1024**3,
+            "active_managed_processes": 1,
+        }, CapacityThresholds())
+        self.assertEqual(active, "busy")
+        self.assertEqual(active_reasons, ["1 active managed process"])
         saturated, saturated_reasons = classify({**sample, "cpu_busy_pct": 95}, CapacityThresholds())
         self.assertEqual(saturated, "saturated")
         self.assertTrue(any("cpu_busy_pct" in reason for reason in saturated_reasons))
@@ -930,9 +1091,7 @@ class SnapshotAndFleetTests(unittest.TestCase):
             ("active_claude_sessions", lambda value: value["capacity"].update(active_claude_sessions=0)),
             ("active_agents", lambda value: value["capacity"].update(active_agents=0)),
             ("active_managed_processes", lambda value: (
-                value["managed_processes"].append({
-                    "host_id": "host-1", "managed_id": "managed", "status": "running",
-                }),
+                value["managed_processes"].append(managed_process()),
                 value["capacity"].update(active_managed_processes=0),
             )),
         ):
@@ -1115,27 +1274,22 @@ class SnapshotAndFleetTests(unittest.TestCase):
             "negative timestamp": lambda value: value["sessions"][0].update(started_at=-1),
             "boolean duration": lambda value: value["agents"][0].update(duration_ms=True),
             "zero pid": lambda value: value.update(managed_processes=[{
-                "host_id": "host-1", "managed_id": "managed", "pid": 0,
+                **managed_process(), "pid": 0,
             }]),
             "negative pgid": lambda value: value.update(inferred_processes=[{
-                "host_id": "host-1", "pid": 1, "pgid": -1,
+                **inferred_process(), "pgid": -1,
             }]),
             "negative count": lambda value: value["sessions"][0].update(inflight_tool_count=-1),
+            "negative exit status": lambda value: value.update(managed_processes=[{
+                **managed_process(), "status": "failed", "finished_at": 2,
+                "exit_status": -9,
+            }]),
         }
         for name, mutate in cases.items():
             value = snapshot()
             mutate(value)
             with self.subTest(name=name), self.assertRaisesRegex(ValueError, "invalid"):
                 _validate_snapshot(json.dumps(value).encode())
-
-        signed_exit = snapshot()
-        signed_exit["managed_processes"] = [{
-            "host_id": "host-1", "managed_id": "managed", "pid": 1, "exit_code": -9,
-        }]
-        self.assertEqual(
-            _validate_snapshot(json.dumps(signed_exit).encode())["managed_processes"][0]["exit_code"],
-            -9,
-        )
 
         for identity in ("unsafe\nidentity", "unsafe\x85identity", "unsafe\u202eidentity", "[REDACTED]"):
             value = snapshot()
@@ -1287,6 +1441,154 @@ class SnapshotAndFleetTests(unittest.TestCase):
         self.assertFalse(result["hosts"][1]["ok"])
         self.assertTrue(result["partial"])
 
+    def test_remote_process_schema_and_fleet_identity_are_strict(self):
+        value = snapshot()
+        value["managed_processes"] = [managed_process()]
+        value["inferred_processes"] = [inferred_process()]
+        validated = _validate_snapshot(json.dumps(value).encode())
+        prefixed = query_fleet(
+            FleetConfig((FleetHost("local", "local"),)),
+            local_snapshot=lambda thresholds: validated,
+        )["hosts"][0]["snapshot"]
+        self.assertNotEqual(
+            prefixed["managed_processes"][0]["fleet_id"],
+            prefixed["inferred_processes"][0]["fleet_id"],
+        )
+
+        invalid_values = []
+        wrong_host = snapshot()
+        wrong_host["managed_processes"] = [managed_process("other")]
+        invalid_values.append(wrong_host)
+        exact_inferred = snapshot()
+        exact = inferred_process()
+        exact["attribution"] = "exact"
+        exact_inferred["inferred_processes"] = [exact]
+        invalid_values.append(exact_inferred)
+        boolean_pid = snapshot()
+        boolean = managed_process()
+        boolean["pid"] = True
+        boolean_pid["managed_processes"] = [boolean]
+        invalid_values.append(boolean_pid)
+        environment_values = snapshot()
+        environment = managed_process()
+        environment["environment_allowlist"] = {"TOKEN": "secret"}
+        environment_values["managed_processes"] = [environment]
+        invalid_values.append(environment_values)
+        conflicting_completion = snapshot()
+        conflicting = managed_process()
+        conflicting.update(status="failed", exit_status=7, signal=9)
+        conflicting_completion["managed_processes"] = [conflicting]
+        invalid_values.append(conflicting_completion)
+        running_completion = snapshot()
+        contradictory = managed_process()
+        contradictory.update(finished_at=2, exit_status=0)
+        running_completion["managed_processes"] = [contradictory]
+        invalid_values.append(running_completion)
+        failed_without_completion = snapshot()
+        contradictory = managed_process()
+        contradictory["status"] = "failed"
+        failed_without_completion["managed_processes"] = [contradictory]
+        invalid_values.append(failed_without_completion)
+        stopped_nonzero = snapshot()
+        contradictory = managed_process()
+        contradictory.update(status="stopped", finished_at=2, exit_status=9)
+        stopped_nonzero["managed_processes"] = [contradictory]
+        invalid_values.append(stopped_nonzero)
+        unknown_without_uncertainty = snapshot()
+        contradictory = managed_process()
+        contradictory["status"] = "unknown"
+        unknown_without_uncertainty["managed_processes"] = [contradictory]
+        invalid_values.append(unknown_without_uncertainty)
+        forbidden_details = snapshot()
+        private = managed_process()
+        private.update(arguments=["--token", "secret"], environment={"TOKEN": "secret"})
+        forbidden_details["managed_processes"] = [private]
+        invalid_values.append(forbidden_details)
+        unsafe_allowlist = snapshot()
+        unsafe = managed_process()
+        unsafe["environment_allowlist"] = ["TOKEN"]
+        unsafe_allowlist["managed_processes"] = [unsafe]
+        invalid_values.append(unsafe_allowlist)
+        unsafe_identity = snapshot()
+        credential_identity = managed_process()
+        credential_identity["managed_process_id"] = "ghp_abcdefghijklmnopqrstuvwxyz123456"
+        unsafe_identity["managed_processes"] = [credential_identity]
+        invalid_values.append(unsafe_identity)
+        partial_session_evidence = snapshot()
+        partial_session_evidence["sessions"][0]["claude_pid"] = 123
+        invalid_values.append(partial_session_evidence)
+        inferred_host = snapshot()
+        inferred_host_record = inferred_process()
+        inferred_host_record.update(
+            attribution="host", session_id=None, status="failed",
+        )
+        inferred_host["inferred_processes"] = [inferred_host_record]
+        invalid_values.append(inferred_host)
+        managed_host_claim = snapshot()
+        managed_host_record = managed_process()
+        managed_host_record.update(attribution="host", agent_id=None)
+        managed_host_claim["managed_processes"] = [managed_host_record]
+        invalid_values.append(managed_host_claim)
+        mismatched_creation = snapshot()
+        mismatched_record = managed_process()
+        mismatched_record["creation_identity"] = "linux:boot-1:different"
+        mismatched_creation["managed_processes"] = [mismatched_record]
+        invalid_values.append(mismatched_creation)
+        credential_creation = snapshot()
+        credential_record = managed_process()
+        credential_record["creation_identity"] = "ghp_abcdefghijklmnopqrstuvwxyz123456"
+        credential_creation["managed_processes"] = [credential_record]
+        invalid_values.append(credential_creation)
+        credential_session = snapshot()
+        credential_session["sessions"][0].update(
+            claude_pid=123,
+            claude_process_start_time="ghp_abcdefghijklmnopqrstuvwxyz123456",
+            claude_creation_identity=(
+                "linux:boot-1:ghp_abcdefghijklmnopqrstuvwxyz123456"
+            ),
+        )
+        invalid_values.append(credential_session)
+        credential_session_reason = snapshot()
+        credential_session_reason["sessions"][0]["process_visibility_reason"] = (
+            "token=ghp_abcdefghijklmnopqrstuvwxyz123456"
+        )
+        invalid_values.append(credential_session_reason)
+        for invalid in invalid_values:
+            with self.subTest(invalid=invalid), self.assertRaisesRegex(ValueError, "process"):
+                _validate_snapshot(json.dumps(invalid).encode())
+
+        redacted = snapshot()
+        visible_secret = "ghp_abcdefghijklmnopqrstuvwxyz123456"
+        private = managed_process()
+        private.update(label=f"token={visible_secret}", executable=f"https://u:{visible_secret}@x/tool",
+                       cwd=f"/tmp/password={visible_secret}")
+        redacted["managed_processes"] = [private]
+        wire = json.dumps(_validate_snapshot(json.dumps(redacted).encode()))
+        self.assertNotIn(visible_secret, wire)
+        self.assertIn("[REDACTED]", wire)
+
+    def test_fleet_identity_augmentation_rebounds_instead_of_marking_host_offline(self):
+        value = snapshot()
+        value["inferred_processes"] = [
+            {
+                **inferred_process(), "pid": 1000 + number,
+                "process_start_time": f"start-{number}-" + "s" * 205,
+                "creation_identity": f"linux:boot-1:start-{number}-" + "s" * 205,
+                "executable": "x" * 1000,
+            }
+            for number in range(900)
+        ]
+        value = bound(value)
+        result = query_fleet(
+            FleetConfig((FleetHost("local", "local"),)),
+            local_snapshot=lambda thresholds: value,
+        )["hosts"][0]
+        self.assertTrue(result["ok"])
+        self.assertLessEqual(
+            len(json.dumps(result["snapshot"], separators=(",", ":")).encode()),
+            MAX_SNAPSHOT_BYTES,
+        )
+
     def test_snapshot_section_failure_is_partial_and_output_is_bounded(self):
         class Host:
             host_id = "host"
@@ -1304,7 +1606,8 @@ class SnapshotAndFleetTests(unittest.TestCase):
             def view(self, thresholds, **counts):
                 return {"capacity_state": "unknown", "capacity_reasons": ["missing"], **counts}
         controller = type("Controller", (), {"host": Host(), "sessions": Sessions(),
-                                               "native": Native(), "capacity": Capacity()})()
+                                               "native": Native(), "capacity": Capacity(),
+                                               "process_monitor": EmptyProcessMonitor()})()
         result = compose(controller)
         self.assertTrue(result["partial"])
         self.assertEqual(result["agents"], [])
@@ -1314,6 +1617,21 @@ class SnapshotAndFleetTests(unittest.TestCase):
         limited = bound(oversized)
         self.assertLessEqual(len(json.dumps(limited, separators=(",", ":")).encode()), MAX_SNAPSHOT_BYTES)
         self.assertTrue(limited["partial"])
+
+        process_heavy = snapshot()
+        process_heavy["managed_processes"] = [
+            {**managed_process(managed_id=f"managed-{number}"), "label": "x" * 1000}
+            for number in range(20)
+        ]
+        process_heavy["inferred_processes"] = [
+            {**inferred_process(), "pid": 1000 + number, "process_start_time": str(number),
+             "creation_identity": f"linux:boot-1:{number}", "executable": "y" * 1000}
+            for number in range(20)
+        ]
+        process_limited = bound(process_heavy, maximum_bytes=5000)
+        self.assertLess(len(process_limited["managed_processes"]), 20)
+        self.assertLess(len(process_limited["inferred_processes"]), 20)
+        self.assertLessEqual(len(json.dumps(process_limited, separators=(",", ":")).encode()), 5000)
 
     def test_nested_capacity_failure_propagates_partial_error(self):
         class Host:
@@ -1331,7 +1649,8 @@ class SnapshotAndFleetTests(unittest.TestCase):
             def view(self, thresholds, **counts):
                 return {"partial": True, "error": "sqlite read failed", **counts}
         controller = type("Controller", (), {"host": Host(), "sessions": Sessions(),
-                                               "native": Native(), "capacity": Capacity()})()
+                                               "native": Native(), "capacity": Capacity(),
+                                               "process_monitor": EmptyProcessMonitor()})()
         result = compose(controller)
         self.assertTrue(result["partial"])
         self.assertEqual(result["errors"]["capacity"], "sqlite read failed")
@@ -1363,7 +1682,7 @@ class SnapshotAndFleetTests(unittest.TestCase):
             capacity.sample()
             result = compose(type("Controller", (), {
                 "host": Host(), "sessions": Sessions(), "native": Native(),
-                "capacity": capacity,
+                "capacity": capacity, "process_monitor": EmptyProcessMonitor(),
             })())
 
         self.assertTrue(result["partial"])
@@ -1377,6 +1696,7 @@ class SnapshotAndFleetTests(unittest.TestCase):
 
         class Host:
             def view(self, at): return {**value["host"], "observed_at": at}
+
         class Sessions:
             def fleet_records(self, limit): return [], 0
             def tasks(self, limit): return []
@@ -1391,6 +1711,7 @@ class SnapshotAndFleetTests(unittest.TestCase):
             sessions = Sessions()
             native = Native()
             capacity = Capacity()
+            process_monitor = EmptyProcessMonitor()
 
             @staticmethod
             def lifecycle_health():
@@ -1400,6 +1721,77 @@ class SnapshotAndFleetTests(unittest.TestCase):
         self.assertTrue(result["partial"])
         self.assertEqual(result["capacity"]["capacity_state"], "unknown")
         self.assertIn("lifecycle", " ".join(result["capacity"]["capacity_reasons"]))
+
+    def test_process_sampler_failure_is_partial_without_hiding_lifecycle(self):
+        class Host:
+            def view(self, at): return {"host_id": "host", "observed_at": at}
+        class Sessions:
+            def fleet_records(self, limit):
+                return [{"source": "claude", "session_id": "S", "status": "running"}], 1
+            def tasks(self, limit): return []
+        class Native:
+            def fleet_records(self, limit): return [], 0
+        class Processes(EmptyProcessMonitor):
+            def health(self):
+                return {"partial": True, "error": "kernel process data unavailable", "observed_at": 1}
+        class Capacity:
+            def view(self, thresholds, **counts): return counts
+        result = compose(type("Controller", (), {
+            "host": Host(), "sessions": Sessions(), "native": Native(),
+            "process_monitor": Processes(), "capacity": Capacity(),
+        })())
+        self.assertEqual(result["sessions"][0]["session_id"], "S")
+        self.assertTrue(result["partial"])
+        self.assertIn("kernel process data unavailable", result["errors"]["processes"])
+        self.assertIsNone(result["capacity"]["active_managed_processes"])
+        self.assertTrue(result["capacity"]["partial"])
+        self.assertEqual(result["capacity"]["capacity_state"], "unknown")
+
+        remote = snapshot()
+        remote["capacity"].update(
+            partial=True, capacity_state="available", capacity_reasons=[],
+            active_managed_processes=None,
+        )
+        fleet = query_fleet(
+            FleetConfig((FleetHost("local", "local"),)),
+            local_snapshot=lambda thresholds: remote,
+        )
+        self.assertEqual(
+            fleet["hosts"][0]["snapshot"]["capacity"]["capacity_state"], "unknown",
+        )
+
+    def test_managed_process_counts_and_alerts_are_independent_of_display_limit(self):
+        failed = {**managed_process("host", "failed"), "status": "failed",
+                  "exit_status": 7, "finished_at": 5}
+        uncertain = {**managed_process("host", "uncertain"), "status": "unknown",
+                     "shutdown_uncertain": True, "shutdown_was_uncertain": True,
+                     "visibility_reason": "descendant remains"}
+        class Processes(EmptyProcessMonitor):
+            def fleet_records(self, limit): return [failed, uncertain][:limit], 4
+        class Host:
+            def view(self, at): return {"host_id": "host", "observed_at": at}
+        class Sessions:
+            def fleet_records(self, limit): return [], 0
+            def tasks(self, limit): return []
+        class Native:
+            def fleet_records(self, limit): return [], 0
+        class Capacity:
+            def view(self, thresholds, **counts): return counts
+        result = compose(type("Controller", (), {
+            "host": Host(), "sessions": Sessions(), "native": Native(),
+            "process_monitor": Processes(), "capacity": Capacity(),
+        })(), history_limit=1)
+        self.assertEqual(result["capacity"]["active_managed_processes"], 4)
+        self.assertEqual(len(result["managed_processes"]), 1)
+        self.assertIn("truncated", result["errors"]["managed_processes"])
+        kinds = {alert["kind"] for alert in result["alerts"]}
+        self.assertIn("managed_process_failed", kinds)
+        complete = compose(type("Controller", (), {
+            "host": Host(), "sessions": Sessions(), "native": Native(),
+            "process_monitor": Processes(), "capacity": Capacity(),
+        })(), history_limit=2)
+        self.assertIn("managed_process_shutdown_uncertain",
+                      {alert["kind"] for alert in complete["alerts"]})
 
     def test_independent_active_counts_and_needs_input_alerts(self):
         class Host:
@@ -1421,7 +1813,8 @@ class SnapshotAndFleetTests(unittest.TestCase):
             def view(self, thresholds, **counts):
                 return {"partial": False, "capacity_state": "unknown", "capacity_reasons": [], **counts}
         result = compose(type("Controller", (), {"host": Host(), "sessions": Sessions(),
-                                                   "native": Native(), "capacity": Capacity()})())
+                                                   "native": Native(), "capacity": Capacity(),
+                                                   "process_monitor": EmptyProcessMonitor()})())
         self.assertEqual(result["capacity"]["active_claude_sessions"], 3)
         self.assertEqual(result["capacity"]["active_agents"], 4)
         self.assertEqual(sum(alert["kind"] == "agent_needs_input" for alert in result["alerts"]), 2)
@@ -1500,6 +1893,7 @@ class SnapshotAndFleetTests(unittest.TestCase):
 
             controller = type("Controller", (), {
                 "host": Host(), "sessions": sessions, "native": native, "capacity": Capacity(),
+                "process_monitor": EmptyProcessMonitor(),
             })()
             with patch("router.fleet_snapshot.now_ms", return_value=1000):
                 result = compose(controller, history_limit=1)
@@ -2306,6 +2700,22 @@ required = false
         self.assertIn("badname", agent_row)
         self.assertIn("20%", agent_row)
 
+        process_value = snapshot("process-host")
+        process_value["sessions"] = []
+        process_value["agents"] = []
+        visible = managed_process("process-host")
+        visible.update(label="suite\n\x1b[2J", pid=321, attribution="exact",
+                       cpu_pct=12.5, rss_bytes=4096, worker_count=2)
+        process_value["managed_processes"] = [visible]
+        process_rendered = fleet_table({
+            "hosts": [{"name": "process-host", "ok": True, "snapshot": process_value}],
+        })
+        self.assertNotIn("\x1b", process_rendered)
+        self.assertIn("suite", process_rendered)
+        self.assertIn("pid 321 exact 0.0s 2w", process_rendered)
+        self.assertIn("12%", process_rendered)
+        self.assertIn("4.0K", process_rendered)
+
     def test_table_marks_partial_empty_snapshot_and_bounds_section_errors(self):
         value = snapshot()
         value.update(
@@ -2383,8 +2793,19 @@ required = false
                             time.sleep(.03)
                     else:
                         self.fail("isolated daemon did not start")
-                    request("session_observe", {"source": "claude", "session_id": "same", "kind": "session_start",
-                                                "observed_at": int(time.time() * 1000)}, endpoint)
+                    identity = creation_identity(process.pid)
+                    start_time = (
+                        identity.rsplit(":", 1)[-1]
+                        if identity.startswith("linux:")
+                        else identity.removeprefix("darwin:")
+                    )
+                    request("session_observe", {
+                        "source": "claude", "session_id": "same", "kind": "session_start",
+                        "observed_at": int(time.time() * 1000),
+                        "claude_pid": process.pid,
+                        "claude_process_start_time": start_time,
+                        "claude_creation_identity": identity,
+                    }, endpoint)
                 config = FleetConfig((FleetHost("one", "local"), FleetHost("two", "ssh", target="emulated")),
                                      ssh_timeout_seconds=1)
                 with patch("router.fleet.ssh_snapshot", side_effect=lambda host, timeout: request("snapshot", {}, endpoints[1])):

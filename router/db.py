@@ -59,12 +59,38 @@ class Store:
                 """CREATE INDEX IF NOT EXISTS sessions_active_tool_deadline
                     ON sessions(host_id, json_extract(data,'$.tool_active_until'))
                     WHERE json_extract(data,'$.status')='running'""",
+                """CREATE TABLE IF NOT EXISTS managed_processes (
+                    managed_process_id TEXT PRIMARY KEY,
+                    host_id TEXT NOT NULL,
+                    boot_id TEXT NOT NULL,
+                    pid INTEGER NOT NULL,
+                    process_start_time TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    monitor_active INTEGER NOT NULL DEFAULT 0,
+                    finished_at INTEGER,
+                    sort_at INTEGER NOT NULL,
+                    data TEXT NOT NULL,
+                    UNIQUE(host_id, boot_id, pid, process_start_time))""",
         )
         with self.transaction() as db:
             for statement in statements:
                 db.execute(statement)
             if "parent_agent_id" not in {row[1] for row in db.execute("PRAGMA table_info(authorizations)")}:
                 db.execute("ALTER TABLE authorizations ADD COLUMN parent_agent_id TEXT")
+            managed_columns = {
+                row[1] for row in db.execute("PRAGMA table_info(managed_processes)")
+            }
+            if "monitor_active" not in managed_columns:
+                db.execute(
+                    "ALTER TABLE managed_processes ADD COLUMN "
+                    "monitor_active INTEGER NOT NULL DEFAULT 0"
+                )
+                db.execute(
+                    """UPDATE managed_processes SET monitor_active=1
+                        WHERE status='running' OR
+                        coalesce(json_extract(data,'$._uncertain_process_live'),0)=1 OR
+                        coalesce(json_extract(data,'$._needs_reconciliation'),0)=1"""
+                )
             observation_columns = [row[1] for row in db.execute("PRAGMA table_info(observations)")]
             if observation_columns != ["task_id", "session_id", "data"]:
                 raise ValueError(
@@ -84,6 +110,22 @@ class Store:
                 WHERE json_extract(data,'$.host_id') IS NOT NULL
                   AND json_extract(data,'$.source') IS NOT NULL
                   AND json_extract(data,'$.agent_id') IS NOT NULL""")
+            db.execute("""CREATE INDEX IF NOT EXISTS sessions_process_inference ON sessions(
+                host_id,source,json_extract(data,'$.status'))
+                WHERE json_extract(data,'$.claude_pid') IS NOT NULL""")
+            db.execute("""CREATE INDEX IF NOT EXISTS sessions_process_recent ON sessions(
+                host_id,source,json_extract(data,'$.last_event_at'))
+                WHERE json_extract(data,'$.status') IN ('running','idle','unknown')""")
+            db.execute("""CREATE INDEX IF NOT EXISTS sessions_process_pid ON sessions(
+                host_id,source,json_extract(data,'$.claude_pid'))
+                WHERE json_extract(data,'$.status') IN ('running','idle','unknown')""")
+            db.execute("""CREATE INDEX IF NOT EXISTS managed_processes_fleet ON managed_processes(
+                host_id,status,sort_at DESC)""")
+            db.execute("""CREATE INDEX IF NOT EXISTS managed_processes_finished ON managed_processes(
+                host_id,finished_at DESC) WHERE status IN ('stopped','failed')""")
+            db.execute("""CREATE INDEX IF NOT EXISTS managed_processes_monitor_active
+                ON managed_processes(host_id,monitor_active)
+                WHERE monitor_active=1""")
         path.chmod(0o600)
 
     @contextmanager
