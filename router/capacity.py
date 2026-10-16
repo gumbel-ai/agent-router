@@ -89,7 +89,7 @@ def _darwin_memory() -> tuple[int, int, int]:
 def _linux_cpu_ticks() -> tuple[int, int]:
     fields = [int(value) for value in Path("/proc/stat").read_text().splitlines()[0].split()[1:]]
     idle = fields[3] + (fields[4] if len(fields) > 4 else 0)
-    return sum(fields), idle
+    return sum(fields[:8]), idle
 
 
 def _darwin_cpu_ticks() -> tuple[int, int]:

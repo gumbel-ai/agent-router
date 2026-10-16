@@ -199,6 +199,8 @@ def _validate_snapshot(payload: bytes) -> dict:
             raise ValueError("Host snapshot alert timestamps are out of order")
         if not isinstance(alert.get("entity"), dict):
             raise ValueError("Host snapshot alert has invalid entity")  # noqa: TRY004 - public wire validation
+    if "partial" in capacity and not isinstance(capacity["partial"], bool):
+        raise ValueError("Host snapshot has invalid capacity partial flag")
     if capacity:
         logical_cpus = capacity.get("logical_cpus")
         if logical_cpus is not None and (not isinstance(logical_cpus, int) or isinstance(logical_cpus, bool) or logical_cpus <= 0):
@@ -341,7 +343,6 @@ def query_fleet(config: FleetConfig, local_snapshot=None, only: str | None = Non
     selected = [host for host in config.hosts if only is None or host.name == only]
     if only is not None and not selected:
         raise ValueError(f"Unknown fleet host: {only}")
-
     def query(host: FleetHost) -> dict:
         started = time.monotonic()
         wrapper = {"name": host.name, "transport": host.transport, "target": host.target,
@@ -356,20 +357,12 @@ def query_fleet(config: FleetConfig, local_snapshot=None, only: str | None = Non
                 snapshot = _validate_snapshot(json.dumps(snapshot, separators=(",", ":")).encode())
             else:
                 snapshot = ssh_snapshot(host, config.ssh_timeout_seconds)
-            capacity = snapshot.get("capacity")
-            if isinstance(capacity, dict):
-                state, reasons = classify(capacity, host.thresholds)
-                capacity.update(capacity_state=state, capacity_reasons=reasons)
-                local_alerts = [item for item in snapshot["alerts"]
-                                if item.get("kind") not in CAPACITY_ALERT_KINDS]
-                if snapshot["host"] and capacity:
-                    local_alerts.extend(capacity_alerts(snapshot["host"], capacity, host.thresholds))
-                snapshot["alerts"] = local_alerts
             snapshot = _prefix_identities(snapshot)
             if len(json.dumps(snapshot, separators=(",", ":")).encode()) > MAX_SNAPSHOT_BYTES:
                 raise ValueError("Host snapshot exceeds one MiB after fleet identity augmentation")
-            return {**wrapper, "ok": True, "latency_ms": round((time.monotonic() - started) * 1000),
-                    "snapshot": snapshot}
+            received_at = time.monotonic()
+            return {**wrapper, "ok": True, "latency_ms": round((received_at - started) * 1000),
+                    "snapshot": snapshot, "_received_at": received_at}
         except (OSError, ValueError, KeyError, TypeError, RecursionError, UnicodeError, OverflowError) as error:
             return {**wrapper, "ok": False, "latency_ms": round((time.monotonic() - started) * 1000),
                     "error": _redact_error(str(error))}
@@ -380,6 +373,8 @@ def query_fleet(config: FleetConfig, local_snapshot=None, only: str | None = Non
         for future in as_completed(futures):
             records[futures[future]] = future.result()
     hosts = [records[host.name] for host in selected]
+    collection_finished = time.monotonic()
+    configured_hosts = {host.name: host for host in selected}
     generated_at = int(time.time() * 1000)
     versions = {record["snapshot"]["host"].get("router_version") for record in hosts if record["ok"]}
     version_mismatch = len(versions) > 1
@@ -388,7 +383,21 @@ def query_fleet(config: FleetConfig, local_snapshot=None, only: str | None = Non
             record["alerts"].append(_fleet_alert(record, "host_offline", record["error"], generated_at))
             continue
         snapshot = record["snapshot"]
-        sample_age = snapshot.get("capacity", {}).get("sample_age_ms")
+        capacity = snapshot.get("capacity", {})
+        sample_age = capacity.get("sample_age_ms")
+        received_at = record.pop("_received_at")
+        if isinstance(sample_age, (int, float)):
+            sample_age += max(0, (collection_finished - received_at) * 1000)
+            capacity["sample_age_ms"] = sample_age
+        state, reasons = classify(capacity, configured_hosts[record["name"]].thresholds)
+        capacity.update(capacity_state=state, capacity_reasons=reasons)
+        snapshot["alerts"] = [
+            alert for alert in snapshot["alerts"] if alert.get("kind") not in CAPACITY_ALERT_KINDS
+        ]
+        if snapshot["host"] and capacity:
+            snapshot["alerts"].extend(capacity_alerts(
+                snapshot["host"], capacity, configured_hosts[record["name"]].thresholds,
+            ))
         if isinstance(sample_age, (int, float)) and sample_age > max(15_000, config.refresh_seconds * 3000):
             record["alerts"].append(_fleet_alert(record, "host_snapshot_stale",
                                                    "Host capacity sample is stale", generated_at))

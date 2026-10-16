@@ -133,6 +133,26 @@ class HookTests(TransportHarness, unittest.TestCase):
             observe({"hook_event_name": "SubagentStart", "session_id": "S", "agent_id": "A"})
         self.assertEqual(calls, ["lifecycle_observe", "observe"])
 
+    def test_observer_redacts_task_metadata_before_bounding_hook_payload(self):
+        requests = []
+        secret = "x" * 217 + " https://user:swordfish@example.com"
+
+        def send(operation, payload, timeout):
+            requests.append((operation, payload))
+            return {"accepted": True}
+
+        with patch("router.observer_hook.request", side_effect=send):
+            observe({"hook_event_name": "TaskCreated", "session_id": "S",
+                     "task_id": "T", "task_subject": secret})
+            observe({"hook_event_name": "PostToolUse", "session_id": "S", "tool_name": "Agent",
+                     "tool_input": {"description": secret},
+                     "tool_response": {"agentId": "A", "isAsync": True}})
+
+        serialized = json.dumps(requests)
+        self.assertNotIn("swordfish", serialized)
+        self.assertEqual(requests[0][1]["session"]["task_subject"].count("[REDACTED]"), 1)
+        self.assertEqual(requests[1][1]["native"]["task"].count("[REDACTED]"), 1)
+
 
 if __name__ == '__main__':
     unittest.main()

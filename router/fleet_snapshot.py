@@ -90,21 +90,55 @@ def _section(snapshot: dict, key: str, producer, fallback) -> None:
         snapshot.setdefault("errors", {})[key] = str(error)[:500]
 
 
+def _collection(snapshot: dict, key: str, producer, limit: int) -> None:
+    _section(snapshot, key, lambda: producer(limit + 1), [])
+    if len(snapshot[key]) > limit:
+        snapshot[key] = snapshot[key][:limit]
+        snapshot["partial"] = True
+        snapshot.setdefault("errors", {})[key] = (
+            f"Collection truncated to history_limit={limit}"
+        )
+
+
+def _observed_collection(snapshot: dict, key: str, producer, limit: int) -> int | None:
+    try:
+        records, active = producer(limit + 1)
+        if not isinstance(records, list):
+            raise TypeError("collection must be a list")
+        if not isinstance(active, int) or isinstance(active, bool) or active < 0:
+            raise ValueError("active count must be a nonnegative integer")
+        snapshot[key] = records[:limit]
+        if len(records) > limit:
+            snapshot["partial"] = True
+            snapshot.setdefault("errors", {})[key] = (
+                f"Collection truncated to history_limit={limit}"
+            )
+        return active
+    except (OSError, ValueError, KeyError, TypeError, sqlite3.Error) as error:
+        snapshot[key] = []
+        snapshot["partial"] = True
+        snapshot.setdefault("errors", {})[key] = str(error)[:500]
+        return None
+
+
 def compose(controller, thresholds: CapacityThresholds | None = None, history_limit: int = 100) -> dict:
     generated_at = now_ms()
     thresholds = thresholds or CapacityThresholds()
     snapshot = {"schema_version": SCHEMA_VERSION, "partial": False, "generated_at": generated_at}
     _section(snapshot, "host", lambda: controller.host.view(generated_at), {})
-    _section(snapshot, "sessions", lambda: controller.sessions.sessions(history_limit), [])
-    _section(snapshot, "agents", lambda: controller.native.snapshot(history_limit), [])
-    _section(snapshot, "tasks", lambda: controller.sessions.tasks(history_limit), [])
+    active_sessions = _observed_collection(
+        snapshot, "sessions", controller.sessions.fleet_records, history_limit,
+    )
+    active_agents = _observed_collection(
+        snapshot, "agents", controller.native.fleet_records, history_limit,
+    )
+    _collection(snapshot, "tasks", controller.sessions.tasks, history_limit)
     sessions = snapshot["sessions"]
     agents = snapshot["agents"]
     _section(snapshot, "capacity", lambda: controller.capacity.view(
         thresholds,
-        active_claude_sessions=sum(
-            item.get("status") == "running" or item.get("needs_input") is True for item in sessions),
-        active_agents=sum(item.get("status") in {"running", "needs_input"} for item in agents),
+        active_claude_sessions=active_sessions,
+        active_agents=active_agents,
         active_managed_processes=0,
     ), {})
     snapshot["managed_processes"] = []

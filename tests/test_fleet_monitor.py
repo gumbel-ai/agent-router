@@ -5,10 +5,12 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 import uuid
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from contextlib import redirect_stdout
 from pathlib import Path
 from unittest.mock import mock_open, patch
@@ -175,6 +177,30 @@ class SessionAndCapacityTests(unittest.TestCase):
         self.assertNotIn("PRIVATE", json.dumps(self.observer.tasks()))
         self.assertEqual(self.event("session_end")["status"], "stopped")
 
+    def test_restart_unknown_records_remain_visible_until_terminal_evidence(self):
+        old = self.now - 301_000
+        self.event("session_start", observed_at=old)
+        native = NativeObserver(self.store, host_id="host")
+        native.observe({
+            "source": "claude", "session_id": "S", "agent_id": "A",
+            "kind": "start", "observed_at": old,
+        })
+
+        self.observer.reconcile_restart()
+        native.reconcile_restart()
+        self.assertEqual(self.observer.sessions()[0]["status"], "unknown")
+        self.assertEqual(native.snapshot()[0]["status"], "unknown")
+        self.assertEqual(self.observer.active_count(), 0)
+        self.assertEqual(native.active_count(), 0)
+
+        self.event("session_end", observed_at=old + 1)
+        native.observe({
+            "source": "claude", "session_id": "S", "agent_id": "A",
+            "kind": "stop", "observed_at": old + 1,
+        })
+        self.assertEqual(self.observer.sessions(), [])
+        self.assertEqual(native.snapshot(), [])
+
     def test_operator_visible_task_metadata_redacts_credentials(self):
         self.event("session_start")
         self.event("task_created", task_id="T", task_subject="rotate password=swordfish")
@@ -190,6 +216,17 @@ class SessionAndCapacityTests(unittest.TestCase):
         })
         self.assertNotIn("sk-ant-abcdefghijklmnop", record["task"])
         self.assertIn("[REDACTED]", record["task"])
+
+        session_boundary_secret = "x" * 477 + " https://user:swordfish@example.com"
+        self.event("task_created", task_id="boundary", task_subject=session_boundary_secret)
+        bounded_task = next(task for task in self.observer.tasks() if task["task_id"] == "boundary")
+        native_boundary_secret = "x" * 217 + " https://user:swordfish@example.com"
+        bounded_native = native.observe({
+            "source": "claude", "session_id": "S", "agent_id": "boundary",
+            "kind": "launch", "observed_at": self.now, "task": native_boundary_secret,
+        })
+        self.assertNotIn("swordfish", bounded_task["subject"])
+        self.assertNotIn("swordfish", bounded_native["task"])
 
         task_id = record["task_id"]
         legacy = native.get(task_id)
@@ -249,6 +286,11 @@ class SessionAndCapacityTests(unittest.TestCase):
         with patch("router.capacity.Path.read_text", return_value="cpu  10 2 3 20 5 0 0 0\n"):
             self.assertEqual(_linux_cpu_ticks(), (40, 25))
 
+    def test_linux_cpu_ticks_do_not_double_count_guest_time(self):
+        with patch("router.capacity.Path.read_text",
+                   return_value="cpu  10 2 3 20 5 0 0 0 7 11\n"):
+            self.assertEqual(_linux_cpu_ticks(), (40, 25))
+
     def test_stale_nonterminal_session_and_native_agent_remain_visible_as_unknown(self):
         old = self.now - 61_000
         self.event("session_start", observed_at=old)
@@ -305,15 +347,20 @@ class SessionAndCapacityTests(unittest.TestCase):
         self.assertEqual(active["status"], "running")
         with patch("router.sessions.now_ms", return_value=self.now):
             self.assertEqual(self.observer.sessions()[0]["status"], "running")
+            self.assertEqual(self.observer.active_count(), 1)
         completed = self.event("tool_end", observed_at=self.now, tool_use_id="tool-1", activity="Bash")
         self.assertEqual(completed["inflight_tool_count"], 0)
+        with patch("router.sessions.now_ms", return_value=self.now + 61_000):
+            self.assertEqual(self.observer.active_count(), 0)
 
     def test_abandoned_inflight_tool_eventually_becomes_unknown_without_leaking_bookkeeping(self):
-        old = self.now - 86_400_001
+        old = self.now - 86_400_002
         self.event("session_start", observed_at=old)
         public = self.event("tool_start", observed_at=old + 1, tool_use_id="tool-1", activity="Bash")
         self.assertEqual(public["status"], "unknown")
         self.assertEqual(public["inflight_tool_count"], 1)
+        with patch("router.sessions.now_ms", return_value=self.now):
+            self.assertEqual(self.observer.active_count(), 0)
         for internal in ("inflight_tools", "tool_event_at", "tool_finished_at", "waiting_agents"):
             self.assertNotIn(internal, public)
 
@@ -434,6 +481,22 @@ class SnapshotAndFleetTests(unittest.TestCase):
         self.assertTrue(result["hosts"][1]["ok"])
         self.assertEqual(result["hosts"][1]["snapshot"]["host"]["host_id"], "healthy")
 
+    def test_non_boolean_capacity_partial_is_rejected_and_peer_isolated(self):
+        invalid = snapshot("invalid")
+        invalid["capacity"]["partial"] = "true"
+        payload = json.dumps(invalid, separators=(",", ":")).encode()
+        with self.assertRaisesRegex(ValueError, "invalid capacity partial flag"):
+            _validate_snapshot(payload)
+
+        config = FleetConfig((FleetHost("invalid", "local"),
+                              FleetHost("healthy", "ssh", target="healthy")))
+        with patch("router.fleet.ssh_snapshot", return_value=snapshot("healthy")):
+            result = query_fleet(config, local_snapshot=lambda thresholds: invalid)
+        self.assertFalse(result["hosts"][0]["ok"])
+        self.assertTrue(result["hosts"][1]["ok"])
+        self.assertEqual(result["hosts"][1]["snapshot"]["capacity"]["capacity_state"],
+                         "available")
+
     def test_malformed_remote_alert_isolated_from_healthy_peer(self):
         config = FleetConfig((FleetHost("local", "local"),
                               FleetHost("invalid", "ssh", target="invalid")))
@@ -458,8 +521,12 @@ class SnapshotAndFleetTests(unittest.TestCase):
         class Sessions:
             def sessions(self, limit): return []
             def tasks(self, limit): return []
+            def active_count(self): return 0
+            def fleet_records(self, limit): return self.sessions(limit), self.active_count()
         class Native:
             def snapshot(self, limit): raise OSError("process data unavailable")
+            def active_count(self): return 0
+            def fleet_records(self, limit): return self.snapshot(limit), self.active_count()
         class Capacity:
             def view(self, thresholds, **counts):
                 return {"capacity_state": "unknown", "capacity_reasons": ["missing"], **counts}
@@ -481,8 +548,12 @@ class SnapshotAndFleetTests(unittest.TestCase):
         class Sessions:
             def sessions(self, limit): return []
             def tasks(self, limit): return []
+            def active_count(self): return 0
+            def fleet_records(self, limit): return self.sessions(limit), self.active_count()
         class Native:
             def snapshot(self, limit): return []
+            def active_count(self): return 0
+            def fleet_records(self, limit): return self.snapshot(limit), self.active_count()
         class Capacity:
             def view(self, thresholds, **counts):
                 return {"partial": True, "error": "sqlite read failed", **counts}
@@ -492,7 +563,7 @@ class SnapshotAndFleetTests(unittest.TestCase):
         self.assertTrue(result["partial"])
         self.assertEqual(result["errors"]["capacity"], "sqlite read failed")
 
-    def test_needs_input_counts_as_active_and_emits_alert(self):
+    def test_independent_active_counts_and_needs_input_alerts(self):
         class Host:
             def view(self, at): return {"host_id": "host", "router_version": "0.4.0", "observed_at": at}
         class Sessions:
@@ -500,18 +571,123 @@ class SnapshotAndFleetTests(unittest.TestCase):
                 return [{"source": "claude", "session_id": "S", "status": "idle", "needs_input": True,
                          "last_event_at": 1, "visibility_reason": "waiting"}]
             def tasks(self, limit): return []
+            def active_count(self): return 3
+            def fleet_records(self, limit): return self.sessions(limit), self.active_count()
         class Native:
             def snapshot(self, limit):
                 return [{"source": "claude", "parent_session_id": "S", "agent_id": "A",
                          "status": "needs_input", "last_event_at": 1}]
+            def active_count(self): return 4
+            def fleet_records(self, limit): return self.snapshot(limit), self.active_count()
         class Capacity:
             def view(self, thresholds, **counts):
                 return {"partial": False, "capacity_state": "unknown", "capacity_reasons": [], **counts}
         result = compose(type("Controller", (), {"host": Host(), "sessions": Sessions(),
                                                    "native": Native(), "capacity": Capacity()})())
-        self.assertEqual(result["capacity"]["active_claude_sessions"], 1)
-        self.assertEqual(result["capacity"]["active_agents"], 1)
+        self.assertEqual(result["capacity"]["active_claude_sessions"], 3)
+        self.assertEqual(result["capacity"]["active_agents"], 4)
         self.assertEqual(sum(alert["kind"] == "agent_needs_input" for alert in result["alerts"]), 2)
+
+    def test_active_counts_ignore_display_limits_and_truncation_is_explicit(self):
+        with tempfile.TemporaryDirectory() as temp:
+            store = Store(Path(temp) / "router.sqlite3", "host")
+            sessions = SessionObserver(store, "host")
+            native = NativeObserver(store, host_id="host")
+            observed_at = int(time.time() * 1000)
+            for number in range(2):
+                session_id = f"S-{number}"
+                sessions.observe({"source": "claude", "session_id": session_id,
+                                  "kind": "session_start", "observed_at": observed_at})
+                sessions.observe({"source": "claude", "session_id": session_id,
+                                  "kind": "task_created", "task_id": f"T-{number}",
+                                  "task_subject": f"Task {number}", "observed_at": observed_at})
+                native.observe({"source": "claude", "session_id": session_id,
+                                "agent_id": f"A-{number}", "kind": "start",
+                                "observed_at": observed_at})
+
+            class Host:
+                def view(self, at): return {"host_id": "host", "observed_at": at}
+
+            class Capacity:
+                def view(self, thresholds, **counts): return counts
+
+            controller = type("Controller", (), {
+                "host": Host(), "sessions": sessions, "native": native, "capacity": Capacity(),
+            })()
+            result = compose(controller, history_limit=1)
+
+        self.assertEqual(len(result["sessions"]), 1)
+        self.assertEqual(len(result["agents"]), 1)
+        self.assertEqual(len(result["tasks"]), 1)
+        self.assertEqual(result["capacity"]["active_claude_sessions"], 2)
+        self.assertEqual(result["capacity"]["active_agents"], 2)
+        self.assertTrue(result["partial"])
+        self.assertIn("truncated", result["errors"]["sessions"])
+        self.assertIn("truncated", result["errors"]["agents"])
+        self.assertIn("truncated", result["errors"]["tasks"])
+
+    def test_observed_rows_and_active_totals_share_one_database_snapshot(self):
+        with tempfile.TemporaryDirectory() as temp:
+            store = Store(Path(temp) / "router.sqlite3", "host")
+            sessions = SessionObserver(store, "host")
+            native = NativeObserver(store, host_id="host")
+            observed_at = int(time.time() * 1000)
+            sessions.observe({"source": "claude", "session_id": "S",
+                              "kind": "session_start", "observed_at": observed_at})
+            native_record = native.observe({"source": "claude", "session_id": "S",
+                                            "agent_id": "A", "kind": "start",
+                                            "observed_at": observed_at})
+            original_connect = store.connect
+
+            def collect_with_interleaved_stop(observer, table, where, parameters):
+                changed = False
+
+                def stop_record():
+                    with original_connect() as writer:
+                        writer.execute("BEGIN IMMEDIATE")
+                        row = writer.execute(
+                            f"SELECT data FROM {table} WHERE {where}", parameters,
+                        ).fetchone()
+                        record = json.loads(row[0])
+                        record.update(status="stopped", last_event_at=observed_at + 1)
+                        writer.execute(
+                            f"UPDATE {table} SET data=? WHERE {where}",
+                            (json.dumps(record, separators=(",", ":")), *parameters),
+                        )
+                        writer.commit()
+
+                @contextmanager
+                def interleaved_connect(timeout=10):
+                    nonlocal changed
+                    with original_connect(timeout) as connection:
+                        class InterleavedConnection:
+                            def execute(self, statement, parameters=()):
+                                nonlocal changed
+                                cursor = connection.execute(statement, parameters)
+                                if not changed and statement.lstrip().startswith(
+                                        f"SELECT data FROM {table}"):
+                                    rows = cursor.fetchall()
+                                    changed = True
+                                    stop_record()
+                                    return rows
+                                return cursor
+                        yield InterleavedConnection()
+
+                with patch.object(store, "connect", interleaved_connect), \
+                        patch("router.sessions.now_ms", return_value=observed_at), \
+                        patch("router.native.now_ms", return_value=observed_at):
+                    return observer.fleet_records(100)
+
+            session_rows, session_active = collect_with_interleaved_stop(
+                sessions, "sessions", "host_id=? AND source=? AND session_id=?",
+                ("host", "claude", "S"),
+            )
+            native_rows, native_active = collect_with_interleaved_stop(
+                native, "observations", "task_id=?", (native_record["task_id"],),
+            )
+
+        self.assertEqual((session_rows[0]["status"], session_active), ("running", 1))
+        self.assertEqual((native_rows[0]["status"], native_active), ("running", 1))
 
     def test_fleet_config_validation_and_partial_hosts_preserve_composite_identity(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -591,6 +767,45 @@ required = false
                          {alert["kind"] for alert in result["hosts"][0]["alerts"]})
         self.assertIn("unsupported_claude_version",
                       {alert["kind"] for alert in result["hosts"][1]["alerts"]})
+
+    def test_fleet_collection_elapsed_time_ages_and_reclassifies_capacity(self):
+        main_thread = threading.current_thread()
+        completed_at = {}
+
+        def monotonic():
+            if threading.current_thread() is main_thread:
+                return 116
+            return completed_at.get(threading.get_ident(), 100)
+
+        def local_snapshot(thresholds):
+            completed_at[threading.get_ident()] = 100
+            return snapshot("local")
+
+        def remote_snapshot(host, timeout):
+            completed_at[threading.get_ident()] = 116
+            return snapshot("peer")
+
+        config = FleetConfig((FleetHost("local", "local"),
+                              FleetHost("peer", "ssh", target="peer")))
+        with patch("router.fleet.time.monotonic", side_effect=monotonic), \
+                patch("router.fleet.ssh_snapshot", side_effect=remote_snapshot):
+            result = query_fleet(
+                config,
+                local_snapshot=local_snapshot,
+            )
+        local_capacity = result["hosts"][0]["snapshot"]["capacity"]
+        peer_capacity = result["hosts"][1]["snapshot"]["capacity"]
+        self.assertEqual(local_capacity["sample_age_ms"], 16_001)
+        self.assertEqual(local_capacity["capacity_state"], "unknown")
+        self.assertIn("stale", local_capacity["capacity_reasons"][0])
+        self.assertIn("host_snapshot_stale", {
+            alert["kind"] for alert in result["hosts"][0]["alerts"]
+        })
+        self.assertEqual(peer_capacity["sample_age_ms"], 1)
+        self.assertEqual(peer_capacity["capacity_state"], "available")
+        self.assertNotIn("host_snapshot_stale", {
+            alert["kind"] for alert in result["hosts"][1]["alerts"]
+        })
 
     def test_snapshot_rejects_record_with_missing_or_mismatched_host_identity(self):
         for host_id in (None, "other-host"):
@@ -772,14 +987,27 @@ required = false
         for secret, leaked in (
                 ("Authorization: Basic dXNlcjpwYXNz", "dXNlcjpwYXNz"),
                 ('password: "orchid meadow"', "orchid meadow"),
+                ('"password": "orchid meadow"', "orchid meadow"),
+                ('"password": "orchid \\"meadow\\""', "meadow"),
+                ('"AWS_SECRET_ACCESS_KEY": "abcd 1234"', "abcd 1234"),
+                ('password: "orchid meadow', "meadow"),
+                ('password: "orchid\nmeadow"', "meadow"),
+                ('password: "orchid\nmeadow', "meadow"),
+                ("AWS_SECRET_ACCESS_KEY='abcd 1234", "1234"),
+                ("passphrase=hunter2", "hunter2"),
+                ("pwd=hunter2", "hunter2"),
                 ("https://user:pass@example.com/path", "user:pass"),
                 ("AWS_SECRET_ACCESS_KEY=abcd1234secret", "abcd1234secret"),
                 ("ANTHROPIC_API_KEY=sk-ant-abcdefghijklmnop", "sk-ant-abcdefghijklmnop"),
+                ("credential ghp_abcdefghijklmnop", "ghp_abcdefghijklmnop"),
+                ("credential github_pat_abcdefghijklmnop", "github_pat_abcdefghijklmnop"),
+                ("credential sk-abcdefghijklmnop", "sk-abcdefghijklmnop"),
                 ("-----BEGIN OPENSSH PRIVATE KEY-----\nprivate-body\n-----END OPENSSH PRIVATE KEY-----",
                  "private-body"),
         ):
             redacted = _redact_error(secret)
             self.assertNotIn(leaked, redacted)
+            self.assertIn("[REDACTED", redacted)
 
     def test_tables_strip_terminal_controls_and_agent_only_host_keeps_metrics(self):
         value = snapshot("host\x1b[31m")
@@ -792,6 +1020,34 @@ required = false
         agent_row = rendered.splitlines()[1]
         self.assertIn("badname", agent_row)
         self.assertIn("20%", agent_row)
+
+    def test_table_marks_partial_empty_snapshot_and_bounds_section_errors(self):
+        value = snapshot()
+        value.update(
+            partial=True,
+            sessions=[],
+            agents=[],
+            errors={
+                "lifecycle": "1 write failure\n\x1b[2J" + "x" * 300,
+                **{f"section-{number}": "failed" for number in range(6)},
+            },
+        )
+        rendered = fleet_table({"hosts": [{"name": "local", "ok": True, "snapshot": value}]})
+        self.assertNotIn("no active sessions", rendered)
+        capacity_rendered = fleet_table(
+            {"hosts": [{"name": "local", "ok": True, "snapshot": value}]},
+            capacity_only=True,
+        )
+        populated = {**value, "sessions": [{"session_id": "S", "status": "running"}]}
+        populated_rendered = fleet_table(
+            {"hosts": [{"name": "local", "ok": True, "snapshot": populated}]},
+        )
+        for output in (rendered, capacity_rendered, populated_rendered):
+            self.assertIn("partial snapshot", output)
+            self.assertIn("lifecycle error: 1 write failure", output)
+            self.assertNotIn("\x1b", output)
+            self.assertIn("... 2 more section errors omitted", output)
+            self.assertNotIn("section-5 error", output)
 
     def test_two_isolated_daemons_with_colliding_session_ids_merge_as_distinct_hosts(self):
         with tempfile.TemporaryDirectory() as temp:

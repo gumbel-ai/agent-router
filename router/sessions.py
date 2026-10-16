@@ -179,7 +179,7 @@ class SessionObserver:
         if completing:
             task["completed_at"] = at
         for source, destination in (("task_subject", "subject"), ("teammate_name", "teammate_name"), ("agent_id", "agent_id")):
-            value = text(event.get(source), 500 if source == "task_subject" else 240)
+            value = text(event.get(source), None if source == "task_subject" else 240)
             if value is not None:
                 if source == "task_subject":
                     value = redact_secrets(value, 500)
@@ -210,15 +210,35 @@ class SessionObserver:
         return result
 
     def sessions(self, limit: int = 100) -> list[dict]:
-        cutoff = now_ms() - RECENT_HISTORY_MS
+        return self.fleet_records(limit)[0]
+
+    def fleet_records(self, limit: int = 100) -> tuple[list[dict], int]:
+        """Return the bounded fleet page and active total from one read snapshot."""
+        at = now_ms()
+        cutoff = at - RECENT_HISTORY_MS
         with self.store.connect() as db:
+            db.execute("BEGIN")
             records = [json.loads(row[0]) for row in db.execute(
                 """SELECT data FROM sessions WHERE host_id=? AND
-                    (json_extract(data,'$.status') IN ('running','idle') OR
+                    (json_extract(data,'$.status') IN ('running','idle','unknown') OR
                      json_extract(data,'$.needs_input')=1 OR json_extract(data,'$.last_event_at')>=?)
                     ORDER BY json_extract(data,'$.last_event_at') DESC LIMIT ?""",
                 (self.host_id, cutoff, limit))]
-        return [self.view(record) for record in records]
+            fresh_active = db.execute("""SELECT COUNT(*) FROM sessions WHERE host_id=? AND
+                    (json_extract(data,'$.status')='running' OR json_extract(data,'$.needs_input')=1) AND
+                    json_extract(data,'$.last_event_at')>=?""",
+                                      (self.host_id, at - STALE_AFTER_MS)).fetchone()[0]
+            tool_candidates = [json.loads(row[0]) for row in db.execute(
+                """SELECT data FROM sessions WHERE host_id=? AND
+                    json_extract(data,'$.status')='running' AND
+                    json_extract(data,'$.last_event_at')<? AND
+                    json_extract(data,'$.last_event_at')>=?""",
+                (self.host_id, at - STALE_AFTER_MS, at - MAX_INFLIGHT_AGE_MS))]
+        active_tools = sum(self.view(record, at)["status"] == "running" for record in tool_candidates)
+        return [self.view(record, at) for record in records], fresh_active + active_tools
+
+    def active_count(self) -> int:
+        return self.fleet_records(0)[1]
 
     def tasks(self, limit: int = 100) -> list[dict]:
         cutoff = now_ms() - RECENT_HISTORY_MS

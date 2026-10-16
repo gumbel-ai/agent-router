@@ -14,10 +14,13 @@ STALE_AFTER_MS = 60_000
 TOKEN_KEYS = ("input_tokens", "output_tokens", "cache_read_input_tokens", "cache_creation_input_tokens")
 
 
-def text(value: object, limit: int = 240) -> str | None:
+def text(value: object, limit: int | None = 240) -> str | None:
     if not isinstance(value, str):
         return None
-    return " ".join("".join(character for character in value if character.isprintable() or character.isspace()).split())[:limit] or None
+    cleaned = " ".join("".join(
+        character for character in value if character.isprintable() or character.isspace()
+    ).split())
+    return (cleaned[:limit] if limit is not None else cleaned) or None
 
 
 class NativeObserver:
@@ -93,27 +96,31 @@ class NativeObserver:
                 "cost_note": "Token usage unavailable", "price_date": None, "price_source": None, "price_overrides_used": [],
                 "price_sources": {}, "usage_partial": False, "transcript_pending": False, "transcript_eof": False,
                 "skip_line": False, "transcript": None, "transcript_offset": 0, "messages": {}, "visibility_reason": None}
-            terminal_metadata_only = record["status"] in {"stopped", "failed"} and kind == "result"
-            if record["status"] in {"stopped", "failed"} and kind not in {"start", "result"}:
+            terminal_metadata_only = record["status"] in {"stopped", "failed"} and kind in {"launch", "result"}
+            if record["status"] in {"stopped", "failed"} and kind not in {"start", "launch", "result"}:
                 return self.view(record)
+            metadata_can_replace = at >= (record["last_event_at"] or -1)
             for key in ("parent_agent_id", "task", "agent_type", "requested_model", "cwd", "activity", "summary"):
-                value = text(event.get(key), 800 if key == "summary" else 240)
-                if value is not None:
-                    if key == "task":
-                        value = redact_secrets(value, 240)
+                value = text(event.get(key), None if key == "task" else 800 if key == "summary" else 240)
+                if key == "task" and value is not None:
+                    value = redact_secrets(value, 240)
+                if value is not None and (metadata_can_replace or record.get(key) is None):
                     record[key] = value
             for key in ("transcript", "worktree"):
-                if isinstance(event.get(key), str):
+                if (isinstance(event.get(key), str)
+                        and (metadata_can_replace or record.get(key) is None)):
                     record[key] = event[key]
             file = text(event.get("file_path"), 2000)
             if file and file not in record["files_touched"]:
                 record["files_touched"].append(file)
                 record["files_touched"] = record["files_touched"][-64:]
             model = text(event.get("resolved_model"))
-            if model:
+            if model and (metadata_can_replace or record.get("resolved_model") is None):
                 self.model(record, model, "host_result")
             cost = event.get("cost")
-            if isinstance(cost, (int, float)) and not isinstance(cost, bool) and math.isfinite(cost) and cost >= 0:
+            if (isinstance(cost, (int, float)) and not isinstance(cost, bool)
+                    and math.isfinite(cost) and cost >= 0
+                    and (metadata_can_replace or record.get("cost") is None)):
                 record.update(cost=cost, cost_source="host_reported_estimate", cost_note="Host-reported estimate; not billed spend",
                               price_date=None, price_source=None, price_sources={}, price_overrides_used=[])
             if kind == "stop":
@@ -278,21 +285,21 @@ class NativeObserver:
         return current
 
     @staticmethod
-    def view(record: dict) -> dict:
+    def view(record: dict, at: int | None = None) -> dict:
         result = {key: value for key, value in record.items() if key not in {
             "messages", "transcript_offset", "state_at", "run_started_at", "skip_line", "transcript_eof", "continuity_uncertain"}}
         if isinstance(result.get("task"), str):
             result["task"] = redact_secrets(result["task"], 240)
         if (record.get("usage_partial") or record.get("transcript_pending")) and record["cost_source"] != "host_reported_estimate":
             result.update(cost=None, cost_source="unavailable", cost_note="Transcript usage incomplete or not yet fully read")
-        now = now_ms()
-        age = max(0, now - record["last_event_at"]) if record["last_event_at"] is not None else None
+        at = now_ms() if at is None else at
+        age = max(0, at - record["last_event_at"]) if record["last_event_at"] is not None else None
         result["observation_age_ms"] = age
         result["elapsed_ms"] = None
         if record["status"] in {"running", "idle", "needs_input"} and age is not None and age > STALE_AFTER_MS:
             result.update(status="unknown", visibility_reason="No recent native lifecycle evidence; last observed nonterminal state")
         elif record["status"] == "running" and record["run_started_at"] is not None:
-            result["elapsed_ms"] = (record["duration_ms"] or 0) + max(0, now - record["run_started_at"])
+            result["elapsed_ms"] = (record["duration_ms"] or 0) + max(0, at - record["run_started_at"])
         elif record["status"] == "stopped":
             result["elapsed_ms"] = record["duration_ms"]
         return result
@@ -309,14 +316,29 @@ class NativeObserver:
 
     def snapshot(self, limit: int = 100) -> list[dict]:
         """Bounded status view without transcript I/O on the snapshot hot path."""
-        cutoff = now_ms() - 300_000
+        return self.fleet_records(limit)[0]
+
+    def fleet_records(self, limit: int = 100) -> tuple[list[dict], int]:
+        """Return the bounded fleet page and active total from one read snapshot."""
+        at = now_ms()
+        cutoff = at - 300_000
         with self.store.connect() as db:
+            db.execute("BEGIN")
             records = [json.loads(row[0]) for row in db.execute("""SELECT data FROM observations
                 WHERE json_extract(data,'$.host_id')=? AND
-                    (json_extract(data,'$.status') IN ('running','idle','needs_input') OR
+                    (json_extract(data,'$.status') IN ('running','idle','needs_input','unknown') OR
                      json_extract(data,'$.last_event_at')>=?)
                 ORDER BY CASE json_extract(data,'$.status')
                     WHEN 'running' THEN 0 WHEN 'needs_input' THEN 1 WHEN 'unknown' THEN 2 ELSE 3 END,
                     json_extract(data,'$.last_event_at') DESC LIMIT ?""", (self.host_id, cutoff, limit))]
-        return [{key: value for key, value in self.view(record).items() if key not in {
+            active = db.execute("""SELECT COUNT(*) FROM observations
+                WHERE json_extract(data,'$.host_id')=?
+                  AND json_extract(data,'$.status') IN ('running','needs_input')
+                  AND json_extract(data,'$.last_event_at')>=?""",
+                                (self.host_id, at - STALE_AFTER_MS)).fetchone()[0]
+        visible = [{key: value for key, value in self.view(record, at).items() if key not in {
             "files_touched", "summary", "transcript", "price_sources", "messages"}} for record in records]
+        return visible, active
+
+    def active_count(self) -> int:
+        return self.fleet_records(0)[1]

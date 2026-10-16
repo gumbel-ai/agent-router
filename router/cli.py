@@ -13,6 +13,9 @@ from router.client import request
 from router.config import load_settings, socket_path, state_dir
 from router.dispatch import MUTATIONS
 
+MAX_DISPLAYED_SNAPSHOT_ERRORS = 5
+MAX_DISPLAYED_SNAPSHOT_ERROR_LENGTH = 160
+
 
 def table(rows: list[dict]) -> str:
     from router.native import text
@@ -70,6 +73,25 @@ def _cell(value: object, limit: int | None = None) -> str:
     return cleaned[:limit] if limit is not None else cleaned
 
 
+def _partial_snapshot_lines(snapshot: dict) -> list[str]:
+    if snapshot.get("partial") is not True:
+        return []
+    lines = ["  warning: partial snapshot; some data may be unavailable"]
+    errors = snapshot.get("errors")
+    if not isinstance(errors, dict):
+        return lines
+    displayed = list(errors.items())[:MAX_DISPLAYED_SNAPSHOT_ERRORS]
+    for section, error in displayed:
+        lines.append(
+            f"  {_cell(section, 24)} error: "
+            f"{_cell(error, MAX_DISPLAYED_SNAPSHOT_ERROR_LENGTH)}"
+        )
+    omitted = len(errors) - len(displayed)
+    if omitted:
+        lines.append(f"  ... {omitted} more section errors omitted")
+    return lines
+
+
 def fleet_table(result: dict, capacity_only: bool = False) -> str:
     lines = ["HOST       CAPACITY   SESSION              AGENT                STATE        ACTIVITY                 CPU    LOAD   MEM FREE DISK FREE"]
     for record in result["hosts"]:
@@ -85,14 +107,18 @@ def fleet_table(result: dict, capacity_only: bool = False) -> str:
         load = f"{capacity['load_1m']:.1f}" if isinstance(capacity.get("load_1m"), (int, float)) else "—"
         memory = _size(capacity.get("memory_available_bytes"))
         disk = _size(capacity.get("disk_available_bytes"))
+        partial_lines = _partial_snapshot_lines(snapshot)
         if capacity_only:
             reason = _cell("; ".join(capacity.get("capacity_reasons", [])) or "capacity thresholds satisfied", 24)
             lines.append(f"{name:<10} {state:<10} {'—':<20} {'—':<20} {'—':<12} {reason:<24} {cpu:<6} {load:<6} {memory:<8} {disk}")
+            lines.extend(partial_lines)
             continue
         sessions = snapshot.get("sessions", [])
         agents = snapshot.get("agents", [])
         if not sessions and not agents:
-            lines.append(f"{name:<10} {state:<10} {'—':<20} {'—':<20} {'—':<12} {'no active sessions':<24} {cpu:<6} {load:<6} {memory:<8} {disk}")
+            activity = "partial snapshot" if partial_lines else "no active sessions"
+            lines.append(f"{name:<10} {state:<10} {'—':<20} {'—':<20} {'—':<12} {activity:<24} {cpu:<6} {load:<6} {memory:<8} {disk}")
+            lines.extend(partial_lines)
             continue
         for index, session in enumerate(sessions):
             display_state = _cell("needs_input" if session.get("needs_input") else session.get("status", "unknown"), 12)
@@ -110,6 +136,7 @@ def fleet_table(result: dict, capacity_only: bool = False) -> str:
                          f"{_cell(agent.get('activity') or '—', 24):<24} "
                          f"{cpu if first else '—':<6} {load if first else '—':<6} "
                          f"{memory if first else '—':<8} {disk if first else '—'}")
+        lines.extend(partial_lines)
     return "\n".join(lines)
 
 

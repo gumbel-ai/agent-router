@@ -85,6 +85,7 @@ class NativeTests(unittest.TestCase):
         record = self.event("start", at=1000)
         with patch("router.native.now_ms", return_value=70000):
             stale = self.control.handle("status", {"task_id": record["task_id"]})
+            self.assertEqual(self.control.native.active_count(), 0)
         self.assertEqual(stale["status"], "unknown")
         self.assertEqual(stale["last_observed_status"], "running")
         self.assertIsNone(stale["duration_ms"])
@@ -159,6 +160,50 @@ class NativeTests(unittest.TestCase):
         resumed = self.event("stop", at=4000)
         self.assertTrue(resumed["runtime_partial"])
         self.assertEqual(resumed["duration_ms"], 1500)
+
+    def test_late_launch_enriches_terminal_record_without_reopening_it(self):
+        self.event("start", at=1000)
+        stopped = self.event("stop", at=2000)
+
+        launched = self.event(
+            "launch",
+            at=500,
+            parent_agent_id="main",
+            task="Fix parser",
+            agent_type="worker",
+            requested_model="opus",
+            resolved_model="claude-opus",
+            cost=.25,
+        )
+
+        self.assertEqual(launched["status"], "stopped")
+        self.assertEqual(launched["finished_at"], stopped["finished_at"])
+        self.assertEqual(launched["duration_ms"], stopped["duration_ms"])
+        self.assertEqual(launched["last_observed_status"], "stopped")
+        self.assertEqual(
+            (launched["parent_agent_id"], launched["task"], launched["agent_type"]),
+            ("main", "Fix parser", "worker"),
+        )
+        self.assertEqual(
+            (launched["requested_model"], launched["resolved_model"], launched["cost"]),
+            ("opus", "claude-opus", .25),
+        )
+
+        final = self.event(
+            "result", at=2200, task="Final task", resolved_model="claude-final",
+            cost=.5, summary="Final summary", agent_type="reviewer", cwd="/final",
+        )
+        delayed = self.event(
+            "start", at=500, task="Stale task", resolved_model="claude-old",
+            cost=.01, summary="Stale summary", agent_type="stale", cwd="/stale",
+        )
+        self.assertEqual(delayed["status"], "stopped")
+        self.assertEqual(
+            (delayed["task"], delayed["resolved_model"], delayed["cost"], delayed["summary"],
+             delayed["agent_type"], delayed["cwd"]),
+            (final["task"], final["resolved_model"], final["cost"], final["summary"],
+             final["agent_type"], final["cwd"]),
+        )
 
 
 if __name__ == "__main__":

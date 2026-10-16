@@ -6,12 +6,21 @@ import time
 from pathlib import Path
 
 from router.client import request
+from router.redaction import redact_secrets
 
 
-def text(value: object, limit: int = 240) -> str | None:
+def text(value: object, limit: int | None = 240) -> str | None:
     if not isinstance(value, str):
         return None
-    return " ".join("".join(character for character in value if character.isprintable() or character.isspace()).split())[:limit] or None
+    normalized = " ".join("".join(
+        character for character in value if character.isprintable() or character.isspace()
+    ).split())
+    return (normalized if limit is None else normalized[:limit]) or None
+
+
+def redacted_text(value: object, limit: int) -> str | None:
+    normalized = text(value, None)
+    return redact_secrets(normalized, limit) if normalized is not None else None
 
 
 def observe(event: dict) -> dict:
@@ -38,7 +47,7 @@ def observe(event: dict) -> dict:
                            "start_source": event.get("source"),
                            "notification_type": event.get("notification_type"),
                            "background_tasks": event.get("background_tasks"), "task_id": event.get("task_id"),
-                           "task_subject": text(event.get("task_subject"), 500),
+                           "task_subject": redacted_text(event.get("task_subject"), 500),
                            "teammate_name": event.get("teammate_name"), "agent_id": event.get("agent_id")}
     payload = {"source": "claude", "session_id": event.get("session_id"), "observed_at": at,
                "agent_id": event.get("agent_id"), "agent_type": event.get("agent_type"), "cwd": event.get("cwd")}
@@ -53,7 +62,8 @@ def observe(event: dict) -> dict:
     elif name == "PostToolUse" and tool in {"Agent", "Task"} and isinstance(response, dict) and response.get("agentId"):
         asynchronous = response.get("isAsync") is True or response.get("status") == "async_launched"
         payload.update(kind="launch" if asynchronous else "result", agent_id=response["agentId"],
-                       parent_agent_id=event.get("agent_id") or "main", task=text(inputs.get("description")),
+                       parent_agent_id=event.get("agent_id") or "main",
+                       task=redacted_text(inputs.get("description"), 240),
                        agent_type=inputs.get("subagent_type"), requested_model=inputs.get("model"),
                        resolved_model=response.get("resolvedModel"))
         if isinstance(response.get("costUSD"), (int, float)):
