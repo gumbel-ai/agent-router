@@ -10,6 +10,9 @@ review comments one at a time. Independent reviews must cover the full current d
 later fixes invalidate overlapping earlier verdicts. Complete the final verification
 and review-loop gates before committing or pushing.
 
+Keep PRs small and single-subsystem, and run the internal adversarial reviews before the
+first push ([Preventing Review Churn](CODE_REVIEW_PROCESS.md#preventing-review-churn)).
+
 Before requesting any review, check every applicable item in
 [Known Defect Patterns](CODE_REVIEW_PROCESS.md#known-defect-patterns). Re-review your own
 fixes with the same rigor as the original change (section 9 of the process), and keep

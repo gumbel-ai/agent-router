@@ -28,6 +28,33 @@ by fixes from the previous round. The recurring defect classes are listed in
 [Known defect patterns](#known-defect-patterns); check every applicable item before
 asking for external review.
 
+## Preventing Review Churn
+
+PR #4 drew more than 25 external review threads across five rounds. Three of those
+findings were regressions introduced by earlier fixes. Most were variants of a bug
+already fixed once. These rules address the causes, not the symptoms.
+
+1. **Keep changes reviewable.** Split work into PRs of a few hundred production lines,
+   one subsystem each, and merge each before starting the next. A large multi-subsystem
+   diff guarantees that every review pass samples a different edge case.
+2. **Remove whole defect classes by design.** Where an approach has unbounded corner
+   cases, change the structure rather than patching instances:
+   - forward only an allowlist of known-safe fields instead of scrubbing free text for
+     secrets;
+   - express lifecycle rules as one explicit transition table (state and event to next
+     state) instead of scattered watermarks and flags;
+   - compute a total or a classification in one place, and derive every alert from it.
+3. **Review internally before the first push.** Run the independent, adversarial
+   reviews in section 6 on the full diff before opening or updating the PR. External
+   review (Copilot) is the final check, not the discovery mechanism.
+4. **Test families, not examples.** When inputs vary along a dimension (nesting depth,
+   event order, token prefix, timing), test across that dimension. Prefer a
+   generated or exhaustive table over a hand-picked case.
+5. **Set a stopping rule per PR.** Fix P1 and P2 findings in the PR. Record narrow P3
+   findings as follow-up issues with a reproduction, unless the fix is trivial and
+   local. A reviewer can always find a narrower case; looping on them indefinitely
+   adds risk through more fixes.
+
 ## Required Review Sequence
 
 ### 1. Define verifiable completion criteria
@@ -70,7 +97,7 @@ Review every applicable dimension, not only the happy path:
 | Bounds and truncation | Is sensitive data transformed safely before truncation? Are totals independent of display limits? |
 | Concurrency | Can related reads observe different database snapshots? Are writes idempotent and monotonic? |
 | Partial failure | Does one failed host or section remain isolated? Is degraded output visibly marked? |
-| Security | Can secrets survive quoting, multiline input, alternate token formats, logs, errors, or preprocessing? |
+| Security | Does any text leave its host or reach a terminal without passing the output-safety boundary? Is that intentional and documented? |
 | Output safety | Are terminal controls, oversized values, and hostile remote payloads bounded and sanitized? |
 
 If a dimension does not apply, note why rather than silently skipping it.
@@ -128,12 +155,16 @@ tests are not better tests: every test costs suite time and maintenance, and may
 the current implementation.
 
 - Before adding a test, look for an existing table-driven or boundary test for the same
-  contract, and add a row or a case to it. Redaction formats, threshold boundaries, and
+  contract, and add a row or a case to it. Escape-sequence formats, threshold boundaries, and
   event orderings belong in tables, not separate methods.
 - Write one regression per violated invariant, not one per comment. Sibling variants of
   the same invariant share one parameterized test.
 - A test must fail without the fix. If it cannot, it adds no protection; delete it or
-  say why it remains.
+  say why it remains. Prove it by reverting only the fix's lines; `git stash` of a whole
+  file can pull in unrelated changes and fail for the wrong reason.
+- When one test covers several fixes (subtests, multiple observers), revert each fix on
+  its own and confirm its subtest fails. Shared fixtures can mask a missing fix: one
+  part's uncertainty made capacity unknown for the other part's case too.
 - Do not test constants, trivial plumbing, logging text, or private helpers already
   covered through the production entry point.
 - Assert observable behavior (persisted state, API output, process outcome), not
@@ -161,7 +192,12 @@ A flaky test is a defect in the change that introduced it, not background noise.
 - Keep synthetic timestamps in the past. A timestamp later than the current clock is
   treated as clock rollback.
 - Give subprocess fixtures enough time to start before a timeout fires, then bound the
-  total duration separately.
+  total duration separately. Interpreter startup alone can exceed a second while the
+  suite runs other processes.
+- Use generous timeouts on success paths (for example 15 s). They return as soon as
+  the work finishes, so a large limit costs nothing when the machine is fast and
+  prevents failures when it is loaded. Keep short timeouts only where the timeout
+  itself is under test.
 - Run new or timing-sensitive tests repeatedly (at least 10 times) and run the full suite
   at least twice before pushing. Check whether a failure also occurs on the base commit.
 
@@ -236,21 +272,25 @@ Fixes are new code and receive the same review as the original change.
 These classes recurred across review cycles in this repository. Check each applicable
 item before requesting review.
 
-**Redaction and output safety**
+**Text handling and output safety**
 
-- Redact the complete value, then truncate. Never truncate first.
-- Strip whole terminal escape sequences before filtering characters; removing only ESC
-  leaves fragments such as `[0m` that split credential names.
-- Credential keys appear bare, quoted, single-quoted, escaped (`\"password\"`), doubly
-  escaped, and with prefixes or suffixes (`SECRET_KEY`, `secret_*`). Header names such
-  as `Authorization` and `Cookie` are credential keys too.
-- Cover a vendor's whole token family, not one prefix (for example
-  `ghp_`/`gho_`/`ghu_`/`ghs_`/`ghr_`/`github_pat_`).
-- Generalize over repetition, not the observed instance. Escaping nests to any depth
-  (`json.dumps` applied N times), so a fix for one level is incomplete. Test depths 1
-  through 4, inner quotes, trailing backslashes, and values truncated mid-secret.
-- A value that fails a safety check should degrade only that value. For example, a
-  token-like path segment must not reject the whole lifecycle event.
+- Do not pattern-match free text to find or remove secrets. Scrubbing cannot be complete
+  (prose, encodings, nesting, unknown token formats), it mangles useful text, and each
+  extension added new defects, including a regex denial of service. Pass text through
+  as written, keep the stores it lands in private, and let the producing host decide
+  whether text leaves the machine (`AGENT_ROUTER_FLEET_SHARE_TEXT`).
+- Make text safe to store and display without changing its words: remove whole terminal
+  escape sequences with a character scanner (removing only ESC leaves `[0m` fragments),
+  drop control and format characters, turn line breaks into spaces, then bound length.
+- Cover every ECMA-48 escape form, not just CSI and OSC: nF (`ESC ( B`, emitted by
+  `tput sgr0`), Fp/Fe/Fs (`ESC 7`, `ESC =`), and C0 controls embedded in a CSI body.
+  An unterminated control string must end at the next ESC so it cannot swallow later
+  text. Treat 8-bit C1 characters as single controls; a stray `U+0090` must never
+  consume the rest of a field.
+- Validate identifiers structurally (no controls, no surrounding whitespace, bounded
+  length). Do not reject them for looking like secrets.
+- A value that fails a safety check should degrade only that value. For example, an
+  unusable transcript path must not reject the whole lifecycle event.
 
 **Ordering and terminal state**
 
@@ -258,6 +298,9 @@ item before requesting review.
   same-timestamp, result-watermark, and session-end cases.
 - Watermarks must advance on metadata-only paths as well as state-changing paths.
 - Same-timestamp ties must not reopen a terminal or ended state.
+- When a history map is bounded (for example the last 128 events), ordering checks
+  must use every retained timestamp for that entity, not only the bounded map.
+  Otherwise eviction lets a delayed event clear state that is still live.
 
 **Clocks and freshness**
 
@@ -267,8 +310,18 @@ item before requesting review.
   and from receipt when expiring a reservation.
 - Treat a timestamp later than the current clock as uncertainty in every observer, and
   report the exact total as unavailable.
+- Restart uncertainty must reach every derived classification, not only the status
+  label. A record reclassified `unknown` after a restart must keep capacity `unknown`
+  until evidence arrives or the window in which it would have counted as active
+  expires. A warning shown next to `available` is a contradiction, not a caveat.
 - Use one threshold for a classification and for every alert or `partial` flag derived
   from it.
+
+**Ownership of nested data**
+
+- A viewer must not write viewer-derived values into a producer's nested record. Put
+  them on the viewer's wrapper. Mixing clocks or sources inside one record breaks
+  that record's own invariants (for example, alerts later than its `generated_at`).
 
 **Counting and truncation**
 
@@ -299,6 +352,9 @@ item before requesting review.
   `vm_size_t` is pointer-sized (`c_size_t`), not `c_uint32`. A mismatch writes past the
   buffer silently. Verify FFI calls against the operating system's own tool output
   (such as `sysctl`).
+- Verify the meaning of each field, not only its width. macOS `free_count` already
+  includes speculative pages (`vm_stat` subtracts them), so adding `speculative_count`
+  double-counted available memory. Reproduce the OS tool's number before deriving one.
 
 **Concurrency and processes**
 
@@ -309,13 +365,10 @@ item before requesting review.
 
 **Parsing and cost**
 
-- Bound every regex quantifier that runs on untrusted text, and keep a match from
-  starting inside a run it would immediately re-scan. An unbounded `\\*` before an
-  optional quote made redaction quadratic (13 s for 20k backslashes) on hook and peer
-  input. Time each changed pattern on 1 MB of its worst-case character.
-- When you narrow a pattern for speed, rerun its previous positive cases. A lookbehind
-  that blocked starts after any backslash silently stopped redacting
-  `C:\password=...`.
+- Avoid regular expressions on untrusted free text. Where one is unavoidable, bound
+  every quantifier and time it on 1 MB of its worst-case character; an unbounded
+  `\\*` before an optional quote once made matching quadratic (13 s for 20k
+  backslashes).
 - Parsers of untrusted JSON must catch `RecursionError` alongside `ValueError`.
 - Verification on hot paths (for example, per-status transcript refresh) must
   short-circuit when inputs are unchanged. Measure the cost on large inputs.
