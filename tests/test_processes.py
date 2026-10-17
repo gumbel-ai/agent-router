@@ -3,6 +3,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -59,6 +60,50 @@ class SamplerTests(unittest.TestCase):
             self.assertEqual(sessions.records("host", roots, 10)[0]["cpu_pct"], 50.0)
 
 
+    def test_processes_sharing_a_start_tick_keep_their_own_cpu_history(self):
+        samples = iter([{10: process(10, 1, "same", 0), 20: process(20, 10, "same", 9_000_000_000)},
+                        {10: process(10, 1, "same", 500_000_000), 20: process(20, 10, "same", 9_000_000_000)}])
+        sessions = SessionProcesses(sampler=lambda: next(samples))
+        roots = [{"source": "claude", "session_id": "s", "pid": 10, "identity": "same"}]
+        with patch("router.processes.time.monotonic", side_effect=[100.0, 101.0]):
+            sessions.records("host", roots, 10)
+            cpu = {record["pid"]: record["cpu_pct"] for record in sessions.records("host", roots, 10)}
+        self.assertEqual(cpu, {10: 50.0, 20: 0.0})
+
+    def test_back_to_back_snapshots_measure_over_a_full_window(self):
+        samples = iter([{10: process(10, 1, cpu_ns=0)}, {10: process(10, 1, cpu_ns=1_000_000_000)},
+                        {10: process(10, 1, cpu_ns=1_010_000_000)}])
+        sessions = SessionProcesses(sampler=lambda: next(samples))
+        roots = [{"source": "claude", "session_id": "s", "pid": 10, "identity": "id-10"},
+                 {"source": "codex", "session_id": "older", "pid": 10, "identity": "id-10"}]
+        with patch("router.processes.time.monotonic", side_effect=[100.0, 102.0, 102.03]):
+            sessions.records("host", roots, 10)
+            self.assertEqual(sessions.records("host", roots, 10)[0]["cpu_pct"], 50.0)
+            # 30 ms later, another watcher still measures against the baseline 2.03 s back.
+            [record] = sessions.records("host", roots, 10)
+        self.assertEqual((record["cpu_pct"], record["session_id"]), (49.8, "s"))
+
+    def test_concurrent_snapshots_sample_one_at_a_time(self):
+        inside, peak, entered = [0], [0], threading.Event()
+
+        def sampler():
+            inside[0] += 1
+            peak[0] = max(peak[0], inside[0])
+            entered.set()
+            time.sleep(0.2)  # Long enough for an unserialized second caller to enter.
+            inside[0] -= 1
+            return {10: process(10, 1)}
+
+        sessions = SessionProcesses(sampler=sampler)
+        roots = [{"source": "claude", "session_id": "s", "pid": 10, "identity": "id-10"}]
+        first = threading.Thread(target=sessions.records, args=("host", roots, 10))
+        first.start()
+        entered.wait(5)
+        sessions.records("host", roots, 10)
+        first.join(5)
+        self.assertEqual(peak[0], 1)
+
+
 class SessionProcessTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="ar-processes-")
@@ -84,6 +129,16 @@ class SessionProcessTests(unittest.TestCase):
         self.assertEqual(self.control.sessions.process_roots(), [])
         view = self.control.handle("snapshot", {})["sessions"][0]
         self.assertFalse({"process_chain", "process_root"} & view.keys())
+
+    def test_a_resumed_session_learns_its_new_process_not_the_shared_terminal(self):
+        terminal = [50, "darwin:1:50"]
+        self.observe([[9001, "darwin:3:1"], [60, "darwin:1:60"], terminal], kind="session_start")
+        self.observe([[9002, "darwin:3:2"], [60, "darwin:1:60"], terminal])
+        self.observe([[9003, "darwin:3:3"], [60, "darwin:1:60"], terminal], kind="session_end")
+        self.observe([[9004, "darwin:3:4"], [70, "darwin:1:70"], terminal], kind="session_start")
+        self.assertEqual(self.control.sessions.process_roots(), [])  # Not the terminal.
+        self.observe([[9005, "darwin:3:5"], [70, "darwin:1:70"], terminal])
+        self.assertEqual([root["pid"] for root in self.control.sessions.process_roots()], [70])
 
     def test_inferred_processes_reach_the_fleet_snapshot(self):
         chain = ancestry()

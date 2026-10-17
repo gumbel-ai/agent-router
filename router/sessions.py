@@ -218,12 +218,19 @@ class SessionObserver:
                       waiter_history_partial=SessionObserver._waiter_history_partial(record) and not resolved)
 
     @staticmethod
-    def _observe_process_chain(record: dict, event: dict) -> None:
+    def _observe_process_chain(record: dict, event: dict, kind: str) -> None:
         """Learn the session's own process: the nearest ancestor shared by successive hook calls.
 
         Hooks may run through a fresh shell per call, so a single chain cannot tell that shell
         from the agent process; the process common to two chains is the one that persists.
         """
+        if kind in {"session_start", "session_end"}:
+            # A resumed session runs in a new process, possibly under the same terminal;
+            # learn its process afresh rather than matching the old lifetime's ancestors.
+            record.pop("process_chain", None)
+            record.pop("process_root", None)
+            if kind == "session_end":
+                return
         chain = event.get("process_ancestors")
         if not (isinstance(chain, list) and 0 < len(chain) <= MAX_PROCESS_ANCESTORS and all(
                 isinstance(entry, list) and len(entry) == 2 and is_wire_integer(entry[0]) and entry[0] > 1
@@ -292,7 +299,7 @@ class SessionObserver:
                 return self.view(record, max(now_ms(), at))
             record["last_event_at"] = at
             record["last_event"] = kind
-            self._observe_process_chain(record, event)
+            self._observe_process_chain(record, event, kind)
             for key, limit in (("cwd", 2000), ("model", 240)):
                 value = safe_text(event.get(key), limit)
                 if value is not None:

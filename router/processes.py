@@ -4,9 +4,11 @@ Only kernel process metadata is read: parent, group, start time, executable name
 resident memory, and CPU time. Command lines and environments are never read.
 """
 
+import collections
 import ctypes
 import os
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -14,6 +16,8 @@ from pathlib import Path
 MAX_ANCESTORS = 6
 # Bound the parent walk when attributing a process to a session root.
 MAX_TREE_DEPTH = 64
+# CPU percent needs a window long enough for tick-granular counters to mean something.
+MIN_CPU_WINDOW_SECONDS = 1.0
 
 
 def _linux_boot_id() -> str:
@@ -21,7 +25,7 @@ def _linux_boot_id() -> str:
 
 
 def _linux_stat(pid: int) -> dict:
-    raw = Path(f"/proc/{pid}/stat").read_text()
+    raw = Path(f"/proc/{pid}/stat").read_text(errors="replace")
     # The executable name sits in parentheses and may itself contain spaces or ')'.
     opening, closing = raw.find("("), raw.rfind(")")
     if opening <= 0 or closing <= opening:
@@ -94,8 +98,8 @@ def ancestry() -> list[list]:
     while pid > 1 and len(chain) < MAX_ANCESTORS:
         try:
             parent, identity = parent_and_identity(pid)
-        except PermissionError:
-            break  # Ancestors owned by other users (login, sandbox) are outside the session.
+        except (OSError, ValueError, IndexError):
+            break  # Unreadable ancestors (other users, hidepid, exited) are outside the session.
         chain.append([pid, identity])
         pid = parent
     return chain
@@ -108,8 +112,10 @@ def sample() -> dict[int, dict]:
         boot_id = _linux_boot_id()
         ticks = os.sysconf("SC_CLK_TCK")
         page = os.sysconf("SC_PAGE_SIZE")
-        boot_seconds = next(int(line.split()[1]) for line in Path("/proc/stat").read_text().splitlines()
-                            if line.split()[:1] == ["btime"])
+        boot_seconds = next((int(line.split()[1]) for line in Path("/proc/stat").read_text().splitlines()
+                             if line.split()[:1] == ["btime"]), None)
+        if boot_seconds is None:
+            raise OSError("Linux /proc/stat has no btime")
         for entry in Path("/proc").iterdir():
             if not entry.name.isdigit():
                 continue
@@ -163,17 +169,28 @@ class SessionProcesses:
 
     def __init__(self, sampler=sample):
         self.sampler = sampler
-        self._previous: tuple[float, dict[str, int]] | None = None
+        self._baselines: collections.deque[tuple[float, dict[tuple[int, str], int]]] = collections.deque(maxlen=3)
+        # Snapshots can run concurrently; a sample and its CPU baseline must stay paired.
+        self._lock = threading.Lock()
 
     def records(self, host_id: str, roots: list[dict], limit: int) -> list[dict]:
         """roots: [{"source", "session_id", "pid", "identity"}]; at most `limit` records, roots first."""
-        processes = self.sampler()
-        now = time.monotonic()
-        cpu = {process["identity"]: process["cpu_ns"] for process in processes.values()}
-        previous, self._previous = self._previous, (now, cpu)
+        with self._lock:
+            processes = self.sampler()
+            now = time.monotonic()
+            # PID and start time together: processes can share a start tick.
+            cpu = {(process["pid"], process["identity"]): process["cpu_ns"] for process in processes.values()}
+            # Compare with the newest baseline at least a full window old, so watchers polling
+            # moments apart still measure over a meaningful interval.
+            previous = next((entry for entry in reversed(self._baselines)
+                             if now - entry[0] >= MIN_CPU_WINDOW_SECONDS), None)
+            if not self._baselines or now - self._baselines[-1][0] >= MIN_CPU_WINDOW_SECONDS:
+                self._baselines.append((now, cpu))
         # A root counts only while its PID still belongs to the same process.
-        live_roots = {root["pid"]: root for root in roots
-                      if processes.get(root["pid"], {}).get("identity") == root["identity"]}
+        live_roots = {}
+        for root in roots:  # Most recently active first: it keeps a process two sessions share.
+            if processes.get(root["pid"], {}).get("identity") == root["identity"]:
+                live_roots.setdefault(root["pid"], root)
         attributed = []
         for process in processes.values():
             pid, depth = process["pid"], 0
@@ -185,9 +202,12 @@ class SessionProcesses:
         records = []
         for _, process, root in attributed[:limit]:
             cpu_pct = None
-            if previous is not None and now > previous[0] and process["identity"] in previous[1]:
-                used = process["cpu_ns"] - previous[1][process["identity"]]
+            key = (process["pid"], process["identity"])
+            if previous is not None and key in previous[1]:
+                used = process["cpu_ns"] - previous[1][key]
                 cpu_pct = round(max(0.0, used / ((now - previous[0]) * 1e9) * 100), 1)
+                if cpu_pct > 100 * (os.cpu_count() or 1):
+                    cpu_pct = None  # Counters read mid-sweep can disagree; report unknown, not nonsense.
             records.append({
                 "host_id": host_id, "pid": process["pid"], "pgid": process["pgid"], "status": "running",
                 "label": process["executable"], "started_at": process["started_at"],
