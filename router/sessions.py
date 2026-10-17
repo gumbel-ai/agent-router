@@ -12,6 +12,7 @@ from router.native import (
     safe_text,
     text,
 )
+from router.processes import MAX_ANCESTORS as MAX_PROCESS_ANCESTORS
 from router.sanitize import sanitize_structure
 from router.validation import MAX_WIRE_INTEGER, is_wire_integer
 
@@ -216,6 +217,34 @@ class SessionObserver:
                       waiter_cleared_at=cleared,
                       waiter_history_partial=SessionObserver._waiter_history_partial(record) and not resolved)
 
+    @staticmethod
+    def _observe_process_chain(record: dict, event: dict) -> None:
+        """Learn the session's own process: the nearest ancestor shared by successive hook calls.
+
+        Hooks may run through a fresh shell per call, so a single chain cannot tell that shell
+        from the agent process; the process common to two chains is the one that persists.
+        """
+        chain = event.get("process_ancestors")
+        if not (isinstance(chain, list) and 0 < len(chain) <= MAX_PROCESS_ANCESTORS and all(
+                isinstance(entry, list) and len(entry) == 2 and is_wire_integer(entry[0]) and entry[0] > 1
+                and isinstance(entry[1], str) and 0 < len(entry[1]) <= 120 for entry in chain)):
+            return
+        common = [entry for entry in chain if entry in (record.get("process_chain") or [])]
+        if common:
+            record["process_root"] = common[0]
+        record["process_chain"] = chain
+
+    def process_roots(self, limit: int = 1000) -> list[dict]:
+        """Identified processes of sessions that have not ended, for process attribution."""
+        with self.store.connect() as db:
+            rows = db.execute("""SELECT source, session_id, json_extract(data,'$.process_root') FROM sessions
+                    WHERE host_id=? AND json_extract(data,'$.status')!='stopped'
+                      AND json_extract(data,'$.process_root') IS NOT NULL
+                    ORDER BY json_extract(data,'$.last_event_at') DESC LIMIT ?""",
+                              (self.host_id, limit)).fetchall()
+        return [{"source": source, "session_id": session_id, "pid": root[0], "identity": root[1]}
+                for source, session_id, encoded in rows for root in [json.loads(encoded)]]
+
     def observe(self, event: dict, timeout: float = 10) -> dict:
         source = event.get("source")
         session_id = event.get("session_id")
@@ -263,6 +292,7 @@ class SessionObserver:
                 return self.view(record, max(now_ms(), at))
             record["last_event_at"] = at
             record["last_event"] = kind
+            self._observe_process_chain(record, event)
             for key, limit in (("cwd", 2000), ("model", 240)):
                 value = safe_text(event.get(key), limit)
                 if value is not None:
@@ -501,6 +531,7 @@ class SessionObserver:
             "tool_reset_at", "tool_active_until", "tool_overflow_until", "tool_overflow_active",
             "active_tool_times", "tool_correlation_partial", "tool_correlation_partial_until",
             "tool_terminal_floor", "tool_history_partial", "restart_uncertain_until", "root_started_at",
+            "process_chain", "process_root",
         }}
         result = sanitize_structure(result)
         clock_rollback = record["last_event_at"] > at

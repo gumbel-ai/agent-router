@@ -208,7 +208,10 @@ def compose(controller, thresholds: CapacityThresholds | None = None, history_li
         active_managed_processes=0,
     ), {})
     snapshot["managed_processes"] = []
-    snapshot["inferred_processes"] = []
+    if hasattr(controller, "inferred_process_records"):
+        _collection(snapshot, "inferred_processes", controller.inferred_process_records, history_limit)
+    else:
+        snapshot["inferred_processes"] = []
     if hasattr(controller, "lifecycle_health"):
         lifecycle_error = controller.lifecycle_health()
         if lifecycle_error:

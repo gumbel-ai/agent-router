@@ -259,12 +259,12 @@ def _project_record(record: dict, allowed: frozenset[str], required: tuple[str, 
         "status", "cwd", "model", "coordinator_role", "visibility_reason", "activity",
         "last_event", "task", "agent_type", "requested_model", "resolved_model", "model_source",
         "executor", "owner", "control_mode", "subject", "teammate_name", "failure_reason", "label",
-        "command", "worktree", "last_observed_status", "managed_id",
+        "command", "worktree", "last_observed_status", "managed_id", "attribution",
     }
     positive_integer_fields = {"pid", "pgid"}
     nonnegative_integer_fields = {
         "started_at", "last_event_at", "finished_at", "duration_ms", "observation_age_ms",
-        "elapsed_ms", "inflight_tool_count", "created_at", "completed_at", "attempts",
+        "elapsed_ms", "inflight_tool_count", "created_at", "completed_at", "attempts", "rss_bytes",
     }
     boolean_fields = {"needs_input", "runtime_partial",
                       "tool_visibility_partial", "cleanup_pending", "shutdown_unconfirmed",
@@ -290,6 +290,10 @@ def _project_record(record: dict, allowed: frozenset[str], required: tuple[str, 
         elif key in nonnegative_integer_fields:
             if value is not None and not is_wire_integer(value):
                 raise ValueError(f"Host snapshot has invalid {collection} {key}")
+            projected[key] = value
+        elif key == "cpu_pct":
+            if value is not None:
+                _nonnegative_number(value, f"{collection} {key}", 100_000)  # Percent of one CPU.
             projected[key] = value
         elif key == "exit_code":
             if value is not None and (not isinstance(value, int) or isinstance(value, bool)
@@ -468,7 +472,8 @@ def _validate_snapshot(payload: bytes) -> dict:
         "managed_processes": frozenset({"host_id", "managed_id", "status", "label", "pid", "pgid",
                                         "started_at", "finished_at", "exit_code", "visibility_reason"}),
         "inferred_processes": frozenset({"host_id", "pid", "pgid", "status", "label", "started_at",
-                                         "visibility_reason"}),
+                                         "visibility_reason", "attribution", "source", "session_id",
+                                         "cpu_pct", "rss_bytes"}),
     }
     projected_collections = {}
     rejected_router_tasks = 0
