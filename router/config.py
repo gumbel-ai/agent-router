@@ -20,6 +20,10 @@ class Settings(BaseSettings):
     models: dict[str, str] = Field(default_factory=dict, validation_alias="AGENT_ROUTER_MODELS")
     repositories: dict[str, dict[str, str]] = Field(default_factory=dict, validation_alias="AGENT_ROUTER_REPOSITORIES")
     model_prices: dict[str, list[PriceTier]] = Field(default_factory=dict, validation_alias="AGENT_ROUTER_MODEL_PRICES")
+    process_sample_interval_seconds: float = Field(
+        default=5, ge=0.1, le=300, allow_inf_nan=False,
+        validation_alias="AGENT_ROUTER_PROCESS_SAMPLE_INTERVAL_SECONDS",
+    )
 
     @property
     def delegation_enabled(self) -> bool:

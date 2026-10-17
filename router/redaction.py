@@ -124,7 +124,7 @@ def redact_secrets(value: str, limit: int = 1000) -> str:
             "sk-", "ghp_", "github_pat_", "glpat-", "xoxb-", "xoxa-", "xoxp-", "xoxr-", "xoxs-",
             "AKIA", "ASIA", "A3T", "AGPA", "AIDA", "AIPA", "ANPA", "ANVA", "APKA", "AROA")):
         value = re.sub(
-            r"(?<![A-Za-z0-9])(?:"
+            r"(?:"
             r"sk-[A-Za-z0-9_-]{12,}|(?:ghp|github_pat)_[A-Za-z0-9_]{12,}|"
             r"glpat-[A-Za-z0-9_-]{12,}|xox[baprs]-[A-Za-z0-9-]{10,}|"
             r"(?:AKIA|ASIA|A3T[A-Z0-9]|AGPA|AIDA|AIPA|ANPA|ANVA|APKA|AROA)[A-Z0-9]{16}"

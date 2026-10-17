@@ -1,4 +1,4 @@
-"""Small operator CLI and JSON client for the five task operations."""
+"""Agent Router operator CLI."""
 
 import argparse
 import json
@@ -115,12 +115,12 @@ def _fleet_alert_lines(record: dict, snapshot: dict | None = None) -> list[str]:
 
 
 def fleet_table(result: dict, capacity_only: bool = False) -> str:
-    lines = ["HOST       CAPACITY   SESSION              AGENT                STATE        ACTIVITY                 CPU    LOAD   MEM FREE DISK FREE"]
+    lines = ["HOST       CAPACITY   SESSION              AGENT / PROCESS       STATE        ACTIVITY                 CPU    LOAD   MEM FREE DISK FREE RSS"]
     for record in result["hosts"]:
         name = _cell(record["name"], 10)
         if not record["ok"]:
             error = _cell("error: " + record["error"], 24)
-            lines.append(f"{name:<10} {'offline':<10} {'—':<20} {'—':<20} {'—':<12} {error:<24} {'—':<6} {'—':<6} {'—':<8} {'—'}")
+            lines.append(f"{name:<10} {'offline':<10} {'—':<20} {'—':<20} {'—':<12} {error:<24} {'—':<6} {'—':<6} {'—':<8} {'—':<9} {'—'}")
             lines.extend(_fleet_alert_lines(record))
             continue
         snapshot = record["snapshot"]
@@ -133,15 +133,16 @@ def fleet_table(result: dict, capacity_only: bool = False) -> str:
         partial_lines = _partial_snapshot_lines(snapshot)
         if capacity_only:
             reason = _cell("; ".join(capacity.get("capacity_reasons", [])) or "capacity thresholds satisfied", 24)
-            lines.append(f"{name:<10} {state:<10} {'—':<20} {'—':<20} {'—':<12} {reason:<24} {cpu:<6} {load:<6} {memory:<8} {disk}")
+            lines.append(f"{name:<10} {state:<10} {'—':<20} {'—':<20} {'—':<12} {reason:<24} {cpu:<6} {load:<6} {memory:<8} {disk:<9} {'—'}")
             lines.extend(partial_lines)
             lines.extend(_fleet_alert_lines(record, snapshot))
             continue
         sessions = snapshot.get("sessions", [])
         agents = snapshot.get("agents", [])
-        if not sessions and not agents:
+        processes = snapshot.get("managed_processes", []) + snapshot.get("inferred_processes", [])
+        if not sessions and not agents and not processes:
             activity = "partial snapshot" if partial_lines else "no active sessions"
-            lines.append(f"{name:<10} {state:<10} {'—':<20} {'—':<20} {'—':<12} {activity:<24} {cpu:<6} {load:<6} {memory:<8} {disk}")
+            lines.append(f"{name:<10} {state:<10} {'—':<20} {'—':<20} {'—':<12} {activity:<24} {cpu:<6} {load:<6} {memory:<8} {disk:<9} {'—'}")
             lines.extend(partial_lines)
             lines.extend(_fleet_alert_lines(record, snapshot))
             continue
@@ -151,7 +152,7 @@ def fleet_table(result: dict, capacity_only: bool = False) -> str:
             lines.append(f"{name if index == 0 else '':<10} {state if index == 0 else '':<10} "
                          f"{_cell(session.get('session_id', '—'), 20):<20} {'main':<20} {display_state:<12} "
                          f"{activity:<24} {cpu if index == 0 else '—':<6} {load if index == 0 else '—':<6} "
-                         f"{memory if index == 0 else '—':<8} {disk if index == 0 else '—'}")
+                         f"{memory if index == 0 else '—':<8} {disk if index == 0 else '—':<9} {'—'}")
         for index, agent in enumerate(agents):
             first = not sessions and index == 0
             lines.append(f"{name if first else '':<10} {state if first else '':<10} "
@@ -160,7 +161,31 @@ def fleet_table(result: dict, capacity_only: bool = False) -> str:
                          f"{_cell(agent.get('status', 'unknown'), 12):<12} "
                          f"{_cell(agent.get('activity') or '—', 24):<24} "
                          f"{cpu if first else '—':<6} {load if first else '—':<6} "
-                         f"{memory if first else '—':<8} {disk if first else '—'}")
+                         f"{memory if first else '—':<8} {disk if first else '—':<9} {'—'}")
+        for index, process in enumerate(processes):
+            first = not sessions and not agents and index == 0
+            process_cpu = (f"{process['cpu_pct']:.0f}%"
+                           if isinstance(process.get("cpu_pct"), (int, float)) else "—")
+            rss = _size(process.get("rss_bytes"))
+            label = process.get("label") or process.get("executable") or "process"
+            elapsed = process.get("elapsed_ms")
+            elapsed_text = (f" {elapsed / 1000:.1f}s"
+                            if isinstance(elapsed, (int, float)) else "")
+            worker_count = process.get("worker_count")
+            workers = (f" {worker_count}w"
+                       if isinstance(worker_count, int) and worker_count > 0 else "")
+            activity = (f"pid {process.get('pid', '—')} "
+                        f"{process.get('attribution', 'unknown')}{elapsed_text}{workers}")
+            if process.get("shutdown_uncertain"):
+                activity = "shutdown uncertain"
+            lines.append(
+                f"{name if first else '':<10} {state if first else '':<10} "
+                f"{_cell(process.get('session_id') or '—', 20):<20} "
+                f"{_cell(label, 20):<20} {_cell(process.get('status', 'unknown'), 12):<12} "
+                f"{_cell(activity, 24):<24} {process_cpu:<6} "
+                f"{load if first else '—':<6} {memory if first else '—':<8} "
+                f"{disk if first else '—':<9} {rss}"
+            )
         lines.extend(partial_lines)
         lines.extend(_fleet_alert_lines(record, snapshot))
     return "\n".join(lines)
@@ -182,6 +207,15 @@ def main() -> None:
     snapshot = commands.add_parser("snapshot", help="Print a bounded read-only local host snapshot")
     snapshot.add_argument("--json", action="store_true", required=True)
     snapshot.add_argument("--history-limit", type=int, default=100)
+    managed = commands.add_parser("run", help="Run and durably observe a foreground command")
+    managed.add_argument("--label", required=True, help="Bounded operator label for the command")
+    managed.add_argument("--session", help="Claude session identifier for attribution")
+    managed.add_argument("--agent", help="Claude agent identifier; requires --session")
+    managed.add_argument("argv", nargs=argparse.REMAINDER, help="Exact command argv after --")
+    process = commands.add_parser("process", help="Register structured coordinator process evidence")
+    process_commands = process.add_subparsers(dest="process_command", required=True)
+    process_register = process_commands.add_parser("register")
+    process_register.add_argument("--json", required=True, help="Versioned structured process evidence")
     fleet = commands.add_parser("fleet", help="Read configured local and SSH host snapshots")
     fleet_commands = fleet.add_subparsers(dest="fleet_command", required=True)
     fleet_status = fleet_commands.add_parser("status")
@@ -260,6 +294,18 @@ def main() -> None:
                 serve(settings, environment, directory, socket_path())
         elif args.command == "snapshot":
             print(json.dumps(request("snapshot", {"history_limit": args.history_limit}), separators=(",", ":")))
+        elif args.command == "run":
+            if not args.argv or args.argv[0] != "--" or len(args.argv) == 1:
+                raise ValueError("router run requires -- followed by a command")
+            from router.managed import run_managed
+            raise SystemExit(run_managed(
+                args.label, args.argv[1:], session_id=args.session, agent_id=args.agent,
+            ))
+        elif args.command == "process":
+            payload = json.loads(args.json)
+            if not isinstance(payload, dict):
+                raise ValueError("Process registration must be a JSON object")
+            print(json.dumps(request("configured_process_register", payload), indent=2))
         elif args.command == "fleet":
             from router.fleet import (
                 DEFAULT_CONFIG,
@@ -314,6 +360,8 @@ def main() -> None:
     except (ValueError, OSError) as error:
         parser.exit(1, f"Agent Router: {error}\n")
     except KeyboardInterrupt:
+        if args.command == "run":
+            raise SystemExit(130) from None
         return
 
 

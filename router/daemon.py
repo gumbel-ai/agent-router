@@ -33,6 +33,7 @@ from router.process import (
     supervised_state,
     verify_shutdown,
 )
+from router.processes import ProcessMonitor
 from router.sessions import SessionObserver
 from router.snapshot import cleanup, git, validate_repository
 
@@ -140,6 +141,11 @@ class Controller:
         self.native = NativeObserver(self.store, settings.model_prices, self.host.host_id)
         self.sessions = SessionObserver(self.store, self.host.host_id)
         self.capacity = CapacitySampler(self.directory)
+        self.process_monitor = ProcessMonitor(
+            self.store, self.directory, self.host.host_id,
+            self.host.view(now_ms())["boot_id"],
+            interval_seconds=settings.process_sample_interval_seconds,
+        )
         self.alert_history = AlertHistory()
         self.lifecycle_queue: queue.Queue[tuple[dict, threading.Event, dict] | None] = queue.Queue(maxsize=1024)
         self.lifecycle_thread: threading.Thread | None = None
@@ -319,6 +325,14 @@ class Controller:
             return self._observe_lifecycle_direct(self.native, payload)
         if operation == "session_observe":
             return self._observe_lifecycle_direct(self.sessions, payload)
+        if operation == "managed_process_start":
+            return self.process_monitor.register(payload, registration_kind="managed")
+        if operation == "configured_process_register":
+            return self.process_monitor.register(payload, registration_kind="configured")
+        if operation == "managed_process_finish":
+            if set(payload) != {"managed_process_id"}:
+                raise ValueError("Managed process completion requires managed_process_id")
+            return self.process_monitor.complete(required_text(payload, "managed_process_id"))
         if operation == "lifecycle_observe":
             if set(payload) - {"session", "native"}:
                 raise ValueError("Unknown lifecycle observation field")
@@ -593,8 +607,10 @@ class Runtime:
         # In serve(), the single-instance daemon lock is already held here.
         self.control.native.reconcile_restart()
         self.control.sessions.reconcile_restart()
+        self.control.process_monitor.reconcile_restart()
         self.control.start_lifecycle_writer()
         self.control.capacity.start()
+        self.control.process_monitor.start()
         for task in self.store.all():
             if task["status"] == "closed" and task.get("cleanup_pending") and task.get("cleanup_error") is None:
                 self.store.update(task["task_id"], lambda t: t.update(cleanup_requested=True))
@@ -985,6 +1001,7 @@ class Runtime:
         self.stopping.set()
         self.control.stop_lifecycle_writer()
         self.control.capacity.stop()
+        self.control.process_monitor.stop()
         self.control.changed.set()
         self.scheduler.join(timeout=2)
         for task in self.store.all():
