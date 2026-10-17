@@ -255,6 +255,16 @@ For each external review finding:
 7. reply to and resolve addressed review threads;
 8. request another external review when the workflow or user requires it.
 
+Read every unresolved thread in full before replying, and write each reply for that
+thread alone. Never reply to or resolve threads in bulk with one message: new threads can
+arrive between polls, and a generic reply resolves findings nobody read. If a thread was
+resolved with the wrong reply, reopen the work, fix it, and post a correction on that
+thread.
+
+When a fix strategy keeps drawing new findings of the same kind (for example, parsing
+shell syntax to find executed words), stop patching cases. Step back to a design whose
+correctness does not depend on enumerating them, and record why in the PR.
+
 ### 9. Re-review your own fixes
 
 Fixes are new code and receive the same review as the original change.
