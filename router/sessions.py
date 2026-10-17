@@ -6,6 +6,7 @@ from router.db import now_ms
 from router.dispatch import canonical
 from router.native import (
     MAX_EVENT_FUTURE_SKEW_MS,
+    SOURCES,
     STALE_AFTER_MS,
     identifier,
     safe_text,
@@ -24,9 +25,10 @@ WAITING_NOTIFICATIONS = frozenset({
 })
 WAITER_CLEARING_KINDS = frozenset({
     "tool_start", "tool_end", "tool_failure", "task_created", "task_completed", "subagent_start", "subagent_stop",
+    "subagent_activity",
 })
 MAX_WAITER_HISTORY = 1024
-WAITING_REASON = "Claude is waiting for input"
+WAITING_REASON = "Waiting for input"
 
 
 class SessionObserver:
@@ -36,7 +38,8 @@ class SessionObserver:
 
     def reconcile_restart(self) -> None:
         with self.store.transaction() as db:
-            for row in db.execute("SELECT data FROM sessions WHERE host_id=? AND source='claude'", (self.host_id,)):
+            for row in db.execute("SELECT data FROM sessions WHERE host_id=? AND source IN ('claude','codex')",
+                                  (self.host_id,)):
                 record = json.loads(row[0])
                 if record["status"] in {"running", "idle"} or record.get("needs_input"):
                     # Work that would still count as active is unresolved, not stopped:
@@ -198,7 +201,7 @@ class SessionObserver:
         session_id = event.get("session_id")
         kind = text(event.get("kind"))
         at = event.get("observed_at")
-        if source != "claude" or not kind:
+        if source not in SOURCES or not kind:
             raise ValueError("Unsupported session observation")
         source = identifier(source, "source")
         session_id = identifier(session_id, "session_id")
@@ -273,8 +276,13 @@ class SessionObserver:
                           "subagent_start", "subagent_stop"}:
                 activity = safe_text(event.get("activity"), 240) or kind
                 waiting = record["needs_input"]
-                record.update(status="running", finished_at=None, activity=activity, needs_input=waiting,
-                              visibility_reason=WAITING_REASON if waiting else None)
+                if kind == "subagent_stop" and source == "codex":
+                    # Codex fires this at the end of every subagent turn; it is not evidence
+                    # that the root session resumed, so its status is left unchanged.
+                    record.update(activity=activity, visibility_reason=WAITING_REASON if waiting else None)
+                else:
+                    record.update(status="running", finished_at=None, activity=activity, needs_input=waiting,
+                                  visibility_reason=WAITING_REASON if waiting else None)
             elif kind == "stop":
                 background = event.get("background_tasks")
                 live = isinstance(background, list) and any(isinstance(item, dict) and item.get("status") not in {"completed", "failed", "stopped"} for item in background)
@@ -307,6 +315,11 @@ class SessionObserver:
                                   visibility_reason=reason)
                 else:
                     record["activity"] = notification
+            elif kind == "subagent_activity":
+                # A subagent acted (for example a Codex subagent prompt): it clears that
+                # agent's waiter but is not a new root turn, so status is left unchanged.
+                record.update(activity=safe_text(event.get("activity"), 240) or record.get("activity"),
+                              visibility_reason=WAITING_REASON if record["needs_input"] else None)
             elif kind == "teammate_idle":
                 record["activity"] = "teammate idle"
             else:

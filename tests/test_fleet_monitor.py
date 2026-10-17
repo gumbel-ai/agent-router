@@ -513,7 +513,7 @@ class SessionAndCapacityTests(unittest.TestCase):
                 self.assertEqual(result["needs_input"], waiting)
                 session = self.observer.sessions()[0]
                 self.assertEqual(session["needs_input"], waiting)
-                self.assertEqual(session["visibility_reason"] == "Claude is waiting for input", waiting)
+                self.assertEqual(session["visibility_reason"] == "Waiting for input", waiting)
                 self.assertEqual(self.observer.fleet_records(10)[1], 1 if waiting else 0)
 
     def test_waiter_history_overflow_reports_uncertainty_instead_of_guessing(self):

@@ -72,6 +72,26 @@ def _size(value: int | None) -> str:
     return "—"
 
 
+def _sourced(record: dict, identity: object) -> str:
+    return f"{record.get('source') or '?'}:{identity or '—'}"
+
+
+def sessions_table(sessions: list[dict], error: object = None) -> str:
+    """Top-level Claude Code and Codex sessions on this host."""
+    if error:
+        warning = f"warning: session list is incomplete: {_cell(error, 200)}"
+        if not sessions:
+            return warning
+    lines = ["SESSION                                     SOURCE   STATE        ACTIVITY"]
+    for session in sessions:
+        state = "needs_input" if session.get("needs_input") else session.get("status", "unknown")
+        lines.append(f"{_cell(session.get('session_id', '—'), 43):<43} {_cell(session.get('source', '?'), 8):<8} "
+                     f"{_cell(state, 12):<12} {_cell(session.get('activity') or '—', 40)}")
+    if error:
+        lines.append(warning)
+    return "\n".join(lines) if sessions else "No observed sessions."
+
+
 def _cell(value: object, limit: int | None = None) -> str:
     cleaned = sanitize_output_text(str(value))
     return cleaned[:limit] if limit is not None else cleaned
@@ -151,13 +171,13 @@ def fleet_table(result: dict, capacity_only: bool = False) -> str:
             display_state = _cell("needs_input" if session.get("needs_input") else session.get("status", "unknown"), 12)
             activity = _cell(session.get("activity") or f"last: {session.get('last_event') or 'unknown'}", 24)
             lines.append(f"{name if index == 0 else '':<10} {state if index == 0 else '':<10} "
-                         f"{_cell(session.get('session_id', '—'), 20):<20} {'main':<20} {display_state:<12} "
+                         f"{_cell(_sourced(session, session.get('session_id')), 20):<20} {'main':<20} {display_state:<12} "
                          f"{activity:<24} {cpu if index == 0 else '—':<6} {load if index == 0 else '—':<6} "
                          f"{memory if index == 0 else '—':<8} {disk if index == 0 else '—'}")
         for index, agent in enumerate(agents):
             first = not sessions and index == 0
             lines.append(f"{name if first else '':<10} {state if first else '':<10} "
-                         f"{_cell(agent.get('parent_session_id', '—'), 20):<20} "
+                         f"{_cell(_sourced(agent, agent.get('parent_session_id')), 20):<20} "
                          f"{_cell(agent.get('agent_type') or agent.get('agent_id') or 'unknown', 20):<20} "
                          f"{_cell(agent.get('status', 'unknown'), 12):<12} "
                          f"{_cell(agent.get('activity') or '—', 24):<24} "
@@ -302,6 +322,10 @@ def main() -> None:
                     if args.watch and sys.stdout.isatty():
                         print("\033[2J\033[H", end="")
                     print(table(result), flush=True)
+                    if not payload:
+                        snapshot = request("snapshot", {"history_limit": 50})
+                        print("\n" + sessions_table(snapshot.get("sessions", []),
+                                                    snapshot.get("errors", {}).get("sessions")), flush=True)
                 if not args.watch:
                     break
                 time.sleep(2)

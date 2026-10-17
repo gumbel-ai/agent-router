@@ -74,6 +74,11 @@ def observe(event: dict) -> dict:
         payload.update(kind="failed", failure_reason="Claude reported that the agent turn failed")
     else:
         payload = None
+    return send(session_payload, payload)
+
+
+def send(session_payload: dict | None, payload: dict | None) -> dict:
+    """Forward one lifecycle observation; failure never blocks the host agent."""
     try:
         result = request("lifecycle_observe", {"session": session_payload, "native": payload}, timeout=.05)
         rejected = result.get("accepted") is False
@@ -101,7 +106,60 @@ def observe(event: dict) -> dict:
     return {}
 
 
+# Codex hook event -> (session kind, native kind for subagent events). See docs/codex-lifecycle.md.
+CODEX_EVENTS = {
+    "SessionStart": ("session_start", None),
+    "SessionEnd": ("session_end", "session_end"),
+    "UserPromptSubmit": ("prompt", "activity"),
+    "PreToolUse": ("tool_start", "activity"),
+    "PostToolUse": ("tool_end", "activity"),
+    "PermissionRequest": ("notification", "needs_input"),
+    "SubagentStart": ("subagent_start", "start"),
+    "SubagentStop": ("subagent_stop", "idle"),  # Per subagent turn, not its end.
+    "Stop": ("stop", None),
+    "Interrupt": ("stop", None),
+}
+
+
+def observe_codex(event: dict) -> dict:
+    """Map a Codex hook payload onto Router lifecycle events. Content is never forwarded."""
+    name = event.get("hook_event_name")
+    if name not in CODEX_EVENTS:
+        return {}
+    session_kind, agent_kind = CODEX_EVENTS[name]
+    agent = event.get("agent_id")
+    at = int(time.time() * 1000)
+    base = {"source": "codex", "session_id": event.get("session_id"), "observed_at": at}
+    tool = bounded_text(event.get("tool_name"), 240)
+    session_payload = {**base, "kind": session_kind, "cwd": event.get("cwd"), "model": event.get("model"),
+                       "agent_id": agent, "tool_use_id": event.get("tool_use_id"), "activity": tool}
+    if name == "SessionStart":
+        session_payload["start_source"] = event.get("source")
+    elif name == "PermissionRequest":
+        session_payload["notification_type"] = "permission_prompt"
+    elif name == "UserPromptSubmit" and agent is not None:
+        # A subagent's prompt is not a new root turn, but it does answer that agent's wait.
+        session_payload["kind"] = "subagent_activity"
+    payload = None
+    if name == "SessionEnd":
+        payload = {**base, "kind": "session_end"}
+    elif agent_kind is not None and agent is not None:
+        payload = {**base, "kind": agent_kind, "agent_id": agent, "agent_type": event.get("agent_type"),
+                   "cwd": event.get("cwd"), "resolved_model": event.get("model"),
+                   "activity": tool or ("needs input" if agent_kind == "needs_input" else None)}
+    return send(session_payload, payload)
+
+
 def main() -> None:
+    if sys.argv[1:] == ["--source", "codex"]:
+        try:
+            event = json.load(sys.stdin)
+            if isinstance(event, dict):
+                observe_codex(event)
+        except (ValueError, KeyError, TypeError, OSError) as error:
+            print(f"Agent Router observation unavailable: {error}", file=sys.stderr)
+        print("{}")  # Codex accepts an empty JSON object as a no-op on every event.
+        return
     try:
         event = json.load(sys.stdin)
         if not isinstance(event, dict):

@@ -12,6 +12,7 @@ from router.validation import MAX_WIRE_INTEGER, is_wire_integer
 LOGGER = logging.getLogger(__name__)
 
 STALE_AFTER_MS = 60_000
+SOURCES = frozenset({"claude", "codex"})
 MAX_EVENT_FUTURE_SKEW_MS = 60_000
 # Lifecycle fields only. Content, token usage, and cost belong to Langfuse; older rows
 # may still hold such fields, so views project onto this allowlist.
@@ -70,7 +71,7 @@ class NativeObserver:
         at = now_ms()
         with self.store.transaction() as db:
             for row in db.execute("""SELECT data FROM observations
-                    WHERE json_extract(data,'$.host_id')=? AND json_extract(data,'$.source')='claude'""",
+                    WHERE json_extract(data,'$.host_id')=? AND json_extract(data,'$.source') IN ('claude','codex')""",
                     (self.host_id,)).fetchall():
                 record = json.loads(row[0])
                 if RETIRED_FIELDS & record.keys() or record.get("model_source") == "transcript":
@@ -116,7 +117,7 @@ class NativeObserver:
     def observe(self, event: dict, timeout: float = 10) -> dict:
         source, raw_session, kind = (event.get(key) for key in ("source", "session_id", "kind"))
         at = event.get("observed_at")
-        if source != "claude" or kind not in {
+        if source not in SOURCES or kind not in {
                 "start", "launch", "result", "activity", "stop", "session_end", "idle", "needs_input", "failed"}:
             raise ValueError("Unsupported native observation")
         session = identifier(raw_session, "session_id")
@@ -136,13 +137,23 @@ class NativeObserver:
                     if at < previous_end:
                         continue
                     record["session_ended_at"] = at
-                    if (record["status"] in {"running", "idle", "needs_input"}
-                            and at >= record.get("state_at", -1)):
+                    # Codex subagents end only with their session, so an agent left unknown by a
+                    # Router restart is still closed by the session's end.
+                    open_states = {"running", "idle", "needs_input"} | ({"unknown"} if source == "codex" else set())
+                    if record["status"] in open_states and at >= record.get("state_at", -1):
                         segment_start = record.get("run_started_at")
                         base_duration = record.get("duration_ms") or 0
                         prior_state_at = record.get("state_at", -1)
                         if record.get("run_started_at") is not None:
                             record["duration_ms"] = base_duration + max(0, at - segment_start)
+                        if source == "codex":
+                            # Codex has no subagent-end hook; its subagents end with the root session.
+                            record.update(status="stopped", last_observed_status="stopped", finished_at=at,
+                                          run_started_at=None, continuity_uncertain=False,
+                                          visibility_reason="Codex session ended",
+                                          state_at=at, last_event_at=max(record["last_event_at"] or 0, at))
+                            self.put(db, record)
+                            continue
                         record.update(status="unknown", continuity_uncertain=True,
                                       run_started_at=None, runtime_partial=True,
                                       session_end_uncertain=True,
@@ -280,7 +291,7 @@ class NativeObserver:
                     if record.get("run_started_at") is not None:
                         record["duration_ms"] = (record["duration_ms"] or 0) + max(0, at - record["run_started_at"])
                     record.update(status="needs_input", last_observed_status="needs_input", run_started_at=None,
-                                  visibility_reason="Claude reported that the agent needs input")
+                                  visibility_reason="The host reported that the agent needs input")
                 if kind in {"start", "activity", "stop", "idle", "needs_input", "failed"}:
                     record["state_at"] = max(record.get("state_at", -1), at)
             record["last_event_at"] = max(record["last_event_at"] or 0, at)
