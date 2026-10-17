@@ -148,6 +148,16 @@ def _router_task_activity(task: dict) -> str:
     return task.get("activity") or task.get("failure_reason") or "—"
 
 
+def _managed_activity(process: dict) -> str:
+    if process.get("status") == "running":
+        return f"pid {process.get('pid')}"
+    if process.get("status") == "unknown" or process.get("group_outlived"):
+        return process.get("visibility_reason") or "outcome unknown"
+    how = f"signal {process['signal']}" if process.get("signal") else f"exit {process.get('exit_code')}"
+    elapsed = process.get("elapsed_ms")
+    return how + (f" after {elapsed / 1000:.1f}s" if isinstance(elapsed, int) else "")
+
+
 def fleet_table(result: dict, capacity_only: bool = False) -> str:
     lines = ["HOST       CAPACITY   SESSION              AGENT                STATE        ACTIVITY                 CPU    LOAD   MEM FREE DISK FREE"]
     for record in result["hosts"]:
@@ -174,7 +184,8 @@ def fleet_table(result: dict, capacity_only: bool = False) -> str:
         sessions = snapshot.get("sessions", [])
         agents = snapshot.get("agents", [])
         router_tasks = snapshot.get("router_tasks", [])
-        if not sessions and not agents and not router_tasks:
+        managed = snapshot.get("managed_processes", [])
+        if not sessions and not agents and not router_tasks and not managed:
             activity = "partial snapshot" if partial_lines else "no active sessions"
             lines.append(f"{name:<10} {state:<10} {'—':<20} {'—':<20} {'—':<12} {activity:<24} {cpu:<6} {load:<6} {memory:<8} {disk}")
             lines.extend(partial_lines)
@@ -205,6 +216,22 @@ def fleet_table(result: dict, capacity_only: bool = False) -> str:
                          f"{_cell(_router_task_activity(task), 24):<24} "
                          f"{cpu if first else '—':<6} {load if first else '—':<6} "
                          f"{memory if first else '—':<8} {disk if first else '—'}")
+        for index, process in enumerate(managed):
+            first = not sessions and not agents and not router_tasks and index == 0
+            lines.append(f"{name if first else '':<10} {state if first else '':<10} "
+                         f"{_cell('run:' + str(process.get('session_id') or '—'), 20):<20} "
+                         f"{_cell(process.get('label') or process.get('executable') or '?', 20):<20} "
+                         f"{_cell(process.get('status', 'unknown'), 12):<12} "
+                         f"{_cell(_managed_activity(process), 24):<24} "
+                         f"{cpu if first else '—':<6} {load if first else '—':<6} "
+                         f"{memory if first else '—':<8} {disk if first else '—'}")
+        inferred = snapshot.get("inferred_processes", [])
+        if inferred:
+            cpu_total = sum(process.get("cpu_pct") or 0 for process in inferred)
+            rss_total = sum(process.get("rss_bytes") or 0 for process in inferred)
+            sessions_seen = len({(process.get("source"), process.get("session_id")) for process in inferred})
+            lines.append(f"{'':<10} session processes: {len(inferred)} in {sessions_seen} session(s), "
+                         f"CPU {cpu_total:.0f}%, RSS {_size(rss_total)}")
         lines.extend(partial_lines)
         lines.extend(_fleet_alert_lines(record, snapshot))
     return "\n".join(lines)

@@ -525,7 +525,7 @@ def _validate_snapshot(payload: bytes) -> dict:
             truncated_sections.append(collection)
     projected_alerts = []
     alert_entity_fields = frozenset({
-        "source", "session_id", "parent_session_id", "agent_id", "task_id", "configured_host",
+        "source", "session_id", "parent_session_id", "agent_id", "task_id", "configured_host", "managed_id",
     })
     for alert in snapshot["alerts"]:
         alert_id = _wire_identity(alert.get("alert_id"), "alert identity", required=True)
