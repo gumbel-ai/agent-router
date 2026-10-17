@@ -140,6 +140,12 @@ Router's `failed` agent state therefore never appears for Codex.
   (`router/child.py`), so they cannot stand in for native Codex sessions.
 - Build test fixtures from the captured payload shapes above (content fields replaced
   with placeholders), and verify the inferred behaviours marked **I** against a real
-  session: per-turn `SubagentStop`, `send_input` turns, `Stop` continuation, and
-  `Interrupt`.
+  session: per-turn `SubagentStop`, `send_input` turns, `Stop` continuation,
+  `Interrupt`, and whether a `resume`d session continues existing subagent threads.
+  Router marks a Codex session's subagents stopped when the session ends; if resume
+  can continue them, their later activity must be allowed to reopen them.
+- Async hooks are stamped when they run, so a subagent hook can arrive after the
+  session's `SessionEnd` with a later timestamp. Decide from the real session whether
+  post-end subagent activity is allowed only after a later root `SessionStart`
+  (`resume`), and test both new and existing subagent records.
 - Capturing a session with subagents requires a persisted (non-ephemeral) session.
