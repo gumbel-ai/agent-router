@@ -221,8 +221,11 @@ class SessionProcessTests(unittest.TestCase):
         self.assertGreater(own["rss_bytes"], 0)
         bad = compose(self.control)
         bad["inferred_processes"][0]["cpu_pct"] = -1
-        with self.assertRaises(ValueError):
-            _validate_snapshot(json.dumps(bad).encode())
+        bad["managed_processes"] = [{"host_id": bad["host"]["host_id"], "managed_id": "managed-x", "pid": 0}]
+        projected = _validate_snapshot(json.dumps(bad).encode())  # Bad process rows are dropped, not the host.
+        self.assertEqual(len(projected["inferred_processes"]), len(bad["inferred_processes"]) - 1)
+        self.assertEqual(projected["managed_processes"], [])
+        self.assertIn("invalid record", projected["errors"]["inferred_processes"])
 
     def test_hooks_send_process_identities_and_survive_without_them(self):
         sent = []

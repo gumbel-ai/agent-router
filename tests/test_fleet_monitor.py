@@ -1321,12 +1321,6 @@ class SnapshotAndFleetTests(unittest.TestCase):
         cases = {
             "negative timestamp": lambda value: value["sessions"][0].update(started_at=-1),
             "boolean duration": lambda value: value["agents"][0].update(duration_ms=True),
-            "zero pid": lambda value: value.update(managed_processes=[{
-                "host_id": "host-1", "managed_id": "managed", "pid": 0,
-            }]),
-            "negative pgid": lambda value: value.update(inferred_processes=[{
-                "host_id": "host-1", "pid": 1, "pgid": -1,
-            }]),
             "negative count": lambda value: value["sessions"][0].update(inflight_tool_count=-1),
         }
         for name, mutate in cases.items():
