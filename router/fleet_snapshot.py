@@ -34,7 +34,7 @@ CAPACITY_DEPENDENCY_SECTIONS = frozenset({
 
 
 # Free text written by users or agents; withheld when fleet text sharing is off.
-FLEET_TEXT_FIELDS = frozenset({"task", "subject", "failure_reason"})
+FLEET_TEXT_FIELDS = frozenset({"task", "subject", "failure_reason", "label"})
 
 class AlertHistory:
     """Preserve first-seen time while an alert remains continuously active."""
@@ -193,9 +193,16 @@ def compose(controller, thresholds: CapacityThresholds | None = None, history_li
         if not snapshot["router_tasks"] and "router_tasks" not in snapshot.get("errors", {}):
             # Older fleet viewers treat unknown sections as partial; send it only when there is something to show.
             del snapshot["router_tasks"]
+    if hasattr(controller, "managed"):
+        active_managed = _observed_collection(
+            snapshot, "managed_processes", controller.managed.records, history_limit,
+            "managed_process_active_count",
+        )
+    else:
+        snapshot["managed_processes"], active_managed = [], 0
     if not getattr(getattr(controller, "settings", None), "fleet_share_text", True):
         # The producing host decides whether user- and agent-written text leaves it.
-        for key in ("agents", "tasks", "router_tasks"):
+        for key in ("agents", "tasks", "router_tasks", "managed_processes"):
             for record in snapshot.get(key, []):
                 for field in FLEET_TEXT_FIELDS & record.keys():
                     record[field] = None
@@ -205,9 +212,8 @@ def compose(controller, thresholds: CapacityThresholds | None = None, history_li
         thresholds,
         active_claude_sessions=active_sessions,
         active_agents=active_agents,
-        active_managed_processes=0,
+        active_managed_processes=active_managed,
     ), {})
-    snapshot["managed_processes"] = []
     if hasattr(controller, "inferred_process_records"):
         _collection(snapshot, "inferred_processes", controller.inferred_process_records, history_limit)
     else:
@@ -278,7 +284,7 @@ def bound(snapshot: dict, maximum_bytes: int = MAX_SNAPSHOT_BYTES) -> dict:
     result = dict(snapshot)
     result["partial"] = True
     result.setdefault("errors", {})["output"] = "Snapshot truncated to configured one MiB bound"
-    for key in ("tasks", "router_tasks", "inferred_processes", "agents", "sessions", "alerts"):
+    for key in ("tasks", "router_tasks", "inferred_processes", "managed_processes", "agents", "sessions", "alerts"):
         values = list(result.get(key, []))
         while values and len(canonical({**result, key: values}).encode()) > maximum_bytes:
             values = values[:len(values) // 2]

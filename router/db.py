@@ -52,6 +52,8 @@ class Store:
                     host_id TEXT NOT NULL, source TEXT NOT NULL, session_id TEXT NOT NULL,
                     task_id TEXT NOT NULL, data TEXT NOT NULL,
                     PRIMARY KEY(host_id, source, session_id, task_id))""",
+                """CREATE TABLE IF NOT EXISTS managed_processes (
+                    managed_id TEXT PRIMARY KEY, data TEXT NOT NULL)""",
                 """CREATE TABLE IF NOT EXISTS native_session_watermarks (
                     host_id TEXT NOT NULL, source TEXT NOT NULL, session_id TEXT NOT NULL,
                     ended_at INTEGER NOT NULL,

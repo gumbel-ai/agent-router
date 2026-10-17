@@ -259,16 +259,17 @@ def _project_record(record: dict, allowed: frozenset[str], required: tuple[str, 
         "status", "cwd", "model", "coordinator_role", "visibility_reason", "activity",
         "last_event", "task", "agent_type", "requested_model", "resolved_model", "model_source",
         "executor", "owner", "control_mode", "subject", "teammate_name", "failure_reason", "label",
-        "command", "worktree", "last_observed_status", "managed_id", "attribution",
+        "command", "worktree", "last_observed_status", "managed_id", "attribution", "executable",
     }
     positive_integer_fields = {"pid", "pgid"}
     nonnegative_integer_fields = {
         "started_at", "last_event_at", "finished_at", "duration_ms", "observation_age_ms",
         "elapsed_ms", "inflight_tool_count", "created_at", "completed_at", "attempts", "rss_bytes",
+        "argument_count", "max_process_rss_bytes", "signal",
     }
     boolean_fields = {"needs_input", "runtime_partial",
                       "tool_visibility_partial", "cleanup_pending", "shutdown_unconfirmed",
-                      "parent_reference_omitted", "cleanup_failed"}
+                      "parent_reference_omitted", "cleanup_failed", "group_outlived"}
     for key in allowed & record.keys():
         value = record[key]
         if key in text_fields:
@@ -425,8 +426,11 @@ def _validate_snapshot(payload: bytes) -> dict:
     # Router tasks were added within schema v1; older peers omit the section.
     snapshot.setdefault("router_tasks", [])
     collections = ("sessions", "agents", "tasks", "router_tasks", "managed_processes", "inferred_processes", "alerts")
+    # These items are checked per row below, where one bad row is dropped rather than the host.
+    row_checked = {"router_tasks", "managed_processes", "inferred_processes"}
     if not isinstance(capacity, dict) or any(
-            not isinstance(snapshot.get(key), list) or any(not isinstance(item, dict) for item in snapshot[key])
+            not isinstance(snapshot.get(key), list)
+            or key not in row_checked and any(not isinstance(item, dict) for item in snapshot[key])
             for key in collections):
         raise ValueError("Host snapshot has invalid section types")
     if any(len(snapshot[key]) > MAX_COLLECTION_RECORDS for key in collections):
@@ -470,13 +474,16 @@ def _validate_snapshot(payload: bytes) -> dict:
                                    "cleanup_pending", "cleanup_failed", "shutdown_unconfirmed",
                                    "parent_reference_omitted"}),
         "managed_processes": frozenset({"host_id", "managed_id", "status", "label", "pid", "pgid",
-                                        "started_at", "finished_at", "exit_code", "visibility_reason"}),
+                                        "started_at", "finished_at", "exit_code", "visibility_reason",
+                                        "attribution", "session_id", "agent_id", "executable",
+                                        "argument_count", "cwd", "elapsed_ms", "signal",
+                                        "max_process_rss_bytes", "group_outlived"}),
         "inferred_processes": frozenset({"host_id", "pid", "pgid", "status", "label", "started_at",
                                          "visibility_reason", "attribution", "source", "session_id",
                                          "cpu_pct", "rss_bytes"}),
     }
     projected_collections = {}
-    rejected_router_tasks = 0
+    rejected: dict[str, int] = {}
     for collection, required in identity_fields.items():
         if collection == "router_tasks":
             # One odd Router task must not hide the host's sessions, agents, and capacity.
@@ -489,7 +496,7 @@ def _validate_snapshot(payload: bytes) -> dict:
                     projected_collections[collection].append(_project_record(
                         record, record_fields[collection], required, collection, host["host_id"]))
                 except (ValueError, TypeError):
-                    rejected_router_tasks += 1
+                    rejected["router_tasks"] = rejected.get("router_tasks", 0) + 1
             continue
         for record in snapshot[collection]:
             if not required_record_fields[collection].issubset(record):
@@ -501,10 +508,16 @@ def _validate_snapshot(payload: bytes) -> dict:
             for record in snapshot[collection]
         ]
     for collection in ("managed_processes", "inferred_processes"):
-        projected_collections[collection] = [
-            _project_record(record, record_fields[collection], ("host_id",), collection, host["host_id"])
-            for record in snapshot[collection]
-        ]
+        # Process rows are numerous and independent; one bad row is dropped, not the host.
+        projected_collections[collection] = []
+        for record in snapshot[collection]:
+            try:
+                if not isinstance(record, dict):
+                    raise TypeError(f"{collection} row is not an object")
+                projected_collections[collection].append(_project_record(
+                    record, record_fields[collection], ("host_id",), collection, host["host_id"]))
+            except (ValueError, TypeError):
+                rejected[collection] = rejected.get(collection, 0) + 1
     truncated_sections = []
     for collection, records in projected_collections.items():
         flags = [record.pop("_truncated", False) for record in records]  # Pop from every record.
@@ -614,10 +627,10 @@ def _validate_snapshot(payload: bytes) -> dict:
         projected_errors["other"] = f"{unknown_error_count} unrecognized error section(s) omitted"
     for section in dict.fromkeys(truncated_sections):
         projected_errors.setdefault(section, "Text truncated to the fleet length bound")
-    if rejected_router_tasks:
-        projected_errors["router_tasks"] = bound_text(
-            f"{rejected_router_tasks} invalid Router task record(s) omitted"
-            + (f"; {projected_errors['router_tasks']}" if "router_tasks" in projected_errors else ""), 500)
+    for section, count in rejected.items():
+        projected_errors[section] = bound_text(
+            f"{count} invalid record(s) omitted"
+            + (f"; {projected_errors[section]}" if section in projected_errors else ""), 500)
     projected_host = {"host_id": _wire_identity(
         host["host_id"], "host host_id", MAX_HOST_ID_LENGTH, True,
     )}

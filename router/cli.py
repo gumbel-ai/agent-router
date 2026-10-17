@@ -223,6 +223,11 @@ def main() -> None:
     status.add_argument("--json", action="store_true")
     status.add_argument("--watch", action="store_true")
     status.add_argument("--native-offset", type=int, default=0, help="Native observation page offset (100 per page)")
+    run = commands.add_parser("run", help="Run a command in its own process group and record completion evidence")
+    run.add_argument("--label", help="Short name shown in status and fleet views")
+    run.add_argument("--session", help="Launching Claude Code or Codex session ID")
+    run.add_argument("--agent", help="Launching agent ID (with --session: exact attribution)")
+    run.add_argument("argv", nargs=argparse.REMAINDER, help="-- command [arguments]")
     snapshot = commands.add_parser("snapshot", help="Print a bounded read-only local host snapshot")
     snapshot.add_argument("--json", action="store_true", required=True)
     snapshot.add_argument("--history-limit", type=int, default=100)
@@ -302,6 +307,10 @@ def main() -> None:
                 settings, environment = load_settings()
                 directory = state_dir()
                 serve(settings, environment, directory, socket_path())
+        elif args.command == "run":
+            from router.managed import run as run_managed
+            argv = args.argv[1:] if args.argv[:1] == ["--"] else args.argv
+            sys.exit(run_managed(argv, args.label, args.session, args.agent, state_dir()))
         elif args.command == "snapshot":
             print(json.dumps(request("snapshot", {"history_limit": args.history_limit}), separators=(",", ":")))
         elif args.command == "fleet":
