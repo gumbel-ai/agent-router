@@ -295,6 +295,14 @@ class SessionAndCapacityTests(unittest.TestCase):
         self.assertEqual(records[0]["inflight_tool_count"], 1)
         self.assertEqual(active, 1)
 
+    def test_delayed_pre_restart_tool_start_stays_active_after_restart_window(self):
+        self.event("prompt", observed_at=self.now - 3000)
+        self.event("notification", notification_type="agent_completed", observed_at=self.now - 1000)
+        self.observer.reconcile_restart()
+        self.event("tool_start", tool_use_id="late", activity="Bash", observed_at=self.now - 2000)
+        with patch("router.sessions.now_ms", return_value=self.now + 61_000):
+            self.assertEqual(self.observer.fleet_records(10)[1], 1)
+
     def test_delayed_tool_start_after_agent_completed_counts_once_as_active(self):
         self.event("prompt", observed_at=self.now - 3000)
         completed = self.event("notification", notification_type="agent_completed", observed_at=self.now - 1000)

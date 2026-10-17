@@ -88,12 +88,15 @@ class HookTests(TransportHarness, unittest.TestCase):
         base = {"session_id": "foreground", "cwd": str(self.repo)}
         self.assertEqual(self.hook({**base, "hook_event_name": "PreToolUse", "tool_name": "Read"}, "observe"), {})
         self.assertEqual(request("status", {}, self.endpoint), [])
-        local = request("snapshot", {}, self.endpoint)
+        local = self.eventually(lambda: request("snapshot", {}, self.endpoint),
+                                lambda local: local["sessions"] and local["sessions"][0]["activity"] == "Read")
         self.assertEqual(local["sessions"][0]["session_id"], "foreground")
         self.assertEqual(local["sessions"][0]["activity"], "Read")
         self.assertEqual(self.hook({**base, "hook_event_name": "PostToolUse", "tool_name": "Agent",
             "tool_input": {"description": "Foreground result"}, "tool_response": {"agentId": "child", "isAsync": False}}, "observe"), {})
-        result = request("status", {}, self.endpoint)[0]
+        rows = self.eventually(lambda: request("status", {}, self.endpoint),
+                               lambda rows: rows and rows[0]["status"] == "unknown")
+        result = rows[0]
         self.assertEqual(result["status"], "unknown")
         self.assertIn("without observed stop", result["visibility_reason"])
 
@@ -110,7 +113,8 @@ class HookTests(TransportHarness, unittest.TestCase):
         for event in events:
             self.assertEqual(self.hook({**base, **event}, "observe"), {})
         local = self.eventually(lambda: request("snapshot", {}, self.endpoint),
-                                lambda local: local["sessions"] and local["sessions"][0]["visibility_reason"])
+                                lambda local: local["sessions"]
+                                and "turn failed" in (local["sessions"][0]["visibility_reason"] or ""))
         self.assertEqual(local["tasks"][0]["status"], "completed")
         session = local["sessions"][0]
         self.assertEqual(session["status"], "idle")

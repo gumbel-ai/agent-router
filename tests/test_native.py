@@ -883,10 +883,11 @@ class NativeTests(unittest.TestCase):
 
     def test_malformed_and_overflowing_transcript_usage_stays_unavailable(self):
         for name, messages in (
-            ("oversized", [{"id": "one", "usage": {"input_tokens": 2**63}}]),
+            # Both required counters present, so shape validation cannot mask the bound.
+            ("oversized", [{"id": "one", "usage": {"input_tokens": 2**63, "output_tokens": 0}}]),
             ("aggregate", [
-                {"id": "one", "usage": {"input_tokens": 2**62}},
-                {"id": "two", "usage": {"output_tokens": 2**62}},
+                {"id": "one", "usage": {"input_tokens": 2**62, "output_tokens": 0}},
+                {"id": "two", "usage": {"input_tokens": 0, "output_tokens": 2**62}},
             ]),
         ):
             transcript = self.root / f"{name}.jsonl"

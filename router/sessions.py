@@ -430,7 +430,7 @@ class SessionObserver:
             active_sessions = db.execute("""SELECT COUNT(*) FROM sessions WHERE host_id=? AND (
                     ((json_extract(data,'$.status')='running' OR json_extract(data,'$.needs_input')=1) AND
                      json_extract(data,'$.last_event_at') BETWEEN ? AND ?) OR
-                    (json_extract(data,'$.status') IN ('running','idle') AND
+                    (json_extract(data,'$.status') IN ('running','idle','unknown') AND
                      json_extract(data,'$.last_event_at')<=? AND
                      json_extract(data,'$.tool_active_until')>=?))""",
                                          (self.host_id, at - STALE_AFTER_MS, at, at, at)).fetchone()[0]
