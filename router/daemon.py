@@ -33,6 +33,7 @@ from router.process import (
     supervised_state,
     verify_shutdown,
 )
+from router.processes import SessionProcesses
 from router.sessions import SessionObserver
 from router.snapshot import cleanup, git, validate_repository
 
@@ -146,6 +147,7 @@ class Controller:
                        (self.host.host_id, canonical(self.host.view(now_ms()))))
         self.native = NativeObserver(self.store, self.host.host_id)
         self.sessions = SessionObserver(self.store, self.host.host_id)
+        self.session_processes = SessionProcesses()
         self.capacity = CapacitySampler(self.directory)
         self.alert_history = AlertHistory()
         self.lifecycle_queue: queue.Queue[tuple[dict, threading.Event, dict] | None] = queue.Queue(maxsize=1024)
@@ -588,6 +590,10 @@ class Controller:
         if payload.get("filter") is None:
             rows.extend(self.native.status(offset=offset))
         return rows
+
+    def inferred_process_records(self, limit: int = 100) -> list[dict]:
+        """Processes descending from live Claude and Codex sessions, attributed to that session."""
+        return self.session_processes.records(self.host.host_id, self.sessions.process_roots(), limit)
 
     def router_task_records(self, limit: int = 100) -> list[dict]:
         """Lifecycle-only fleet projection of Router-dispatched tasks: open or recently changed."""

@@ -5,6 +5,7 @@ import sys
 import time
 
 from router.client import request
+from router.processes import ancestry
 from router.sanitize import bound_text, strip_terminal_sequences
 
 
@@ -79,6 +80,12 @@ def observe(event: dict) -> dict:
 
 def send(session_payload: dict | None, payload: dict | None) -> dict:
     """Forward one lifecycle observation; failure never blocks the host agent."""
+    if session_payload is not None:
+        try:
+            # Process identities only (no names or command lines), to find the session's process.
+            session_payload["process_ancestors"] = ancestry()
+        except (OSError, ValueError, IndexError):
+            pass  # Lifecycle observation does not depend on process evidence.
     try:
         result = request("lifecycle_observe", {"session": session_payload, "native": payload}, timeout=.05)
         rejected = result.get("accepted") is False
