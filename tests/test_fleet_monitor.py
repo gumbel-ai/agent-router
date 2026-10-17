@@ -45,6 +45,7 @@ from router.fleet import (
 from router.fleet_snapshot import MAX_SNAPSHOT_BYTES, AlertHistory, bound, compose
 from router.host import HostIdentity, current_boot_id, stable_host_id
 from router.native import NativeObserver
+from router.redaction import redact_secrets
 from router.sessions import MAX_EXACT_INFLIGHT_TOOLS, SessionObserver
 from router.validation import HOST_STRING_LIMITS
 
@@ -2391,6 +2392,13 @@ required = false
                 ('headers = {"Cookie": "session=swordfish"}', "swordfish"),
                 ('Payload was "{\\"password\\": \\"swordfish\\"}".', "swordfish"),
                 (json.dumps({"cmd": json.dumps({"password": 'sword"fish', "user": "bob"})}), "fish"),
+                (json.dumps(json.dumps(json.dumps({"password": "swordfish", "user": "bob"}))), "swordfish"),
+                (json.dumps(json.dumps(json.dumps(json.dumps({"password": 'sw"ordfish'})))), "ordfish"),
+                # Unterminated: the string is cut inside the secret.
+                ((nested := json.dumps(json.dumps(json.dumps({"password": "canary"}))))[
+                    :nested.index("canary") + 4], "cana"),
+                ("C:\\password=swordfish", "swordfish"),
+                ("line\\npassword=swordfish", "swordfish"),
                 ("API_\x1b[0mKEY=swordfish", "swordfish"),
                 ("pass\x1b]8;;http://x\x07word=swordfish", "swordfish"),
                 (json.dumps({"cmd": json.dumps({"password": "swordfish\\", "user": "bob"})}), "swordfish"),
@@ -2404,6 +2412,12 @@ required = false
             redacted = _redact_error(secret)
             self.assertNotIn(leaked, redacted)
             self.assertIn("[REDACTED", redacted)
+
+    def test_redaction_stays_linear_on_long_backslash_runs(self):
+        # An unbounded escaped-key prefix backtracks quadratically (13 s at 20k).
+        started = time.monotonic()
+        redact_secrets("\\" * 200_000 + " x=1", 10)
+        self.assertLess(time.monotonic() - started, 1)
 
     def test_local_snapshot_final_boundary_redacts_all_error_and_display_canaries(self):
         secret = "MY_SERVICE_API_KEY=swordfish"

@@ -4,12 +4,12 @@ import re
 import unicodedata
 
 _ASSIGNMENT_HEADER = re.compile(
-    r"(?i)(?<![a-z0-9_])(?P<key_quote>\\?[\"']?)"
+    r"(?i)(?<![a-z0-9_])(?!(?<=\\)\\)(?P<key_quote>\\{0,63}[\"']?)"
     r"(?P<key>[$a-z0-9][$a-z0-9_.-]{0,239})(?P=key_quote)"
     r"\s*(?::|=|\bis\b)\s*"
 )
 _SPACED_ASSIGNMENT_HEADER = re.compile(
-    r"(?i)(?<![a-z0-9_])(?P<key_quote>\\?[\"']?)"
+    r"(?i)(?<![a-z0-9_])(?!(?<=\\)\\)(?P<key_quote>\\{0,63}[\"']?)"
     r"(?P<key>(?:[$a-z0-9_.-]{1,64}\s+){0,8}(?:"
     r"api\s+key|access\s+(?:key|token)|pass\s+(?:word|phrase)|"
     r"secret(?:\s+(?:access\s+key|key|token))?|private\s+key"
@@ -24,6 +24,9 @@ _VALUE_BOUNDARY = re.compile(
     r"[\"']?[$a-z0-9_.-]+[\"']?\s*(?:=|:|\bis\b)"
     r"))"
 )
+# Bounded runs keep matching linear on hostile input (an unbounded "\\*"
+# backtracks quadratically); 63 backslashes covers six levels of JSON nesting.
+_ESCAPED_QUOTE = re.compile(r"\\{1,63}[\"']")
 _SENSITIVE_COMPONENTS = frozenset({
     "token", "password", "passwd", "passphrase", "pwd", "credential", "secret",
     "authorization", "cookie",
@@ -52,15 +55,18 @@ def _credential_name(value: str) -> bool:
 def _value_end(value: str, start: int) -> int:
     if start >= len(value):
         return start
-    if value.startswith(("\\\"", "\\'"), start):
-        # In once-escaped text the closing quote follows a run of escaped
-        # backslash pairs, so the run before the delimiter is a multiple of 4.
-        delimiter = value[start:start + 2]
-        search = start + 2
+    escaped = _ESCAPED_QUOTE.match(value, start)
+    if escaped:
+        # Each JSON encoding level doubles backslashes and escapes the quote, so
+        # a value opened by k backslashes + quote closes at the first such
+        # delimiter whose preceding backslash run is a multiple of 2(k+1).
+        delimiter = escaped.group()
+        modulus = 2 * len(delimiter)
+        search = escaped.end()
         while (end := value.find(delimiter, search)) >= 0:
-            backslashes = len(value[start + 2:end]) - len(value[start + 2:end].rstrip("\\"))
-            if backslashes % 4 == 0:
-                return end + 2
+            run = len(value[escaped.end():end]) - len(value[escaped.end():end].rstrip("\\"))
+            if run % modulus == 0:
+                return end + len(delimiter)
             search = end + 1
         return len(value)
     quote = value[start]

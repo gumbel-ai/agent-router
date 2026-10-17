@@ -228,6 +228,77 @@ class NativeTests(unittest.TestCase):
             self.assertIsNone(later["cost"])
             self.assertIn("rewritten", later["transcript_error"].lower())
 
+    def test_transcript_changed_during_read_is_not_cached_as_complete(self):
+        import os as real_os
+
+        def line(message_id, tokens):
+            return json.dumps({"type": "assistant", "message": {
+                "id": message_id, "model": "claude-haiku-5-5",
+                "usage": {"input_tokens": tokens, "output_tokens": tokens}}}) + "\n"
+
+        for mode in ("rewrite", "append"):
+            transcript = self.root / f"during-{mode}.jsonl"
+            transcript.write_text(line("aaa", 1))
+            record = self.event("stop", agent=f"during-{mode}", transcript=str(transcript))
+            calls = []
+            actual_fstat = real_os.fstat
+
+            def fstat(descriptor, calls=calls, mode=mode, transcript=transcript, actual_fstat=actual_fstat):
+                calls.append(None)
+                if len(calls) == 2:  # After stream.read(), before the final stat.
+                    if mode == "rewrite":
+                        with transcript.open("r+") as stream:
+                            stream.write(line("aaa", 9))
+                    else:
+                        with transcript.open("a") as stream:
+                            stream.write(line("bbb", 1))
+                    stat = transcript.stat()
+                    real_os.utime(transcript, ns=(stat.st_atime_ns, stat.st_mtime_ns + 1_000_000))
+                return actual_fstat(descriptor)
+
+            with patch("router.native.os.fstat", side_effect=fstat):
+                during = self.control.handle("status", {"task_id": record["task_id"]})
+            self.assertIsNone(during["cost"], mode)  # Incomplete, not stale-and-complete.
+            settled = self.control.handle("status", {"task_id": record["task_id"]})
+            if mode == "rewrite":
+                self.assertIsNone(settled["usage"])
+                self.assertIn("rewritten", settled["transcript_error"].lower())
+            else:
+                self.assertEqual(settled["usage"]["output_tokens"], 2)
+
+    def test_change_during_empty_read_is_not_cached_as_eof(self):
+        # Pending path: nothing new to read, but the file is rewritten between the
+        # read and the final stat. Caching that post-change metadata as EOF would let
+        # the shortcut serve stale usage forever.
+        import os as real_os
+
+        def line(tokens):
+            return json.dumps({"type": "assistant", "message": {
+                "id": "aaa", "model": "claude-haiku-5-5",
+                "usage": {"input_tokens": tokens, "output_tokens": tokens}}}) + "\n"
+
+        transcript = self.root / "quiet-rewrite.jsonl"
+        transcript.write_text(line(1))
+        record = self.event("stop", agent="quiet-rewrite", transcript=str(transcript))
+        self.control.handle("status", {"task_id": record["task_id"]})
+        stat = transcript.stat()
+        real_os.utime(transcript, ns=(stat.st_atime_ns, stat.st_mtime_ns + 1_000_000))  # Defeat the shortcut.
+        calls, actual_fstat = [], real_os.fstat
+
+        def fstat(descriptor):
+            calls.append(None)
+            if len(calls) == 2:
+                transcript.write_text(line(9))
+                changed = transcript.stat()
+                real_os.utime(transcript, ns=(changed.st_atime_ns, changed.st_mtime_ns + 2_000_000))
+            return actual_fstat(descriptor)
+
+        with patch("router.native.os.fstat", side_effect=fstat):
+            self.control.handle("status", {"task_id": record["task_id"]})
+        settled = self.control.handle("status", {"task_id": record["task_id"]})
+        self.assertIsNone(settled["usage"])
+        self.assertIn("rewritten", settled["transcript_error"].lower())
+
     def test_legacy_suffix_boundary_upgrades_without_losing_usage(self):
         import hashlib
 

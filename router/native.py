@@ -458,7 +458,7 @@ class NativeObserver:
             if len(batch) < 1_048_576:
                 return self._record_transcript_pending(
                     task_id, path, offset, revision, bool(batch),
-                    opened_file_id, final_info, boundary, reset_reason,
+                    opened_file_id, opened_info, boundary, reset_reason,
                 )
             # Bound memory and advance past an oversized line. Its usage cannot
             # be trusted, so never claim a complete usage-derived cost.
@@ -481,6 +481,10 @@ class NativeObserver:
                 events.append(event)
             else:
                 malformed_lines += 1
+        # A change between the opening stat and the final stat means the bytes
+        # just read may mix old and new content: report usage as incomplete now.
+        changed = ((opened_info.st_size, opened_info.st_mtime_ns)
+                   != (final_info.st_size, final_info.st_mtime_ns))
         with self.store.transaction() as db:
             current = self.get(task_id, db)
             if not self._refresh_is_current(current, path, offset, revision):
@@ -496,11 +500,13 @@ class NativeObserver:
                 self._mark_usage_invalid(current, reset_reason)
             current["transcript_offset"] = cursor
             current.update(skip_line=skipped and not lines and b"\n" not in batch,
-                           transcript_pending=current["transcript_offset"] < final_info.st_size,
-                           transcript_eof=current["transcript_offset"] >= final_info.st_size,
+                           transcript_pending=current["transcript_offset"] < final_info.st_size or changed,
+                           transcript_eof=current["transcript_offset"] >= final_info.st_size and not changed,
                            transcript_file_id=opened_file_id,
-                           transcript_file_size=final_info.st_size,
-                           transcript_file_mtime_ns=final_info.st_mtime_ns,
+                           # Cache metadata observed before verifying and reading,
+                           # so a change during the read fails the next EOF check.
+                           transcript_file_size=opened_info.st_size,
+                           transcript_file_mtime_ns=opened_info.st_mtime_ns,
                            transcript_boundary=boundary,
                            transcript_revision=revision + 1)
             self._clear_transient_error(current)

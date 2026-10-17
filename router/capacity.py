@@ -73,7 +73,7 @@ def _darwin_library():
 def _darwin_memory() -> tuple[int, int, int]:
     library = _darwin_library()
     host = library.mach_host_self()
-    page_size = ctypes.c_uint32()
+    page_size = ctypes.c_size_t()  # vm_size_t is pointer-sized on 64-bit macOS.
     if library.host_page_size(host, ctypes.byref(page_size)) != 0:
         raise OSError("host_page_size failed")
     statistics = _VMStatistics64()
