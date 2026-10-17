@@ -209,7 +209,7 @@ def install_codex_plugin(marketplace: str) -> None:
         try:
             failed = subprocess.run(command, stdin=subprocess.DEVNULL, capture_output=True,
                                     timeout=120, check=False).returncode != 0
-        except subprocess.TimeoutExpired:
+        except (subprocess.TimeoutExpired, OSError):  # Codex optional: never abort setup.
             failed = True
         if failed:
             print(f"Codex plugin not installed ({' '.join(command)} failed). "
@@ -228,7 +228,7 @@ def uninstall(yes: bool = False) -> None:
         try:
             removed = subprocess.run(["codex", "plugin", "remove", PLUGIN_ID], stdin=subprocess.DEVNULL,
                                      capture_output=True, timeout=120, check=False).returncode == 0
-        except subprocess.TimeoutExpired:
+        except (subprocess.TimeoutExpired, OSError):  # Codex optional: finish uninstalling.
             removed = False
         if not removed:
             print(f"Codex plugin not removed; remove it with: codex plugin remove {PLUGIN_ID}")

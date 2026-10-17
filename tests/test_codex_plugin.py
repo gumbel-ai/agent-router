@@ -53,6 +53,9 @@ class CodexPluginTests(unittest.TestCase):
         commands = {handler["command"] for groups in HOOKS["hooks"].values()
                     for group in groups for handler in group["hooks"]}
         self.assertEqual(commands, {'sh "${PLUGIN_ROOT}/router/plugin/codex/hook.sh"'})
+        # Router stamps events on receipt; background hooks could arrive out of order.
+        self.assertFalse(any(handler.get("async") for groups in HOOKS["hooks"].values()
+                             for group in groups for handler in group["hooks"]))
         self.assertTrue((ROOT / "router" / "plugin" / "codex" / "hook.sh").is_file())
         self.assertEqual(len(expected_trust(HOOKS)), len(HOOKS["hooks"]))
         # Codex caches the plugin under its manifest version; keep it tied to the package.
@@ -84,6 +87,17 @@ class CodexPluginTests(unittest.TestCase):
         self.assertEqual(self.configure(entries=trusted), "hooks_untrusted")
         retrusted = {key: {"trusted_hash": value} for key, value in expected_trust(changed).items()}
         self.assertEqual(self.configure(entries=retrusted), "ready")
+        # SemVer order, as Codex sorts it: 0.10.0 still wins over 0.10.0-beta.1 and 0.9.0.
+        self.install("0.10.0-beta.1")
+        self.assertEqual(self.configure(entries=retrusted), "ready")
+        self.install("0.11.0-beta.1")
+        self.assertEqual(self.configure(entries=retrusted), "hooks_untrusted")
+        # Every lifecycle event must keep a handler, or observation is incomplete.
+        without_end = {"hooks": {event: groups for event, groups in HOOKS["hooks"].items() if event != "SessionEnd"}}
+        for declarations in (without_end, {"hooks": {}}):
+            self.install("0.11.0-beta.1", declarations)
+            trusted_rest = {key: {"trusted_hash": value} for key, value in expected_trust(declarations).items()}
+            self.assertEqual(self.configure(entries=trusted_rest), "unknown")
         (self.home / "config.toml").write_bytes(b"\xff")
         self.assertEqual(availability(self.home)["state"], "unknown")
         (self.home / "config.toml").write_text("[plugins\n")
@@ -115,11 +129,12 @@ class CodexPluginTests(unittest.TestCase):
                              [["codex", "plugin", "marketplace", "add", "owner/repo"],
                               ["codex", "plugin", "add", PLUGIN_ID]])
             self.assertEqual("/hooks" in output.call_args.args[0], installed)
-        with patch("router.setup.shutil.which", return_value="/usr/bin/codex"), \
-                patch("router.setup.subprocess.run", side_effect=subprocess.TimeoutExpired("codex", 120)), \
-                patch("builtins.print") as output:
-            install_codex_plugin("owner/repo")
-        self.assertIn("Install it later", output.call_args.args[0])
+        for failure in (subprocess.TimeoutExpired("codex", 120), OSError("bad interpreter")):
+            with self.subTest(failure=failure), patch("router.setup.shutil.which", return_value="/usr/bin/codex"), \
+                    patch("router.setup.subprocess.run", side_effect=failure), \
+                    patch("builtins.print") as output:
+                install_codex_plugin("owner/repo")
+            self.assertIn("Install it later", output.call_args.args[0])
 
 
 if __name__ == "__main__":

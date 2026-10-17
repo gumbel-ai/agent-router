@@ -8,12 +8,15 @@ this only reports which prerequisite is missing, so an untrusted or disabled plu
 is never mistaken for an idle Codex. See docs/codex-lifecycle.md.
 """
 
+import functools
 import hashlib
 import json
 import os
 import shutil
 import tomllib
 from pathlib import Path
+
+from router.observer_hook import CODEX_EVENTS
 
 PLUGIN_ID = "agent-router@agent-router"
 PLUGIN_CACHE = ("plugins", "cache", "agent-router", "agent-router")
@@ -48,11 +51,41 @@ def hook_hash(event: str, group: dict) -> str:
     return "sha256:" + hashlib.sha256(encoded).hexdigest()
 
 
-def _version_key(version: str) -> tuple:
-    parts = version.split(".")
-    if len(parts) == 3 and all(part.isdecimal() for part in parts):
-        return (1, tuple(int(part) for part in parts), version)
-    return (0, (), version)
+def _identifiers(text: str, numeric_leading_zero_ok: bool) -> list | None:
+    parts = text.split(".")
+    for part in parts:
+        if not part or not all(c.isascii() and (c.isalnum() or c == "-") for c in part):
+            return None
+        if part.isdigit() and len(part) > 1 and part[0] == "0" and not numeric_leading_zero_ok:
+            return None
+    return [(0, int(part), "") if part.isdigit() else (1, 0, part) for part in parts]
+
+
+def _semver(version: str) -> tuple | None:
+    """SemVer 2.0 precedence key (Rust `semver::Version` order), or None if invalid."""
+    core, _, build = version.partition("+")
+    core, has_pre, pre = core.partition("-")
+    numbers = core.split(".")
+    if len(numbers) != 3 or not all(n.isascii() and n.isdigit() and (n == "0" or n[0] != "0") for n in numbers):
+        return None
+    pre_ids = _identifiers(pre, False) if has_pre else []
+    build_ids = _identifiers(build, True) if "+" in version else []
+    if pre_ids is None or build_ids is None:
+        return None
+    # A release sorts after its pre-releases; build metadata breaks remaining ties.
+    return tuple(int(n) for n in numbers), (not pre_ids, pre_ids), build_ids
+
+
+def _compare_versions(left: str, right: str) -> int:
+    """Mirror of `compare_plugin_versions`: SemVer when both parse, else lexical."""
+    keys = (_semver(left), _semver(right))
+    a, b = keys if None not in keys else (left, right)
+    return (a > b) - (a < b)
+
+
+def _valid_version_segment(version: str) -> bool:
+    return (version not in {"", ".", ".."}
+            and all(c.isascii() and (c.isalnum() or c in "-_.+") for c in version))
 
 
 def active_plugin_root(home: Path) -> Path | None:
@@ -63,14 +96,15 @@ def active_plugin_root(home: Path) -> Path | None:
     """
     base = home.joinpath(*PLUGIN_CACHE)
     try:
-        versions = [entry.name for entry in base.iterdir() if entry.is_dir()]
+        versions = [entry.name for entry in base.iterdir()
+                    if entry.is_dir() and _valid_version_segment(entry.name)]
     except FileNotFoundError:
         return None
     if not versions:
         return None
     if "local" in versions:
         return base / "local"
-    return base / max(versions, key=_version_key)
+    return base / max(versions, key=functools.cmp_to_key(_compare_versions))
 
 
 def expected_trust(declarations: dict, plugin_id: str = PLUGIN_ID, hooks_file: str = HOOKS_FILE) -> dict[str, str]:
@@ -111,8 +145,12 @@ def availability(codex_home: Path | None = None) -> dict:
     try:
         declarations = json.loads((root / HOOKS_FILE).read_text())
         trust = expected_trust(declarations)
+        missing = sorted(event for event in CODEX_EVENTS
+                         if not any(group.get("hooks") for group in declarations["hooks"].get(event) or []))
     except (OSError, ValueError, KeyError, TypeError, AttributeError) as error:
         return {"state": "unknown", "detail": f"Installed Codex plugin hooks unreadable: {error}"}
+    if missing:
+        return {"state": "unknown", "detail": "Installed Codex plugin lacks hooks for " + ", ".join(missing)}
     state = hooks.get("state", {})
     untrusted, modified, disabled = [], [], []
     for key, expected in trust.items():

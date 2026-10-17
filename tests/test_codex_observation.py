@@ -163,6 +163,26 @@ class CodexObservationTests(unittest.TestCase):
                 self.assertEqual(self.agent()["status"], "stopped")
                 self.clock = start + 2000
 
+    def test_agent_events_stamped_after_session_end_stay_stopped_until_resume(self):
+        for seen_before_end in (False, True):
+            with self.subTest(seen_before_end=seen_before_end):
+                self.control = Controller(settings(self.root / "repo"), {}, self.root / f"state-{seen_before_end}")
+                self.control.start_lifecycle_writer()
+                self.addCleanup(self.control.stop_lifecycle_writer)
+                self.hook("SessionStart", source="startup")
+                if seen_before_end:
+                    self.hook("SubagentStart", turn_id="t1", agent_id=CHILD, agent_type="default")
+                self.hook("SessionEnd", reason="other")
+                # Async hooks are stamped when they run, so these arrive later than the end.
+                for late in ("SubagentStart", "PreToolUse"):
+                    self.hook(late, turn_id="t2", agent_id=CHILD, agent_type="default", tool_name="Bash",
+                              tool_input={}, tool_use_id="exec-9")
+                    self.assertEqual(self.agent()["status"], "stopped")
+                self.hook("SessionStart", source="resume")
+                self.hook("PreToolUse", turn_id="t3", agent_id=CHILD, agent_type="default", tool_name="Bash",
+                          tool_input={}, tool_use_id="exec-10")
+                self.assertEqual(self.agent()["status"], "running")
+
     def test_child_work_finishing_after_the_root_turn_returns_the_session_to_idle(self):
         root, child = {"model": "root-model"}, {"model": "child-model", "agent_id": CHILD, "turn_id": "t2"}
         self.hook("SessionStart", source="startup", **root)

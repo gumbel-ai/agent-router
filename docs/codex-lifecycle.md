@@ -120,10 +120,11 @@ Router's `failed` agent state therefore never appears for Codex.
 - **Trust.** Every non-managed hook must be trusted against its current hash via
   Codex's `/hooks` command. Enabling a plugin does not trust its hooks, and a hook
   update changes its hash and requires re-trust. [D, S]
-- **Fail open.** Register hooks with `async: true`. Background hooks cannot block or
-  alter the session; at most eight run concurrently and unfinished ones are cancelled
-  at session end. A synchronous hook that is slow stalls the agent until its timeout
-  (600 s default). [D]
+- **Fail open, in order.** Background (`async: true`) hooks cannot block the session,
+  but they may finish in any order, and Router stamps events on receipt: a delayed
+  `PreToolUse` after `Stop` would reopen finished work. Router's Codex hooks are
+  therefore synchronous with a 2 s timeout, like its Claude observe hooks. The hook
+  always answers `{}` and measured 60-90 ms locally, so it delays but never blocks Codex. [D, V]
 - **Execution environment.** Hooks run through `$SHELL -lc` with a cleared environment
   replayed from the session snapshot. Profile scripts run on every hook, which adds
   latency and can print to stdout. The Router hook must not depend on inherited
@@ -181,8 +182,8 @@ reflects that installed copy, not Router's package.
   `Interrupt`, and whether a `resume`d session continues existing subagent threads.
   Router marks a Codex session's subagents stopped when the session ends. Live
   verification showed resume does not continue them, so they stay stopped.
-- Async hooks are stamped when they run, so a subagent hook can arrive after the
-  session's `SessionEnd` with a later timestamp. Decide from the real session whether
-  post-end subagent activity is allowed only after a later root `SessionStart`
-  (`resume`), and test both new and existing subagent records.
+- Hooks are stamped when they run, so a subagent event can still be stamped after the
+  session's `SessionEnd`. Decided: such an event leaves the agent stopped unless a later
+  root `SessionStart` (`resume`) has reopened the session (`router/native.py`), tested
+  for new and existing subagent records.
 - Capturing a session with subagents requires a persisted (non-ephemeral) session.

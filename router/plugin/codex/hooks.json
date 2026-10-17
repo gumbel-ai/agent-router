@@ -7,8 +7,7 @@
           {
             "type": "command",
             "command": "sh \"${PLUGIN_ROOT}/router/plugin/codex/hook.sh\"",
-            "timeout": 2,
-            "async": true
+            "timeout": 2
           }
         ]
       }
@@ -19,8 +18,7 @@
           {
             "type": "command",
             "command": "sh \"${PLUGIN_ROOT}/router/plugin/codex/hook.sh\"",
-            "timeout": 2,
-            "async": false
+            "timeout": 2
           }
         ]
       }
@@ -31,8 +29,7 @@
           {
             "type": "command",
             "command": "sh \"${PLUGIN_ROOT}/router/plugin/codex/hook.sh\"",
-            "timeout": 2,
-            "async": true
+            "timeout": 2
           }
         ]
       }
@@ -43,8 +40,7 @@
           {
             "type": "command",
             "command": "sh \"${PLUGIN_ROOT}/router/plugin/codex/hook.sh\"",
-            "timeout": 2,
-            "async": true
+            "timeout": 2
           }
         ]
       }
@@ -55,8 +51,7 @@
           {
             "type": "command",
             "command": "sh \"${PLUGIN_ROOT}/router/plugin/codex/hook.sh\"",
-            "timeout": 2,
-            "async": true
+            "timeout": 2
           }
         ]
       }
@@ -67,8 +62,7 @@
           {
             "type": "command",
             "command": "sh \"${PLUGIN_ROOT}/router/plugin/codex/hook.sh\"",
-            "timeout": 2,
-            "async": true
+            "timeout": 2
           }
         ]
       }
@@ -79,8 +73,7 @@
           {
             "type": "command",
             "command": "sh \"${PLUGIN_ROOT}/router/plugin/codex/hook.sh\"",
-            "timeout": 2,
-            "async": true
+            "timeout": 2
           }
         ]
       }
@@ -91,8 +84,7 @@
           {
             "type": "command",
             "command": "sh \"${PLUGIN_ROOT}/router/plugin/codex/hook.sh\"",
-            "timeout": 2,
-            "async": true
+            "timeout": 2
           }
         ]
       }
@@ -103,8 +95,7 @@
           {
             "type": "command",
             "command": "sh \"${PLUGIN_ROOT}/router/plugin/codex/hook.sh\"",
-            "timeout": 2,
-            "async": true
+            "timeout": 2
           }
         ]
       }
@@ -115,8 +106,7 @@
           {
             "type": "command",
             "command": "sh \"${PLUGIN_ROOT}/router/plugin/codex/hook.sh\"",
-            "timeout": 2,
-            "async": true
+            "timeout": 2
           }
         ]
       }

@@ -187,6 +187,18 @@ class NativeObserver:
                 "session_end_segment_started_at": None, "session_end_segment_base_duration": None,
                 "session_end_prior_state_at": None,
                 "cwd": None, "activity": None, "visibility_reason": None}
+            live_kinds = {"start", "activity", "idle", "needs_input"}
+            if source == "codex" and kind in live_kinds and session_ended_at >= 0:
+                # Async Codex hooks are stamped when they run, so an agent event can arrive after
+                # its session ended. Only a later root SessionStart (resume) makes it live again.
+                session_state = db.execute("""SELECT json_extract(data,'$.status') FROM sessions
+                        WHERE host_id=? AND source=? AND session_id=?""",
+                                           (self.host_id, source, session)).fetchone()
+                if session_state is None or session_state[0] == "stopped":
+                    at = min(at, session_ended_at)
+                elif (row and record["status"] == "stopped" and at > session_ended_at
+                      and record.get("visibility_reason") == "Codex session ended"):
+                    record["status"] = "unknown"  # Real activity in the resumed session.
             if not row and session_ended_at >= 0 and source == "codex" and at <= session_ended_at:
                 # Codex subagents end with their session; a late first event is already over.
                 record.update(status="stopped", last_observed_status="stopped", finished_at=session_ended_at,
