@@ -302,6 +302,10 @@ item before requesting review.
 - When a history map is bounded (for example the last 128 events), ordering checks
   must use every retained timestamp for that entity, not only the bounded map.
   Otherwise eviction lets a delayed event clear state that is still live.
+- When eviction makes ordering unknowable, mark the record uncertain and report its
+  totals as unknown until the next reset. Do not add a floor that rejects older
+  evidence: it silently hides real state (a waiting agent) and blocks legitimate
+  updates for entries that are still retained.
 
 **Clocks and freshness**
 

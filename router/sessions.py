@@ -25,7 +25,7 @@ WAITING_NOTIFICATIONS = frozenset({
 WAITER_CLEARING_KINDS = frozenset({
     "tool_start", "tool_end", "tool_failure", "task_created", "task_completed", "subagent_start", "subagent_stop",
 })
-MAX_WAITER_HISTORY = 256
+MAX_WAITER_HISTORY = 1024
 WAITING_REASON = "Claude is waiting for input"
 
 
@@ -121,7 +121,7 @@ class SessionObserver:
         return {agent: at for agent in legacy if isinstance(agent, str)} if isinstance(legacy, list) else {}
 
     @staticmethod
-    def _observe_waiter(record: dict, event: dict, kind: str, at: int) -> bool:
+    def _observe_waiter(record: dict, event: dict, kind: str, at: int, tool_evidence: bool = True) -> bool:
         """Order waiting state per agent, independently of the session's latest event.
 
         A needs-input notification adds its agent; that agent's later completion,
@@ -133,6 +133,8 @@ class SessionObserver:
         adds = notification in WAITING_NOTIFICATIONS
         clears = (kind in WAITER_CLEARING_KINDS
                   or (kind == "notification" and notification == "agent_completed"))
+        if kind in {"tool_start", "tool_end", "tool_failure"} and not tool_evidence:
+            clears = False  # A rejected tool event (stale or replayed) is not evidence the agent acted.
         if not adds and not clears:
             return False
         agent = event.get("agent_id")
@@ -140,25 +142,32 @@ class SessionObserver:
         waiters = SessionObserver._waiters(record)
         cleared = {name: value for name, value in (record.get("waiter_cleared_at") or {}).items()
                    if isinstance(name, str) and is_wire_integer(value)}
-        before = (dict(waiters), dict(cleared), record.get("waiter_clear_floor", -1))
-        floor = record.get("waiter_clear_floor", -1)
-        # Ties keep arrival order, as the rest of the session lifecycle does. A notice at
-        # or before the eviction floor cannot be ordered against a forgotten completion.
-        if (adds and at >= cleared.get(key, -1) and at >= record.get("tool_reset_at", -1)
-                and (key in cleared or at > floor)):
+        partial = SessionObserver._waiter_history_partial(record)
+        record.pop("waiter_clear_floor", None)
+        before = (dict(waiters), dict(cleared), partial)
+        # Ties keep arrival order, as the rest of the session lifecycle does.
+        if adds and at >= cleared.get(key, -1) and at >= record.get("tool_reset_at", -1):
             waiters[key] = max(waiters.get(key, -1), at)
         elif clears:
             if at >= waiters.get(key, -1):
                 waiters.pop(key, None)
             cleared[key] = max(cleared.get(key, -1), at)
             if len(cleared) > MAX_WAITER_HISTORY:
-                kept = sorted(cleared.items(), key=lambda item: item[1])
-                floor = max(floor, max(value for _, value in kept[:-MAX_WAITER_HISTORY]))
-                cleared = dict(kept[-MAX_WAITER_HISTORY:])
+                # Evicted completions can no longer order a delayed notice. Accept such
+                # notices rather than hiding them, and report the totals as uncertain
+                # until the next reset clears this history.
+                cleared = dict(sorted(cleared.items(), key=lambda item: item[1])[-MAX_WAITER_HISTORY:])
+                partial = True
         record.update(waiters=waiters, waiting_agents=sorted(waiters), needs_input=bool(waiters),
-                      waiter_cleared_at=cleared, waiter_clear_floor=floor)
+                      waiter_cleared_at=cleared, waiter_history_partial=partial)
         # Completion history is evidence even when no waiter changed; persist it too.
-        return (waiters, cleared, floor) != before
+        return (waiters, cleared, partial) != before
+
+    @staticmethod
+    def _waiter_history_partial(record: dict) -> bool:
+        # An earlier format kept an eviction floor instead; it means the same uncertainty.
+        floor = record.get("waiter_clear_floor")
+        return bool(record.get("waiter_history_partial")) or (is_wire_integer(floor) and floor >= 0)
 
     @staticmethod
     def _reset_waiters(record: dict, at: int) -> None:
@@ -167,8 +176,9 @@ class SessionObserver:
         # history older than it is no longer needed.
         cleared = {key: value for key, value in (record.get("waiter_cleared_at") or {}).items()
                    if is_wire_integer(value) and value > at}
+        record.pop("waiter_clear_floor", None)
         record.update(waiters=waiters, waiting_agents=sorted(waiters), needs_input=bool(waiters),
-                      waiter_cleared_at=cleared)
+                      waiter_cleared_at=cleared, waiter_history_partial=False)
 
     def observe(self, event: dict, timeout: float = 10) -> dict:
         source = event.get("source")
@@ -188,7 +198,7 @@ class SessionObserver:
             if record["status"] == "stopped" and (kind != "session_start" or at <= record["last_event_at"]):
                 return self.view(record, max(now_ms(), at))
             tool_changed, tool_state_evidence = self._observe_tool(record, event, at)
-            waiter_changed = self._observe_waiter(record, event, kind, at)
+            waiter_changed = self._observe_waiter(record, event, kind, at, tool_changed or tool_state_evidence)
             evidence_changed = tool_changed or waiter_changed
             if waiter_changed and record.get("visibility_reason") in {None, WAITING_REASON}:
                 # Keep the reason consistent with the waiters whatever the arrival order.
@@ -433,7 +443,7 @@ class SessionObserver:
         age = max(0, at - record["last_event_at"])
         result = {key: value for key, value in record.items() if key not in {
             "inflight_tools", "tool_event_at", "tool_finished_at", "waiting_agents", "waiters", "waiter_cleared_at",
-            "waiter_clear_floor",
+            "waiter_history_partial", "waiter_clear_floor",
             "tool_reset_at", "tool_active_until", "tool_overflow_until", "tool_overflow_active",
             "active_tool_times", "tool_correlation_partial", "tool_correlation_partial_until",
             "tool_terminal_floor", "tool_history_partial", "restart_uncertain_until",
@@ -460,6 +470,9 @@ class SessionObserver:
         elif correlation_partial:
             result.update(status="unknown", needs_input=False,
                           visibility_reason="Inflight tool correlation exceeded the exact tracking bound")
+        elif SessionObserver._waiter_history_partial(record) and record.get("needs_input"):
+            result.update(status="unknown", needs_input=False,
+                          visibility_reason="Waiting-state history exceeded the tracking bound")
         elif ((record["status"] in {"running", "idle"} or record.get("needs_input"))
                 and not active_tool and age > STALE_AFTER_MS):
             result.update(status="unknown", needs_input=False,
@@ -489,8 +502,12 @@ class SessionObserver:
                     (json_extract(data,'$.tool_correlation_partial')=1 AND
                      COALESCE(json_extract(data,'$.tool_correlation_partial_until'),?)>=?) OR
                     (json_extract(data,'$.status')='unknown' AND
-                     json_extract(data,'$.restart_uncertain_until')>=?))""",
-                                           (self.host_id, at, at, at, at)).fetchone()[0]
+                     json_extract(data,'$.restart_uncertain_until')>=?) OR
+                    -- Waiter history overflowed: a fresh session's waiting state is uncertain.
+                    ((json_extract(data,'$.waiter_history_partial')=1 OR
+                      COALESCE(json_extract(data,'$.waiter_clear_floor'),-1)>=0) AND
+                     json_extract(data,'$.last_event_at')>=?))""",
+                                           (self.host_id, at, at, at, at, at - STALE_AFTER_MS)).fetchone()[0]
             # One predicate, so each session counts once: fresh running/waiting
             # work, or any unexpired tool (a reordered tool_start can leave a
             # live tool under a newer, fresh "idle" status).
