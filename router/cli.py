@@ -137,6 +137,17 @@ def _fleet_alert_lines(record: dict, snapshot: dict | None = None) -> list[str]:
     return lines
 
 
+def _router_task_activity(task: dict) -> str:
+    # Conditions that need an operator come before the executor's last activity.
+    if task.get("shutdown_unconfirmed"):
+        return "shutdown unconfirmed"
+    if task.get("cleanup_failed"):
+        return "cleanup failed"
+    if task.get("status") in {"failed", "interrupted", "blocked"} and task.get("failure_reason"):
+        return task["failure_reason"]
+    return task.get("activity") or task.get("failure_reason") or "—"
+
+
 def fleet_table(result: dict, capacity_only: bool = False) -> str:
     lines = ["HOST       CAPACITY   SESSION              AGENT                STATE        ACTIVITY                 CPU    LOAD   MEM FREE DISK FREE"]
     for record in result["hosts"]:
@@ -191,7 +202,7 @@ def fleet_table(result: dict, capacity_only: bool = False) -> str:
                          f"{_cell('router:' + str(task.get('parent_session_id') or '—'), 20):<20} "
                          f"{_cell(str(task.get('executor') or '?') + ':' + str(task.get('task_id')), 20):<20} "
                          f"{_cell(task.get('status', 'unknown'), 12):<12} "
-                         f"{_cell(task.get('activity') or task.get('failure_reason') or '—', 24):<24} "
+                         f"{_cell(_router_task_activity(task), 24):<24} "
                          f"{cpu if first else '—':<6} {load if first else '—':<6} "
                          f"{memory if first else '—':<8} {disk if first else '—'}")
         lines.extend(partial_lines)

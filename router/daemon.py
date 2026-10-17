@@ -597,7 +597,8 @@ class Controller:
                      if task["status"] != "closed" or task.get("cleanup_pending") or task["updated_at"] >= cutoff]
             # Active work first, then tasks waiting on a decision, then recently finished ones.
             tasks.sort(key=lambda task: (task["status"] not in ACTIVE,
-                                         task["status"] not in DECISIONS and not task.get("shutdown_unconfirmed"),
+                                         task["status"] not in DECISIONS and not task.get("shutdown_unconfirmed")
+                                         and task.get("cleanup_error") is None,
                                          -task["updated_at"]))
             tasks = tasks[:limit]
             histories = {task["task_id"]: self.store.history(task["task_id"], db) for task in tasks}
@@ -625,6 +626,7 @@ class Controller:
                 # A clock step back can make a stored duration negative; never send that.
                 "elapsed_ms": max(0, int(elapsed)) if elapsed is not None else None,
                 "last_event_at": task["updated_at"], "cleanup_pending": view["cleanup_pending"],
+                "cleanup_failed": task.get("cleanup_error") is not None,
                 "shutdown_unconfirmed": view["shutdown_unconfirmed"],
             })
         return records

@@ -280,7 +280,7 @@ def _project_record(record: dict, allowed: frozenset[str], required: tuple[str, 
     }
     boolean_fields = {"needs_input", "runtime_partial",
                       "tool_visibility_partial", "cleanup_pending", "shutdown_unconfirmed",
-                      "parent_reference_omitted"}
+                      "parent_reference_omitted", "cleanup_failed"}
     for key in allowed & record.keys():
         value = record[key]
         if key in text_fields:
@@ -498,7 +498,8 @@ def _validate_snapshot(payload: bytes) -> dict:
         "router_tasks": frozenset({"host_id", "task_id", "status", "executor", "requested_model", "resolved_model",
                                    "attempts", "parent_session_id", "parent_agent_id", "task", "activity",
                                    "failure_reason", "created_at", "started_at", "elapsed_ms", "last_event_at",
-                                   "cleanup_pending", "shutdown_unconfirmed", "parent_reference_omitted"}),
+                                   "cleanup_pending", "cleanup_failed", "shutdown_unconfirmed",
+                                   "parent_reference_omitted"}),
         "managed_processes": frozenset({"host_id", "managed_id", "status", "label", "pid", "pgid",
                                         "started_at", "finished_at", "exit_code", "visibility_reason"}),
         "inferred_processes": frozenset({"host_id", "pid", "pgid", "status", "label", "started_at",
@@ -507,7 +508,21 @@ def _validate_snapshot(payload: bytes) -> dict:
     projected_collections = {}
     collection_projection_partial = False
     collection_projection_evidence: dict[str, tuple[int, int]] = {}
+    rejected_router_tasks = 0
     for collection, required in identity_fields.items():
+        if collection == "router_tasks":
+            # One odd Router task must not hide the host's sessions, agents, and capacity.
+            projected_collections[collection] = []
+            for record in snapshot[collection]:
+                try:
+                    if (not required_record_fields[collection].issubset(record)
+                            or record["status"] not in status_domains[collection]):
+                        raise ValueError("invalid Router task record")
+                    projected_collections[collection].append(_project_record(
+                        record, record_fields[collection], required, collection, host["host_id"]))
+                except (ValueError, TypeError):
+                    rejected_router_tasks += 1
+            continue
         for record in snapshot[collection]:
             if not required_record_fields[collection].issubset(record):
                 raise ValueError(f"Host snapshot has incomplete {collection} record")
@@ -643,6 +658,10 @@ def _validate_snapshot(payload: bytes) -> dict:
     unknown_error_count = len(set(errors) - recognized_error_sections)
     if unknown_error_count:
         projected_errors["other"] = f"{unknown_error_count} unrecognized error section(s) omitted"
+    if rejected_router_tasks:
+        projected_errors["router_tasks"] = bound_text(
+            f"{rejected_router_tasks} invalid Router task record(s) omitted"
+            + (f"; {projected_errors['router_tasks']}" if "router_tasks" in projected_errors else ""), 500)
     for section, (changed, omitted) in collection_projection_evidence.items():
         _add_projection_error(projected_errors, section, changed=changed, omitted=omitted)
     _add_projection_error(

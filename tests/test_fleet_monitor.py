@@ -2838,6 +2838,28 @@ class RouterTaskFleetTests(unittest.TestCase):
                           decision["parent_reference_omitted"]), (None, None, True))
         self.assertEqual((decision["elapsed_ms"], len(decision["task"])), (0, 240))
 
+    def test_failed_cleanup_outranks_a_newer_finished_task(self):
+        now = int(time.time() * 1000)
+        stuck = self.task("closed", at=now - 2000, cleanup_pending=True, cleanup_error="worktree busy")
+        self.task("closed", at=now - 1000)
+        self.assertEqual([task["task_id"] for task in self.control.router_task_records(1)], [stuck])
+        self.task("failed", at=now - 500, failure_reason="Executor failed", executor_activity="agent_message")
+        result = query_fleet(FleetConfig((FleetHost("here", "local"),)),
+                             local_snapshot=lambda thresholds: compose(self.control))
+        table = fleet_table(result)
+        self.assertIn("cleanup failed", table)
+        self.assertIn("Executor failed", table)
+
+    def test_one_malformed_router_task_row_is_dropped_not_the_host(self):
+        self.task("running")
+        local = compose(self.control)
+        local["router_tasks"].append({**local["router_tasks"][0], "task_id": "bad", "attempts": -1})
+        projected = _validate_snapshot(json.dumps(local).encode())
+        self.assertEqual(len(projected["router_tasks"]), 1)
+        self.assertTrue(projected["partial"])
+        self.assertIn("1 invalid Router task record(s) omitted", projected["errors"]["router_tasks"])
+        self.assertTrue(projected["sessions"] == local["sessions"] and "capacity" in projected)
+
 
 if __name__ == "__main__":
     unittest.main()
