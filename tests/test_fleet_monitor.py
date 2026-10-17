@@ -549,6 +549,28 @@ class SessionAndCapacityTests(unittest.TestCase):
                         self.assertEqual(self.observer.fleet_records(10)[1], 1)
                         self.assertEqual(self.observer.sessions()[0]["status"], "running")
 
+    def test_superseded_completions_do_not_fill_waiter_history(self):
+        from router.sessions import MAX_WAITER_HISTORY
+        base = self.now - 10_000
+        self.event("session_start", observed_at=base)
+        self.event("prompt", observed_at=base + 2000)
+        for index in range(MAX_WAITER_HISTORY + 1):  # All older than the prompt's reset.
+            self.event("subagent_stop", observed_at=base + 1 + index, agent_id=f"Y{index}")
+        with patch("router.sessions.now_ms", return_value=base + 2001):
+            self.assertEqual(self.observer.fleet_records(10)[1], 1)
+
+    def test_older_reset_does_not_clear_newer_eviction_uncertainty(self):
+        from router.sessions import MAX_WAITER_HISTORY
+        base = self.now - 10_000
+        self.event("session_start", observed_at=base)
+        for index in range(MAX_WAITER_HISTORY + 1):  # Unmatched completions at 20 overflow the history.
+            self.event("tool_end", observed_at=base + 20, tool_use_id=f"T{index}", agent_id=f"A{index}")
+        self.event("prompt", observed_at=base + 10)  # Delayed reset, older than the evicted evidence.
+        self.event("notification", observed_at=base + 15, notification_type="agent_needs_input", agent_id="A0")
+        with patch("router.sessions.now_ms", return_value=base + 21):
+            self.assertIsNone(self.observer.fleet_records(10)[1])
+            self.assertEqual(self.observer.sessions()[0]["status"], "unknown")
+
     def test_accepted_early_tool_completion_orders_the_agent_waiter(self):
         for completion in ("tool_end", "tool_failure"):
             with self.subTest(completion):

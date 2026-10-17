@@ -143,7 +143,9 @@ class SessionObserver:
         cleared = {name: value for name, value in (record.get("waiter_cleared_at") or {}).items()
                    if isinstance(name, str) and is_wire_integer(value)}
         partial = SessionObserver._waiter_history_partial(record)
-        record.pop("waiter_clear_floor", None)
+        floor = record.pop("waiter_clear_floor", None)
+        if is_wire_integer(floor):
+            record["waiter_evicted_at"] = max(record.get("waiter_evicted_at", -1), floor)
         before = (dict(waiters), dict(cleared), partial)
         # Ties keep arrival order, as the rest of the session lifecycle does.
         if adds and at >= cleared.get(key, -1) and at >= record.get("tool_reset_at", -1):
@@ -151,12 +153,18 @@ class SessionObserver:
         elif clears:
             if at >= waiters.get(key, -1):
                 waiters.pop(key, None)
-            cleared[key] = max(cleared.get(key, -1), at)
+            # A completion at or before the last reset is already superseded by it.
+            if at > record.get("tool_reset_at", -1):
+                cleared[key] = max(cleared.get(key, -1), at)
             if len(cleared) > MAX_WAITER_HISTORY:
                 # Evicted completions can no longer order a delayed notice. Accept such
                 # notices rather than hiding them, and report the totals as uncertain
-                # until the next reset clears this history.
-                cleared = dict(sorted(cleared.items(), key=lambda item: item[1])[-MAX_WAITER_HISTORY:])
+                # until a reset at or after the newest evicted completion.
+                kept = sorted(cleared.items(), key=lambda item: item[1])
+                evicted_at = max(record.get("waiter_evicted_at", -1),
+                                 max(value for _, value in kept[:-MAX_WAITER_HISTORY]))
+                record["waiter_evicted_at"] = evicted_at
+                cleared = dict(kept[-MAX_WAITER_HISTORY:])
                 partial = True
         record.update(waiters=waiters, waiting_agents=sorted(waiters), needs_input=bool(waiters),
                       waiter_cleared_at=cleared, waiter_history_partial=partial)
@@ -176,9 +184,14 @@ class SessionObserver:
         # history older than it is no longer needed.
         cleared = {key: value for key, value in (record.get("waiter_cleared_at") or {}).items()
                    if is_wire_integer(value) and value > at}
-        record.pop("waiter_clear_floor", None)
+        floor = record.pop("waiter_clear_floor", None)
+        if is_wire_integer(floor):  # The earlier format's floor was the newest evicted time.
+            record["waiter_evicted_at"] = max(record.get("waiter_evicted_at", -1), floor)
+        # Only a reset at or after the newest evicted completion supersedes it.
+        resolved = at >= record.get("waiter_evicted_at", -1)
         record.update(waiters=waiters, waiting_agents=sorted(waiters), needs_input=bool(waiters),
-                      waiter_cleared_at=cleared, waiter_history_partial=False)
+                      waiter_cleared_at=cleared,
+                      waiter_history_partial=SessionObserver._waiter_history_partial(record) and not resolved)
 
     def observe(self, event: dict, timeout: float = 10) -> dict:
         source = event.get("source")
@@ -443,7 +456,7 @@ class SessionObserver:
         age = max(0, at - record["last_event_at"])
         result = {key: value for key, value in record.items() if key not in {
             "inflight_tools", "tool_event_at", "tool_finished_at", "waiting_agents", "waiters", "waiter_cleared_at",
-            "waiter_history_partial", "waiter_clear_floor",
+            "waiter_history_partial", "waiter_clear_floor", "waiter_evicted_at",
             "tool_reset_at", "tool_active_until", "tool_overflow_until", "tool_overflow_active",
             "active_tool_times", "tool_correlation_partial", "tool_correlation_partial_until",
             "tool_terminal_floor", "tool_history_partial", "restart_uncertain_until",
