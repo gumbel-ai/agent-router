@@ -1,11 +1,10 @@
 """Claude host adapters. Prompt bodies are never sent to the router."""
 
 import json
-import re
 import sys
 
 from router.client import request
-from router.dispatch import MUTATIONS, literal_payload
+from router.dispatch import literal_payload, mutation_operation
 from router.paths import configuration, delegation_target
 
 
@@ -25,13 +24,10 @@ def submit(event: dict) -> dict:
 
 def authorize(event: dict) -> dict:
     command = event.get("tool_input", {}).get("command", "")
-    if event.get("tool_name") != "Bash" or not re.search(r"\brouter\s+(start|review|cancel|close)\b", command):
+    operation = mutation_operation(command) if event.get("tool_name") == "Bash" else None
+    if operation is None:
         return {}
     try:
-        match = re.match(r"router (start|review|cancel|close) --json ", command)
-        if not match or match[1] not in MUTATIONS:
-            raise ValueError("Use a standalone canonical router command; no pipelines or substitutions")
-        operation = match[1]
         payload = literal_payload(command, operation)
         request("authorize", {"session_id": event["session_id"], "prompt_id": event["prompt_id"],
                               "operation": operation, "invocation": payload,
