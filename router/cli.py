@@ -148,6 +148,38 @@ def _router_task_activity(task: dict) -> str:
     return task.get("activity") or task.get("failure_reason") or "—"
 
 
+def _process_summary(snapshot: dict) -> list[str]:
+    inferred = snapshot.get("inferred_processes", [])
+    if not inferred:
+        return []
+    def total(key: str, label: str, render) -> str:
+        # A missing measurement is unknown, not zero; say how many are missing.
+        values = [process[key] for process in inferred if isinstance(process.get(key), (int, float))]
+        missing = len(inferred) - len(values)
+        if not values:
+            return f"{label} unknown"
+        return f"{label} {render(sum(values))}" + (f" + {missing} unmeasured" if missing else "")
+
+    sessions = len({(process.get("source"), process.get("session_id")) for process in inferred})
+    # Totals cover the processes in this snapshot; a truncated page is flagged separately.
+    scope = " (shown only)" if "inferred_processes" in snapshot.get("errors", {}) else ""
+    cpu = total("cpu_pct", "CPU", lambda value: f"{value:.0f}%")
+    rss = total("rss_bytes", "RSS", _size)
+    return [f"{'':<10} session processes{scope}: {len(inferred)} in {sessions} session(s), {cpu}, {rss}"]
+
+
+def _managed_activity(process: dict) -> str:
+    if process.get("status") == "running":
+        return f"pid {process['pid']}" if process.get("pid") else "running"
+    if process.get("status") == "unknown" or process.get("group_outlived"):
+        return process.get("visibility_reason") or "outcome unknown"
+    if process.get("signal") is None and process.get("exit_code") is None:
+        return process.get("status") or "unknown"
+    how = f"signal {process['signal']}" if process.get("signal") else f"exit {process.get('exit_code')}"
+    elapsed = process.get("elapsed_ms")
+    return how + (f" after {elapsed / 1000:.1f}s" if isinstance(elapsed, int) else "")
+
+
 def fleet_table(result: dict, capacity_only: bool = False) -> str:
     lines = ["HOST       CAPACITY   SESSION              AGENT                STATE        ACTIVITY                 CPU    LOAD   MEM FREE DISK FREE"]
     for record in result["hosts"]:
@@ -174,9 +206,11 @@ def fleet_table(result: dict, capacity_only: bool = False) -> str:
         sessions = snapshot.get("sessions", [])
         agents = snapshot.get("agents", [])
         router_tasks = snapshot.get("router_tasks", [])
-        if not sessions and not agents and not router_tasks:
+        managed = snapshot.get("managed_processes", [])
+        if not sessions and not agents and not router_tasks and not managed:
             activity = "partial snapshot" if partial_lines else "no active sessions"
             lines.append(f"{name:<10} {state:<10} {'—':<20} {'—':<20} {'—':<12} {activity:<24} {cpu:<6} {load:<6} {memory:<8} {disk}")
+            lines.extend(_process_summary(snapshot))
             lines.extend(partial_lines)
             lines.extend(_fleet_alert_lines(record, snapshot))
             continue
@@ -205,6 +239,16 @@ def fleet_table(result: dict, capacity_only: bool = False) -> str:
                          f"{_cell(_router_task_activity(task), 24):<24} "
                          f"{cpu if first else '—':<6} {load if first else '—':<6} "
                          f"{memory if first else '—':<8} {disk if first else '—'}")
+        for index, process in enumerate(managed):
+            first = not sessions and not agents and not router_tasks and index == 0
+            lines.append(f"{name if first else '':<10} {state if first else '':<10} "
+                         f"{_cell('run:' + str(process.get('session_id') or '—'), 20):<20} "
+                         f"{_cell(process.get('label') or process.get('executable') or '?', 20):<20} "
+                         f"{_cell(process.get('status', 'unknown'), 12):<12} "
+                         f"{_cell(_managed_activity(process), 24):<24} "
+                         f"{cpu if first else '—':<6} {load if first else '—':<6} "
+                         f"{memory if first else '—':<8} {disk if first else '—'}")
+        lines.extend(_process_summary(snapshot))
         lines.extend(partial_lines)
         lines.extend(_fleet_alert_lines(record, snapshot))
     return "\n".join(lines)

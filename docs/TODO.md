@@ -209,7 +209,9 @@ PR would repeat the PR #4 review churn.
 Keep the spec's limits: no command-text capture by default, no kill or cancel, and no
 exact attribution without the wrapper.
 
-**Status:** 1 (session process sampling) merged in PR #18; 2 (`router run`) in review.
+**Status:** Implemented in PRs #18 (session process sampling), #19 (`router run`), and #21
+(alerts, fleet output, smoke test). Acceptance still needs the two-host live smoke test
+(spec §19.3), which runs with the manual Linux testing.
 
 **Done when:** the fleet spec's Milestone B outcomes are met, each PR is reviewed and
 merged separately, and PR #5 is closed with a pointer to the series.

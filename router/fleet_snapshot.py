@@ -81,11 +81,27 @@ def capacity_alerts(host: dict, capacity: dict, thresholds: CapacityThresholds,
 
 def alerts(host: dict, capacity: dict, sessions: list[dict], agents: list[dict],
            thresholds: CapacityThresholds, limit: int,
-           observed_at: int | None = None) -> list[dict]:
+           observed_at: int | None = None, managed: list[dict] | None = None) -> list[dict]:
     result = capacity_alerts(host, capacity, thresholds, observed_at)
     if len(result) >= limit:
         return result[:limit]
     host_id = host["host_id"]
+    # Managed outcomes come before per-session alerts so a burst of those cannot crowd them out.
+    for record in managed or []:
+        if not record.get("managed_id"):
+            continue
+        entity = {"managed_id": record["managed_id"]}
+        name = record.get("label") or record.get("executable") or record["managed_id"]
+        if record.get("status") in {"failed", "signaled"}:
+            how = (f"signal {record['signal']}" if record.get("signal") else f"exit code {record.get('exit_code')}")
+            result.append(_alert(host_id, "managed_process_failed", "warning", f"{name} ended with {how}",
+                                 entity, record.get("finished_at"), observed_at))
+        if record.get("status") == "unknown" or record.get("group_outlived"):
+            result.append(_alert(host_id, "managed_process_shutdown_uncertain", "warning",
+                                 record.get("visibility_reason") or f"{name} may still be running",
+                                 entity, record.get("uncertain_at") or record.get("finished_at"), observed_at))
+        if len(result) >= limit:
+            return result[:limit]
     for record in sessions + agents:
         entity = {key: record[key] for key in ("source", "session_id", "parent_session_id", "agent_id") if record.get(key)}
         if record.get("needs_input") or record.get("status") == "needs_input":
@@ -258,14 +274,14 @@ def compose(controller, thresholds: CapacityThresholds | None = None, history_li
         interval_seconds = getattr(controller.capacity, "interval_seconds", 5)
         state, reasons = classify(capacity, thresholds, interval_seconds * 3000)
         capacity.update(capacity_state=state, capacity_reasons=reasons)
-    if any(key in snapshot.get("errors", {}) for key in ("sessions", "agents")):
+    if any(key in snapshot.get("errors", {}) for key in ("sessions", "agents", "managed_processes")):
         # Alert-worthy records sort first, but a truncated or failed page can
         # still omit some; say so rather than implying the alert list is whole.
         snapshot["partial"] = True
-        snapshot["errors"]["alerts"] = "Alerts derived from incomplete session or agent records"
+        snapshot["errors"]["alerts"] = "Alerts derived from incomplete session, agent, or managed process records"
     _collection(snapshot, "alerts", lambda limit: alerts(
         snapshot["host"], snapshot["capacity"], sessions, agents, thresholds, limit,
-        generated_at), MAX_ALERTS, "alert_limit")
+        generated_at, snapshot["managed_processes"]), MAX_ALERTS, "alert_limit")
     if hasattr(controller, "alert_history"):
         snapshot["alerts"] = controller.alert_history.track(snapshot["alerts"])
     return bound(snapshot)
@@ -285,9 +301,21 @@ def bound(snapshot: dict, maximum_bytes: int = MAX_SNAPSHOT_BYTES) -> dict:
     result["partial"] = True
     result.setdefault("errors", {})["output"] = "Snapshot truncated to configured one MiB bound"
     for key in ("tasks", "router_tasks", "inferred_processes", "managed_processes", "agents", "sessions", "alerts"):
-        values = list(result.get(key, []))
-        while values and len(canonical({**result, key: values}).encode()) > maximum_bytes:
+        if key not in result:
+            continue
+        original = list(result[key])
+        # Name a shortened section, so its totals read as covering only what is shown; the note
+        # itself counts toward the bound.
+        noted = {**result["errors"], key: result["errors"].get(key, "Collection truncated to the one MiB snapshot bound")}
+
+        values = original
+        while values:
+            errors = result["errors"] if len(values) == len(original) else noted
+            if len(canonical({**result, key: values, "errors": errors}).encode()) <= maximum_bytes:
+                break
             values = values[:len(values) // 2]
+        if len(values) < len(original):
+            result["errors"] = noted
         result[key] = values
     # Fixed metadata should remain far below the limit; guard malformed producers.
     if len(json.dumps(result, separators=(",", ":")).encode()) > maximum_bytes:

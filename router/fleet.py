@@ -265,7 +265,7 @@ def _project_record(record: dict, allowed: frozenset[str], required: tuple[str, 
     nonnegative_integer_fields = {
         "started_at", "last_event_at", "finished_at", "duration_ms", "observation_age_ms",
         "elapsed_ms", "inflight_tool_count", "created_at", "completed_at", "attempts", "rss_bytes",
-        "argument_count", "max_process_rss_bytes", "signal",
+        "argument_count", "max_process_rss_bytes", "signal", "uncertain_at",
     }
     boolean_fields = {"needs_input", "runtime_partial",
                       "tool_visibility_partial", "cleanup_pending", "shutdown_unconfirmed",
@@ -477,7 +477,7 @@ def _validate_snapshot(payload: bytes) -> dict:
                                         "started_at", "finished_at", "exit_code", "visibility_reason",
                                         "attribution", "session_id", "agent_id", "executable",
                                         "argument_count", "cwd", "elapsed_ms", "signal",
-                                        "max_process_rss_bytes", "group_outlived"}),
+                                        "max_process_rss_bytes", "group_outlived", "uncertain_at"}),
         "inferred_processes": frozenset({"host_id", "pid", "pgid", "status", "label", "started_at",
                                          "visibility_reason", "attribution", "source", "session_id",
                                          "cpu_pct", "rss_bytes"}),
@@ -525,7 +525,7 @@ def _validate_snapshot(payload: bytes) -> dict:
             truncated_sections.append(collection)
     projected_alerts = []
     alert_entity_fields = frozenset({
-        "source", "session_id", "parent_session_id", "agent_id", "task_id", "configured_host",
+        "source", "session_id", "parent_session_id", "agent_id", "task_id", "configured_host", "managed_id",
     })
     for alert in snapshot["alerts"]:
         alert_id = _wire_identity(alert.get("alert_id"), "alert identity", required=True)

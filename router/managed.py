@@ -314,12 +314,14 @@ class ManagedProcesses:
         """
         self.reconcile()
         cutoff = _now() - RECENT_MS
-        hidden = {"wrapper_pid", "wrapper_identity", "uncertain_at"}
+        hidden = {"wrapper_pid", "wrapper_identity"}
         with self.store.snapshot() as db:  # The page and the count describe one database state.
             rows = [json.loads(row[0]) for row in db.execute("""SELECT data FROM managed_processes
                     WHERE json_extract(data,'$.status')='running'
                        OR COALESCE(json_extract(data,'$.finished_at'), json_extract(data,'$.uncertain_at'))>=?
-                    ORDER BY json_extract(data,'$.status')!='running',
+                    ORDER BY CASE WHEN json_extract(data,'$.status') IN ('failed','signaled','unknown')
+                                        OR json_extract(data,'$.group_outlived')=1 THEN 0
+                                   WHEN json_extract(data,'$.status')='running' THEN 1 ELSE 2 END,
                              json_extract(data,'$.started_at') DESC LIMIT ?""", (cutoff, limit))]
             running, uncertain = db.execute("""SELECT
                     SUM(json_extract(data,'$.status')='running'),

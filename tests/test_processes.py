@@ -97,6 +97,19 @@ class SamplerTests(unittest.TestCase):
         trimmed = bound({"schema_version": 1, "partial": False, "inferred_processes": [record] * 1000})
         self.assertTrue(trimmed["partial"])
         self.assertLess(len(trimmed["inferred_processes"]), 1000)
+        # The shortened section is named, so the fleet summary reads as covering only what is shown.
+        self.assertIn("one MiB", trimmed["errors"]["inferred_processes"])
+        from router.cli import fleet_table
+        table = fleet_table({"hosts": [{"name": "h", "ok": True, "snapshot": {**trimmed, "capacity": {}}}]})
+        self.assertIn("session processes (shown only):", table)
+        # Across the boundary where the truncation note itself tips the size, the result always fits.
+        for count in range(1, 80):
+            for padding in range(0, 60, 7):
+                value = {"schema_version": 1, "partial": False, "errors": {},
+                         "inferred_processes": [{"pid": index, "label": "x" * padding} for index in range(count)]}
+                with self.subTest(count=count, padding=padding):
+                    self.assertLessEqual(len(json.dumps(bound(value, maximum_bytes=900),
+                                                        separators=(",", ":")).encode()), 900)
 
     def test_cpu_percent_comes_from_the_change_since_the_previous_sample(self):
         samples = iter([{10: process(10, 1, cpu_ns=0)}, {10: process(10, 1, cpu_ns=500_000_000)}])
