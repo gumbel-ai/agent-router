@@ -1,0 +1,189 @@
+# Code Review Process
+
+This process is mandatory for changes that span multiple layers, alter persisted state,
+handle untrusted input, or affect lifecycle, capacity, concurrency, or operator-visible
+status. A passing test suite alone is not evidence that such a change is complete.
+
+## Why This Exists
+
+Milestone A was declared ready before it had been reviewed end to end. Later reviews
+found real defects in redaction boundaries, fleet-level capacity reclassification,
+out-of-order lifecycle events, active totals, partial-state rendering, and database
+snapshot consistency. A later review cycle then found additional defects in shutdown
+ownership, transport deadlines, remote-schema projection, privacy boundaries, numeric
+validation, duplicate identity handling, and restart semantics.
+
+The failure was not simply a lack of tests. The initial review validated components in
+isolation and trusted existing tests even when they encoded incorrect behavior. It did
+not consistently follow data through every production layer or challenge timing,
+truncation, restart, malformed-input, and concurrency boundaries.
+
+Not every subsequent review comment represented a distinct production defect, but the
+number of valid findings showed that the initial completion claim was unjustified.
+Repeated findings in one subsystem are evidence of a missed invariant, not merely a
+queue of isolated lines to patch.
+
+## Required Review Sequence
+
+### 1. Define verifiable completion criteria
+
+Before implementation, translate the request into observable checks. Include:
+
+- expected behavior and explicit non-goals;
+- affected inputs, persisted records, APIs, and operator-visible outputs;
+- failure behavior for unavailable, malformed, stale, or partial data;
+- commands or tests that will prove completion.
+
+Do not add speculative behavior merely to make the design appear comprehensive.
+
+### 2. Trace every contract end to end
+
+For each new or changed field, state, route, or relation, inspect all applicable stages:
+
+1. source or definition;
+2. input normalization and validation;
+3. construction and state transitions;
+4. persistence and migration behavior;
+5. serialization and transport;
+6. aggregation or reclassification;
+7. rendering or downstream consumption;
+8. tests at both component and production-path levels.
+
+A lower layer being correct is insufficient if an earlier layer transforms its input or
+a later layer overwrites its result.
+
+### 3. Build an adversarial boundary matrix
+
+Review every applicable dimension, not only the happy path:
+
+| Dimension | Required questions |
+| --- | --- |
+| Missing or malformed data | Is it rejected or explicitly reported as unknown/partial? Can a fallback hide the failure? |
+| Time and freshness | What happens exactly at, before, and after each threshold? Does collection latency change the answer? |
+| Ordering | Can delayed, duplicated, or out-of-order events reopen terminal state or overwrite newer evidence? |
+| Restart | What remains visible, what becomes uncertain, and what evidence resolves that uncertainty? |
+| Bounds and truncation | Is sensitive data transformed safely before truncation? Are totals independent of display limits? |
+| Concurrency | Can related reads observe different database snapshots? Are writes idempotent and monotonic? |
+| Partial failure | Does one failed host or section remain isolated? Is degraded output visibly marked? |
+| Security | Can secrets survive quoting, multiline input, alternate token formats, logs, errors, or preprocessing? |
+| Output safety | Are terminal controls, oversized values, and hostile remote payloads bounded and sanitized? |
+
+If a dimension does not apply, note why rather than silently skipping it.
+
+### 4. Review invariants, not individual comments
+
+For every valid finding:
+
+1. name the violated invariant in plain language;
+2. find every producer, transformation, consumer, state transition, and sibling input
+   governed by that invariant;
+3. build a variant matrix covering those paths and failure modes;
+4. fix the invariant at the correct abstraction boundary;
+5. verify the original reproduction and the sibling variants.
+
+Do not close a finding with a one-branch condition, regex, or narrow regression test
+until the surrounding variants have been checked. After a second valid finding in the
+same subsystem, stop patching comments sequentially and perform an invariant-wide
+audit of that subsystem.
+
+Examples of invariants that require system-wide checks:
+
+- unknown, partial, malformed, or contradictory evidence must never become healthy or
+  available through a later reclassification;
+- a terminal or newer state must not be reopened by delayed or same-time events;
+- accepted work must have durable or bounded ownership through shutdown;
+- timeout and cancellation paths must remain bounded, including cleanup after a kill;
+- remote data must be projected onto an explicit local schema; unknown fields must not
+  be forwarded merely because they arrived inside a known object;
+- values used in arithmetic or JSON output must be finite and bounded;
+- truncation must remain visibly partial and must not change aggregate truth;
+- identifiers, errors, reservations, summaries, and nested fields must cross the same
+  privacy and output-safety boundary as primary payloads.
+
+### 5. Test semantics, not the current implementation
+
+- Treat a surprising existing assertion as a hypothesis, not authority.
+- A test count is not quality evidence. Challenge tests that preserve current behavior
+  when that behavior conflicts with the contract.
+- Add regression tests for every behavior-changing fix.
+- Exercise the real production entry point when preprocessing or integration layers exist.
+- Test both sides of thresholds and length boundaries.
+- Include concurrency tests when consistency depends on transactions or snapshots.
+- Verify negative behavior: stale or unknown records must not be counted as active, and
+  malformed data must not be reported as available or healthy.
+- Add composition tests where independently reasonable behaviors interact. Applicable
+  combinations include reordered events plus restart, partial sections plus
+  reclassification, slow transport plus freshness, contention plus shutdown, hostile
+  nested wire fields plus serialization, and concurrent file or process state.
+
+### 6. Make the review scope match the claim
+
+A targeted review supports only a targeted claim. Before claiming that a change or PR
+is ready, reviewers must inspect the full current diff, including all uncommitted fixes,
+against the actual merge base. A verdict on an older commit or smaller diff does not
+cover later overlapping changes.
+
+For substantial or high-risk changes, run independent correctness, security, testing,
+reliability, API-contract, and project-standards reviews after implementation. Include
+an adversarial review for code involving concurrency, lifecycle state, persistence,
+untrusted wire data, or process control. Reviewers must inspect the current filesystem
+and cite concrete code or runtime evidence. Treat their advice as hypotheses until it
+is reproduced or otherwise verified.
+
+After addressing findings, ask the relevant reviewers to re-review the updated code.
+Any new actionable finding invalidates the affected clean verdict. Rerun the relevant
+reviewers on the updated full diff rather than reviewing only the latest patch.
+
+### 7. Verify the final state
+
+Before committing or pushing:
+
+- run focused tests for changed behavior;
+- run the full test suite;
+- run the repository lint and formatting checks;
+- run `git diff --check`;
+- inspect the final diff for unrelated changes and temporary scaffolding;
+- confirm every accepted review finding has a test or other reproducible verification;
+- confirm the working tree contains only intended changes.
+
+For concurrency, timeouts, ordering, or race fixes, repeat the focused regression enough
+times to exercise scheduling variance. A single successful run is insufficient evidence
+for a nondeterministic boundary.
+
+If a check has a known pre-existing failure, identify it precisely and prove the current
+change did not introduce it. Do not describe a partially skipped check as fully passing.
+
+### 8. Close the review loop
+
+For each external review finding:
+
+1. classify it as accepted, rejected, or already addressed;
+2. record the evidence for that decision;
+3. implement accepted fixes and add regression coverage;
+4. rerun the semantic review and verification gates;
+5. perform a fresh full-diff review after all accepted fixes;
+6. push only after the local review has no unresolved actionable findings;
+7. reply to and resolve addressed review threads;
+8. request another external review when the workflow or user requires it.
+
+## Completion Standard
+
+Do not say a change is complete, safe, clean, or ready merely because tests pass.
+A completion claim requires all of the following:
+
+- the requested behavior is implemented without expanding scope;
+- relevant contracts have been traced end to end;
+- applicable adversarial boundaries have been exercised;
+- focused and full verification pass, with exceptions stated accurately;
+- the required independent reviews have no unresolved actionable findings on the
+  current full diff;
+- the final diff has been inspected and contains no unrelated work.
+
+Do not use a local commit as evidence of readiness. If a high-risk change must be saved
+before these gates pass, label it explicitly as a checkpoint rather than a completed
+implementation.
+
+Do not say `clean`, `ready`, or `code complete` while a specification-mandated live or
+integration check remains pending. Use precise language such as: “Automated checks pass;
+the two-host live verification is still pending.” When any evidence is incomplete, state
+exactly what remains unverified.
