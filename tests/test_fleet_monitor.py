@@ -482,6 +482,145 @@ class SessionAndCapacityTests(unittest.TestCase):
             self.assertEqual(self.observer.sessions()[0]["status"], "unknown")
             self.assertEqual(native.snapshot()[0]["status"], "unknown")
 
+    def test_waiting_state_is_ordered_per_agent_not_per_session(self):
+        base = self.now - 10_000  # Whole timeline in the past (process rule 5b).
+
+        def notice(agent, offset, kind="agent_needs_input"):
+            return self.event("notification", observed_at=base + offset, notification_type=kind, agent_id=agent)
+
+        cases = {
+            # The deferred PR #4 finding: a delayed completion for A arrives after B's newer notice.
+            "delayed completion for another agent": (
+                [("A", 1, "agent_needs_input"), ("B", 3, "agent_needs_input"),
+                 ("A", 2, "agent_completed"), ("B", 4, "agent_completed")], False),
+            "delayed completion older than the same agent's newer notice": (
+                [("A", 5, "agent_needs_input"), ("A", 2, "agent_completed")], True),
+            "delayed notice older than the agent's completion": (
+                [("A", 4, "agent_completed"), ("A", 2, "agent_needs_input")], False),
+            # A completion that clears nothing is still evidence and must be kept.
+            "completion recorded before its notice arrives": (
+                [("B", 4, "agent_completed"), ("A", 3, "agent_completed"), ("A", 2, "agent_needs_input")], False),
+            # A delayed notice must set the waiting reason as an in-order one would.
+            "delayed session-level notice": ([("A", 10, "agent_completed"), (None, 5, "permission_prompt")], True),
+        }
+        for name, (events, waiting) in cases.items():
+            with self.subTest(name):
+                self.store = Store(Path(tempfile.mkdtemp(dir=self.temp.name)) / "router.sqlite3", "host")
+                self.observer = SessionObserver(self.store, "host")
+                self.event("session_start", observed_at=base)
+                for agent, offset, kind in events:
+                    result = notice(agent, offset, kind)
+                self.assertEqual(result["needs_input"], waiting)
+                session = self.observer.sessions()[0]
+                self.assertEqual(session["needs_input"], waiting)
+                self.assertEqual(session["visibility_reason"] == "Claude is waiting for input", waiting)
+                self.assertEqual(self.observer.fleet_records(10)[1], 1 if waiting else 0)
+
+    def test_waiter_history_overflow_reports_uncertainty_instead_of_guessing(self):
+        from router.sessions import MAX_WAITER_HISTORY
+        base = self.now - 10_000
+        # The subagent events keep the session running, so the exact total is 1.
+        for others, waiting, exact in ((MAX_WAITER_HISTORY - 1, False, 1), (MAX_WAITER_HISTORY, True, None)):
+            with self.subTest(others=others):
+                self.store = Store(Path(tempfile.mkdtemp(dir=self.temp.name)) / "router.sqlite3", "host")
+                self.observer = SessionObserver(self.store, "host")
+                self.event("session_start", observed_at=base)
+                self.event("notification", observed_at=base + 10, notification_type="agent_needs_input", agent_id="X")
+                self.event("notification", observed_at=base + 20, notification_type="agent_completed", agent_id="X")
+                for index in range(others):
+                    self.event("subagent_start", observed_at=base + 30 + index, agent_id=f"Y{index}")
+                # X's delayed notice is rejected while its completion is retained; once the
+                # history overflows it is accepted and the active total is reported unknown.
+                late = self.event("notification", observed_at=base + 15,
+                                  notification_type="agent_needs_input", agent_id="X")
+                # Accepted after overflow, but shown as uncertain rather than a confirmed wait.
+                self.assertFalse(late["needs_input"])
+                self.assertEqual(late["status"] == "unknown", waiting)
+                with patch("router.sessions.now_ms", return_value=base + 30 + others):
+                    self.assertEqual(self.observer.fleet_records(10)[1], exact)
+                if waiting:
+                    # The session itself shows the uncertainty, not a confirmed wait.
+                    with patch("router.sessions.now_ms", return_value=base + 30 + others):
+                        session = self.observer.sessions()[0]
+                    self.assertEqual((session["status"], session["needs_input"]), ("unknown", False))
+                    self.assertIn("tracking bound", session["visibility_reason"])
+                    self.event("prompt", observed_at=base + 40 + others)  # A reset resolves it.
+                    with patch("router.sessions.now_ms", return_value=base + 41 + others):
+                        self.assertEqual(self.observer.fleet_records(10)[1], 1)
+                        self.assertEqual(self.observer.sessions()[0]["status"], "running")
+
+    def test_superseded_completions_do_not_fill_waiter_history(self):
+        from router.sessions import MAX_WAITER_HISTORY
+        base = self.now - 10_000
+        self.event("session_start", observed_at=base)
+        self.event("prompt", observed_at=base + 2000)
+        for index in range(MAX_WAITER_HISTORY + 1):  # All older than the prompt's reset.
+            self.event("subagent_stop", observed_at=base + 1 + index, agent_id=f"Y{index}")
+        with patch("router.sessions.now_ms", return_value=base + 2001):
+            self.assertEqual(self.observer.fleet_records(10)[1], 1)
+
+    def test_older_reset_does_not_clear_newer_eviction_uncertainty(self):
+        from router.sessions import MAX_WAITER_HISTORY
+        base = self.now - 10_000
+        self.event("session_start", observed_at=base)
+        for index in range(MAX_WAITER_HISTORY + 1):  # Unmatched completions at 20 overflow the history.
+            self.event("tool_end", observed_at=base + 20, tool_use_id=f"T{index}", agent_id=f"A{index}")
+        self.event("prompt", observed_at=base + 10)  # Delayed reset, older than the evicted evidence.
+        self.event("notification", observed_at=base + 15, notification_type="agent_needs_input", agent_id="A0")
+        with patch("router.sessions.now_ms", return_value=base + 21):
+            self.assertIsNone(self.observer.fleet_records(10)[1])
+            self.assertEqual(self.observer.sessions()[0]["status"], "unknown")
+
+    def test_accepted_early_tool_completion_orders_the_agent_waiter(self):
+        for completion in ("tool_end", "tool_failure"):
+            with self.subTest(completion):
+                self.store = Store(Path(tempfile.mkdtemp(dir=self.temp.name)) / "router.sqlite3", "host")
+                self.observer = SessionObserver(self.store, "host")
+                base = self.now - 10_000
+                self.event("session_start", observed_at=base)
+                self.event(completion, observed_at=base + 4, tool_use_id="T", agent_id="A")  # Before its start.
+                self.event("notification", observed_at=base + 6, notification_type="agent_completed", agent_id="B")
+                self.event("notification", observed_at=base + 2, notification_type="agent_needs_input", agent_id="A")
+                self.event("tool_start", observed_at=base + 1, tool_use_id="T", agent_id="A", activity="Bash")
+                self.assertFalse(self.observer.sessions()[0]["needs_input"])
+                with patch("router.sessions.now_ms", return_value=base + 7):
+                    self.assertEqual(self.observer.fleet_records(10)[1], 0)
+
+    def test_pushed_eviction_floor_format_upgrades_to_uncertainty(self):
+        base = self.now - 10_000
+        self.event("session_start", observed_at=base)
+        with self.store.transaction() as db:
+            record = self.observer._session(db, "claude", "S", base)
+            record.pop("waiter_history_partial", None)
+            record.update(waiter_cleared_at={}, waiter_clear_floor=base + 20)  # X's completion was evicted.
+            self.observer._put_session(db, record)
+        late = self.event("notification", observed_at=base + 15, notification_type="agent_needs_input", agent_id="X")
+        self.assertTrue(late["needs_input"] is False and late["status"] == "unknown", late)
+        self.assertNotIn("waiter_clear_floor", late)
+        with patch("router.sessions.now_ms", return_value=base + 16):
+            self.assertIsNone(self.observer.fleet_records(10)[1])
+
+    def test_rejected_tool_replay_does_not_clear_a_waiter(self):
+        base = self.now - 10_000
+        self.event("session_start", observed_at=base)
+        self.event("tool_start", observed_at=base + 5, tool_use_id="T", agent_id="A", activity="Bash")
+        self.event("tool_end", observed_at=base + 10, tool_use_id="T", agent_id="A")
+        self.event("notification", observed_at=base + 10, notification_type="agent_needs_input", agent_id="A")
+        replay = self.event("tool_start", observed_at=base + 10, tool_use_id="T", agent_id="A", activity="Bash")
+        self.assertTrue(replay["needs_input"])
+
+    def test_legacy_waiting_list_is_still_cleared_per_agent(self):
+        self.event("session_start")
+        with self.store.transaction() as db:
+            record = self.observer._session(db, "claude", "S", self.now)
+            record.pop("waiters", None)
+            record.update(waiting_agents=["A", "B"], needs_input=True)
+            self.observer._put_session(db, record)
+        one_left = self.event("notification", observed_at=self.now + 1, notification_type="agent_completed", agent_id="A")
+        self.assertTrue(one_left["needs_input"])  # B, migrated from the legacy list, still waits.
+        none_left = self.event("notification", observed_at=self.now + 2, notification_type="agent_completed", agent_id="B")
+        self.assertFalse(none_left["needs_input"])
+
     def test_agent_completion_clears_only_the_matching_waiting_state(self):
         self.event("session_start")
         self.event("notification", observed_at=self.now + 1, notification_type="agent_needs_input", agent_id="A")
