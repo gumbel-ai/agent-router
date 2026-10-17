@@ -49,14 +49,25 @@ class DispatchTests(unittest.TestCase):
             'eval "router review --json {}"': "review",
             "git status": None,
             "router status --json": None,
-            "my-router start": None,
+            "my-router start": "start",  # Conservative, as the previous matcher was.
+            "router_tool start": None,
+            "echo $'it\\'s'; eval 'router start --json {}'": "start",
+            "unset c; ${c:-router start} --json '{}'": "start",
+            "router \\\nstart --json '{}'": "start",
             "echo 'unbalanced router start": "start",  # Unparseable text falls back to plain words.
             "cat <<'EOF'\nit's\nEOF\nrouter start --json '{}'": "start",
             "echo $'it\\'s'; router start --json '{}'": "start",
             "curl http://h/p#x && router start --json '{}'": "start",
+            "echo $'it\\'s';router start --json '{}'": "start",
+            "cat <<'EOF'\nit's\nEOF\ntrue;router start --json '{}'": "start",
+            "router start$(printf '') --json '{}'": "start",
             "printf '%s\\n' value#; router start --json '{}'": "start",
             "router start --json '{}'\nprintf '%s\\n' '": "start",  # Runs before the later parse error.
         }
+        nested = "router start --json {}"
+        for _ in range(8):
+            nested = shlex.join(["eval", nested])
+        cases[nested] = "start"
         for command, expected in cases.items():
             with self.subTest(command=command):
                 self.assertEqual(mutation_operation(command), expected)

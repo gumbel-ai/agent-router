@@ -1,43 +1,27 @@
 """The deliberately narrow shell dispatch contract."""
 
+import itertools
 import json
 import shlex
-from pathlib import PurePath
 
 MUTATIONS = {"start", "review", "cancel", "close"}
-# Shell text nested inside words (bash -c, eval, quoted substitutions) is re-parsed this deep.
-MAX_NESTED_SHELL_DEPTH = 4
 
 
-def _shell_words(command: str) -> list[str]:
-    """POSIX shell words, with control operators and substitution delimiters split out."""
-    lexer = shlex.shlex(command, posix=True, punctuation_chars="();<>|&`")
-    lexer.whitespace_split = True
-    lexer.commenters = ""  # Bash starts comments only at word starts; keep every word visible.
-    return list(lexer)
+def mutation_operation(command: str) -> str | None:
+    """Return the Router mutation a command's text could invoke, else None.
 
-
-def mutation_operation(command: str, depth: int = 0) -> str | None:
-    """Return the Router mutation a shell command would invoke anywhere, else None.
-
-    Words are re-parsed as shell text so commands hidden in `bash -c '...'`, `eval`, or a
-    quoted `$(...)` are still found. Shell text shlex cannot read (heredoc bodies, `$'...'`)
-    falls back to whitespace-separated words, so a mutation beside it is still found.
+    Deliberately conservative: any `router` word directly followed by a mutation word,
+    whatever shell syntax surrounds them (quotes, substitutions, eval, heredocs, expansions),
+    is reported so the hook sends the command through the canonical check. Parsing shell
+    to find only executed words cannot be done safely without a shell.
     """
     if not isinstance(command, str):
         raise TypeError("Shell command must be text")
-    try:
-        words = _shell_words(command)
-    except ValueError:
-        words = command.split()
-    for index, word in enumerate(words):
-        following = words[index + 1] if index + 1 < len(words) else None
-        if PurePath(word).name == "router" and following in MUTATIONS:
+    words = "".join(character if character.isalnum() or character == "_" else " "
+                    for character in command).split()
+    for word, following in itertools.pairwise(words):
+        if word == "router" and following in MUTATIONS:
             return following
-        if depth < MAX_NESTED_SHELL_DEPTH and word != command:
-            nested = mutation_operation(word, depth + 1)
-            if nested is not None:
-                return nested
     return None
 
 
