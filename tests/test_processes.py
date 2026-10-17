@@ -83,6 +83,21 @@ class SamplerTests(unittest.TestCase):
             self.assertNotIn(os.getpid(), sample())
         self.assertIn(os.getpid(), sample())
 
+    def test_exited_children_awaiting_reaping_are_not_running_processes(self):
+        child = subprocess.Popen([sys.executable, "-c", "pass"])
+        self.addCleanup(child.wait)
+        deadline = time.monotonic() + 10
+        while child.pid in sample() and time.monotonic() < deadline:
+            time.sleep(0.02)  # Exited but deliberately not reaped yet: a zombie.
+        self.assertNotIn(child.pid, sample())
+
+    def test_oversized_process_lists_are_trimmed_not_fatal(self):
+        from router.fleet_snapshot import bound
+        record = {"host_id": "h", "pid": 2, "session_id": "\u00e9" * 240, "status": "running"}
+        trimmed = bound({"schema_version": 1, "partial": False, "inferred_processes": [record] * 1000})
+        self.assertTrue(trimmed["partial"])
+        self.assertLess(len(trimmed["inferred_processes"]), 1000)
+
     def test_cpu_percent_comes_from_the_change_since_the_previous_sample(self):
         samples = iter([{10: process(10, 1, cpu_ns=0)}, {10: process(10, 1, cpu_ns=500_000_000)}])
         sessions = SessionProcesses(sampler=lambda: next(samples))

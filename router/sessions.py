@@ -236,7 +236,7 @@ class SessionObserver:
                 return
         chain = event.get("process_ancestors")
         if not (isinstance(chain, list) and 0 < len(chain) <= MAX_PROCESS_ANCESTORS and all(
-                isinstance(entry, list) and len(entry) == 2 and is_wire_integer(entry[0]) and entry[0] > 1
+                isinstance(entry, list) and len(entry) == 2 and is_wire_integer(entry[0], minimum=1)
                 and isinstance(entry[1], str) and 0 < len(entry[1]) <= 120 for entry in chain)):
             return
         previous = record.get("process_chain") or []

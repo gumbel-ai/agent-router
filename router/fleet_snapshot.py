@@ -278,7 +278,7 @@ def bound(snapshot: dict, maximum_bytes: int = MAX_SNAPSHOT_BYTES) -> dict:
     result = dict(snapshot)
     result["partial"] = True
     result.setdefault("errors", {})["output"] = "Snapshot truncated to configured one MiB bound"
-    for key in ("tasks", "router_tasks", "agents", "sessions", "alerts"):
+    for key in ("tasks", "router_tasks", "inferred_processes", "agents", "sessions", "alerts"):
         values = list(result.get(key, []))
         while values and len(canonical({**result, key: values}).encode()) > maximum_bytes:
             values = values[:len(values) // 2]

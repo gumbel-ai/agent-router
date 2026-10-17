@@ -31,6 +31,8 @@ def _linux_stat(pid: int) -> dict:
     if opening <= 0 or closing <= opening:
         raise ValueError("Malformed Linux process stat")
     fields = raw[closing + 1:].split()
+    if fields[0] in {"Z", "X", "x"}:
+        raise ProcessLookupError(f"Process {pid} has exited")  # Zombie or dead: not running.
     return {"pid": pid, "ppid": int(fields[1]), "pgid": int(fields[2]),
             "cpu_ticks": int(fields[11]) + int(fields[12]), "start_ticks": int(fields[19]),
             "executable": raw[opening + 1:closing]}
@@ -95,12 +97,14 @@ def ancestry() -> list[list]:
     """[[pid, identity], ...] for this process's nearest ancestors, nearest first."""
     chain = []
     pid = os.getppid()
-    while pid > 1 and len(chain) < MAX_ANCESTORS:
+    while pid >= 1 and len(chain) < MAX_ANCESTORS:  # PID 1 can be the agent in a container.
         try:
             parent, identity = parent_and_identity(pid)
         except (OSError, ValueError, IndexError):
             break  # Unreadable ancestors (other users, hidepid, exited) are outside the session.
         chain.append([pid, identity])
+        if pid == 1:
+            break
         pid = parent
     return chain
 
@@ -151,6 +155,8 @@ def sample() -> dict[int, dict]:
             try:
                 info = _darwin_bsd(lib, pid)
             except OSError:
+                continue
+            if info.status == 5:  # SZOMB: exited, not yet reaped.
                 continue
             if lib.proc_pidinfo(pid, 4, 0, ctypes.byref(task), ctypes.sizeof(task)) != ctypes.sizeof(task):
                 continue
