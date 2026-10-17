@@ -576,6 +576,9 @@ def _validate_snapshot(payload: bytes) -> dict:
         if key in projected_capacity and projected_capacity[key] is not None:
             projected_capacity[key] = _wire_text(projected_capacity[key], f"capacity {key}",
                                                  500 if key == "error" else 240)
+    if capacity.get("error") is not None and not projected_capacity.get("error"):
+        # A reported failure stays a failure even if its text was only control characters.
+        projected_capacity["error"] = "Capacity error reported without printable text"
     if projected_capacity.get("capacity_reasons") is not None:
         projected_capacity["capacity_reasons"] = [
             _wire_text(reason, "capacity reason", 500, True) for reason in projected_capacity["capacity_reasons"]
@@ -586,7 +589,7 @@ def _validate_snapshot(payload: bytes) -> dict:
         raise TypeError("Host snapshot has invalid errors")
     recognized_error_sections = {
         "host", "sessions", "agents", "tasks", "router_tasks", "managed_processes", "inferred_processes",
-        "capacity", "alerts", "lifecycle", "lifecycle_consistency", "output", "projection",
+        "capacity", "alerts", "lifecycle", "lifecycle_consistency", "output",
         "session_active_count", "agent_active_count", "managed_process_active_count",
     }
     for key, value in errors.items():

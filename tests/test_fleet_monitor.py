@@ -1205,6 +1205,11 @@ class SnapshotAndFleetTests(unittest.TestCase):
         display_only["sessions"][0]["unknown_display_field"] = "omitted"
         display_projection = _validate_snapshot(json.dumps(display_only).encode())
         self.assertFalse(display_projection["partial"])
+        unprintable = snapshot()
+        unprintable["capacity"]["error"] = "\x1b[31m\u200b"
+        unprintable_projection = _validate_snapshot(json.dumps(unprintable).encode())
+        self.assertTrue(unprintable_projection["partial"])
+        self.assertEqual(unprintable_projection["capacity"]["capacity_state"], "unknown")
         self.assertNotIn("unknown_display_field", display_projection["sessions"][0])
         self.assertFalse(display_projection["capacity"].get("partial", False))
         fleet_projection = query_fleet(
@@ -1347,6 +1352,7 @@ class SnapshotAndFleetTests(unittest.TestCase):
         self.assertTrue(projected["partial"])
         self.assertTrue(projected["capacity"]["partial"])
         self.assertEqual(projected["capacity"]["capacity_state"], "unknown")
+        self.assertNotIn("future_metric", projected["capacity"])
         self.assertIn("managed_processes", projected["errors"])
         self.assertIn("inferred_processes", projected["errors"])
 
