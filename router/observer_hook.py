@@ -3,7 +3,6 @@
 import json
 import sys
 import time
-from pathlib import Path
 
 from router.client import request
 from router.sanitize import bound_text, strip_terminal_sequences
@@ -52,14 +51,10 @@ def observe(event: dict) -> dict:
                            "teammate_name": event.get("teammate_name"), "agent_id": event.get("agent_id")}
     payload = {"source": "claude", "session_id": event.get("session_id"), "observed_at": at,
                "agent_id": event.get("agent_id"), "agent_type": event.get("agent_type"), "cwd": event.get("cwd")}
-    main_transcript = event.get("transcript_path")
     if name == "SessionEnd":
         payload["kind"] = "session_end"
     elif name in {"SubagentStart", "SubagentStop"}:
         payload["kind"] = "start" if name == "SubagentStart" else "stop"
-        if name == "SubagentStop":
-            payload["summary"] = bounded_text(event.get("last_assistant_message"), 800)
-            payload["transcript"] = event.get("agent_transcript_path")
     elif name == "PostToolUse" and tool in {"Agent", "Task"} and isinstance(response, dict) and response.get("agentId"):
         asynchronous = response.get("isAsync") is True or response.get("status") == "async_launched"
         payload.update(kind="launch" if asynchronous else "result", agent_id=response["agentId"],
@@ -67,11 +62,8 @@ def observe(event: dict) -> dict:
                        task=bounded_text(inputs.get("description"), 240),
                        agent_type=inputs.get("subagent_type"), requested_model=inputs.get("model"),
                        resolved_model=response.get("resolvedModel"))
-        if isinstance(response.get("costUSD"), (int, float)):
-            payload["cost"] = response["costUSD"]
     elif name in {"PreToolUse", "PostToolUse", "PostToolUseFailure"} and payload["agent_id"]:
-        payload.update(kind="activity", activity=bounded_text(tool, 240),
-                       file_path=bounded_text(inputs.get("file_path"), 2000))
+        payload.update(kind="activity", activity=bounded_text(tool, 240))
     elif name == "TeammateIdle" and payload["agent_id"]:
         payload.update(kind="idle", activity="teammate idle")
     elif name == "Notification" and payload["agent_id"] and event.get("notification_type") == "agent_needs_input":
@@ -82,9 +74,6 @@ def observe(event: dict) -> dict:
         payload.update(kind="failed", failure_reason="Claude reported that the agent turn failed")
     else:
         payload = None
-    if payload and payload["agent_id"] and isinstance(main_transcript, str) and not payload.get("transcript"):
-        parent = Path(main_transcript)
-        payload["transcript"] = str(parent.parent / parent.stem / "subagents" / f"agent-{payload['agent_id']}.jsonl")
     try:
         result = request("lifecycle_observe", {"session": session_payload, "native": payload}, timeout=.05)
         rejected = result.get("accepted") is False

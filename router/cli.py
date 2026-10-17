@@ -32,7 +32,9 @@ def table(rows: list[dict]) -> str:
         model = _cell(row.get("resolved_model") or "unknown", 24)
         elapsed = row.get("elapsed_ms")
         duration = f"{elapsed / 1000:.1f}s" if elapsed is not None else "unknown"
-        cost = f"{row['cost']:.6f}" if row.get("cost") is not None else "unknown"
+        # Native agents carry no usage or cost; Langfuse owns that.
+        cost = ("n/a" if row.get("control_mode") == "observe"
+                else f"{row['cost']:.6f}" if row.get("cost") is not None else "unknown")
         lines.append(f"{task_id:<43} {owner:<17} {state:<17} {model:<24} {duration:<10} {cost}")
         lines.append(f"  parent {text(row.get('parent_session_id')) or 'unknown'}/{text(row.get('parent_agent_id')) or 'unknown'}"
                      f" | work: {text(row.get('task')) or 'unknown'}")

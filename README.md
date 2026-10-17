@@ -14,7 +14,7 @@ Delegate coding tasks to another agent while the parent stays in control.
 - Let the parent inspect, request corrections, accept, or discard the work.
 - Continue corrections in the same child session, preserving context.
 - Track tasks durably and prevent duplicate launches on request retries.
-- See who started each agent, its model, elapsed time, activity, tokens, and estimated cost.
+- See who started each agent, its model, elapsed time, and activity, plus tokens and estimated cost for Router-launched children. Use Langfuse for content, per-call usage, and cost of native Claude Code and Codex sessions.
 - Set limits on concurrency, runtime, and correction attempts.
 - Preserve partial work when a child fails or times out.
 - Integrate reviewed changes explicitly and stop on patch conflicts.
