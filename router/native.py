@@ -187,7 +187,12 @@ class NativeObserver:
                 "session_end_segment_started_at": None, "session_end_segment_base_duration": None,
                 "session_end_prior_state_at": None,
                 "cwd": None, "activity": None, "visibility_reason": None}
-            if not row and session_ended_at >= 0:
+            if not row and session_ended_at >= 0 and source == "codex" and at <= session_ended_at:
+                # Codex subagents end with their session; a late first event is already over.
+                record.update(status="stopped", last_observed_status="stopped", finished_at=session_ended_at,
+                              state_at=session_ended_at, last_event_at=session_ended_at,
+                              session_ended_at=session_ended_at, visibility_reason="Codex session ended")
+            elif not row and session_ended_at >= 0:
                 record.update(
                     state_at=session_ended_at,
                     last_event_at=session_ended_at,
@@ -197,6 +202,8 @@ class NativeObserver:
                 )
             terminal_metadata_only = record["status"] in {"stopped", "failed"} and kind in {"launch", "result"}
             if record["status"] in {"stopped", "failed"} and kind not in {"start", "launch", "result"}:
+                if not row:
+                    self.put(db, record)  # A row first created as terminal must still be stored.
                 return self.view(record)
             metadata_can_replace = at >= (record["last_event_at"] or -1)
             if event.get("parent_agent_id") is not None:

@@ -180,6 +180,9 @@ the current implementation.
   slice can silently test a different case, such as a terminated value instead of a
   truncated one.
 - Make the marker you assert against unique. `"swor"` also matches `"password"`.
+- Set the value under test explicitly in every event that carries it. A fixture default
+  (for example a model name in a payload helper) silently overrides it and can make a
+  correct fix look broken or a broken one look correct.
 
 ### 5b. Keep tests deterministic
 

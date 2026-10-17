@@ -147,6 +147,39 @@ class CodexObservationTests(unittest.TestCase):
         with patch("router.sessions.now_ms", return_value=self.clock + 1):
             self.assertEqual(self.control.sessions.fleet_records(10)[1], 0)
 
+    def test_late_subagent_events_after_session_end_are_stopped_in_either_order(self):
+        for late in ("SubagentStart", "PreToolUse", "SubagentStop", "PermissionRequest"):
+            with self.subTest(late):
+                self.control = Controller(settings(self.root / "repo"), {}, self.root / f"state-{late}")
+                self.control.start_lifecycle_writer()
+                self.addCleanup(self.control.stop_lifecycle_writer)
+                start = self.clock
+                self.hook("SessionStart", source="startup")
+                self.clock = start + 1000
+                self.hook("SessionEnd", reason="other")
+                self.clock = start + 100  # Delivered after the end, but timestamped before it.
+                self.hook(late, turn_id="t2", agent_id=CHILD, agent_type="default", tool_name="Bash",
+                          tool_input={}, tool_use_id="exec-9")
+                self.assertEqual(self.agent()["status"], "stopped")
+                self.clock = start + 2000
+
+    def test_child_work_finishing_after_the_root_turn_returns_the_session_to_idle(self):
+        root, child = {"model": "root-model"}, {"model": "child-model", "agent_id": CHILD, "turn_id": "t2"}
+        self.hook("SessionStart", source="startup", **root)
+        self.hook("UserPromptSubmit", turn_id="t1", prompt=CONTENT, **root)
+        self.hook("SubagentStart", agent_type="default", **child)
+        self.hook("Stop", turn_id="t1", last_assistant_message=CONTENT, stop_hook_active=False, **root)
+        self.hook("PreToolUse", tool_name="Bash", tool_input={}, tool_use_id="exec-5", **child)
+        self.assertEqual(self.session()["status"], "running")  # The child is still working.
+        self.hook("PostToolUse", tool_name="Bash", tool_input={}, tool_response="", tool_use_id="exec-5", **child)
+        self.hook("SubagentStop", agent_type="default", last_assistant_message=CONTENT,
+                  stop_hook_active=False, **child)
+        session = self.session()
+        self.assertEqual((session["status"], session["model"]), ("idle", "root-model"))
+        self.assertEqual(self.agent()["resolved_model"], "child-model")
+        with patch("router.sessions.now_ms", return_value=self.clock + 1):
+            self.assertEqual(self.control.sessions.fleet_records(10)[1], 0)
+
     def test_status_and_fleet_tables_label_the_source(self):
         self.hook("SessionStart", source="startup")
         self.hook("SubagentStart", turn_id="t2", agent_id=CHILD, agent_type="default")
@@ -161,6 +194,19 @@ class CodexObservationTests(unittest.TestCase):
         self.assertNotIn("No observed sessions", rendered)
         self.assertEqual(sessions_table([]), "No observed sessions.")
 
+    def test_hook_entry_point_forwards_codex_source(self):
+        sent = []
+
+        def capture(operation, body, timeout):
+            sent.append(body)
+            return {"accepted": True}
+
+        with patch("sys.stdin", io.StringIO(json.dumps(payload("SessionStart", source="startup")))), \
+                patch("sys.argv", ["router-observe", "--source", "codex"]), \
+                patch("router.observer_hook.request", side_effect=capture), redirect_stdout(io.StringIO()):
+            observer_hook.main()
+        self.assertEqual(sent[0]["session"]["source"], "codex")
+
     def test_hook_entry_point_always_answers_and_never_raises(self):
         for stdin in ("not json", "[]", json.dumps(payload("PreCompact", trigger="auto"))):
             with self.subTest(stdin=stdin[:20]), patch("sys.stdin", io.StringIO(stdin)), \
@@ -170,6 +216,13 @@ class CodexObservationTests(unittest.TestCase):
                 with redirect_stdout(output):
                     observer_hook.main()
                 self.assertEqual(output.getvalue().strip(), "{}")
+        # Deeply nested input can exhaust the parser's recursion limit on smaller stacks.
+        with patch("router.observer_hook.json.load", side_effect=RecursionError), \
+                patch("sys.argv", ["router-observe", "--source", "codex"]):
+            output = io.StringIO()
+            with redirect_stdout(output):
+                observer_hook.main()
+            self.assertEqual(output.getvalue().strip(), "{}")
 
 
 if __name__ == "__main__":

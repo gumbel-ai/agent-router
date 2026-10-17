@@ -131,7 +131,9 @@ def observe_codex(event: dict) -> dict:
     at = int(time.time() * 1000)
     base = {"source": "codex", "session_id": event.get("session_id"), "observed_at": at}
     tool = bounded_text(event.get("tool_name"), 240)
-    session_payload = {**base, "kind": session_kind, "cwd": event.get("cwd"), "model": event.get("model"),
+    session_payload = {**base, "kind": session_kind, "cwd": event.get("cwd"),
+                       # The session model is the root's; subagent models go on their own records.
+                       "model": event.get("model") if agent is None else None,
                        "agent_id": agent, "tool_use_id": event.get("tool_use_id"), "activity": tool}
     if name == "SessionStart":
         session_payload["start_source"] = event.get("source")
@@ -156,7 +158,7 @@ def main() -> None:
             event = json.load(sys.stdin)
             if isinstance(event, dict):
                 observe_codex(event)
-        except (ValueError, KeyError, TypeError, OSError) as error:
+        except (ValueError, KeyError, TypeError, OSError, RecursionError) as error:
             print(f"Agent Router observation unavailable: {error}", file=sys.stderr)
         print("{}")  # Codex accepts an empty JSON object as a no-op on every event.
         return
@@ -172,7 +174,7 @@ def main() -> None:
             print(json.dumps(observe(event)))
         else:
             print("{}")
-    except (ValueError, KeyError, TypeError, OSError) as error:
+    except (ValueError, KeyError, TypeError, OSError, RecursionError) as error:
         print(f"Agent Router observation unavailable: {error}", file=sys.stderr)
         print("{}")
 

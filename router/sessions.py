@@ -278,8 +278,11 @@ class SessionObserver:
                 waiting = record["needs_input"]
                 if kind == "subagent_stop" and source == "codex":
                     # Codex fires this at the end of every subagent turn; it is not evidence
-                    # that the root session resumed, so its status is left unchanged.
-                    record.update(activity=activity, visibility_reason=WAITING_REASON if waiting else None)
+                    # that the root session resumed. If the root turn already ended and no
+                    # tool is live, the remaining child work is done and the session is idle.
+                    done = record.get("root_turn_open") is False and not self._has_active_tool(record, at)
+                    record.update(activity=activity, visibility_reason=WAITING_REASON if waiting else None,
+                                  **({"status": "idle"} if done else {}))
                 else:
                     record.update(status="running", finished_at=None, activity=activity, needs_input=waiting,
                                   visibility_reason=WAITING_REASON if waiting else None)
@@ -324,6 +327,10 @@ class SessionObserver:
                 record["activity"] = "teammate idle"
             else:
                 raise ValueError("Unsupported session observation")
+            if kind in {"session_start", "prompt"}:
+                record["root_turn_open"] = True
+            elif kind in {"stop", "stop_failure", "session_end"}:
+                record["root_turn_open"] = False
             if kind in {"session_start", "session_end", "prompt", "stop", "stop_failure"}:
                 record["tool_reset_at"] = max(record.get("tool_reset_at", -1), at)
             self._put_session(db, record)
@@ -469,7 +476,7 @@ class SessionObserver:
         age = max(0, at - record["last_event_at"])
         result = {key: value for key, value in record.items() if key not in {
             "inflight_tools", "tool_event_at", "tool_finished_at", "waiting_agents", "waiters", "waiter_cleared_at",
-            "waiter_history_partial", "waiter_clear_floor", "waiter_evicted_at",
+            "waiter_history_partial", "waiter_clear_floor", "waiter_evicted_at", "root_turn_open",
             "tool_reset_at", "tool_active_until", "tool_overflow_until", "tool_overflow_active",
             "active_tool_times", "tool_correlation_partial", "tool_correlation_partial_until",
             "tool_terminal_floor", "tool_history_partial", "restart_uncertain_until",
