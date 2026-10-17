@@ -201,13 +201,19 @@ def compose(controller, thresholds: CapacityThresholds | None = None, history_li
                     record[field] = None
     sessions = snapshot["sessions"]
     agents = snapshot["agents"]
+    if hasattr(controller, "managed"):
+        active_managed = _observed_collection(
+            snapshot, "managed_processes", controller.managed.records, history_limit,
+            "managed_process_active_count",
+        )
+    else:
+        snapshot["managed_processes"], active_managed = [], 0
     _section(snapshot, "capacity", lambda: controller.capacity.view(
         thresholds,
         active_claude_sessions=active_sessions,
         active_agents=active_agents,
-        active_managed_processes=0,
+        active_managed_processes=active_managed,
     ), {})
-    snapshot["managed_processes"] = []
     if hasattr(controller, "inferred_process_records"):
         _collection(snapshot, "inferred_processes", controller.inferred_process_records, history_limit)
     else:

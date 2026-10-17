@@ -209,7 +209,7 @@ PR would repeat the PR #4 review churn.
 Keep the spec's limits: no command-text capture by default, no kill or cancel, and no
 exact attribution without the wrapper.
 
-**Status:** 1 (session process sampling and `session` attribution) in progress.
+**Status:** 1 (session process sampling, PR #18) and 2 (`router run`) in progress.
 
 **Done when:** the fleet spec's Milestone B outcomes are met, each PR is reviewed and
 merged separately, and PR #5 is closed with a pointer to the series.

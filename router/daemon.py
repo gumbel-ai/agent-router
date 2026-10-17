@@ -24,6 +24,7 @@ from router.db import Store, now_ms
 from router.dispatch import MUTATIONS, canonical
 from router.fleet_snapshot import AlertHistory
 from router.host import HostIdentity
+from router.managed import ManagedProcesses
 from router.native import NativeObserver, identifier, safe_text
 from router.process import (
     UncertainProcess,
@@ -148,6 +149,7 @@ class Controller:
         self.native = NativeObserver(self.store, self.host.host_id)
         self.sessions = SessionObserver(self.store, self.host.host_id)
         self.session_processes = SessionProcesses()
+        self.managed = ManagedProcesses(self.store, self.host.host_id, self.directory)
         self.capacity = CapacitySampler(self.directory)
         self.alert_history = AlertHistory()
         self.lifecycle_queue: queue.Queue[tuple[dict, threading.Event, dict] | None] = queue.Queue(maxsize=1024)
@@ -331,6 +333,10 @@ class Controller:
             return {"version": version("agent-router"), "state_dir": str(self.directory),
                     "delegation_enabled": self.settings.delegation_enabled,
                     "active_tasks": self.busy()}
+        if operation == "managed_start":
+            return self.managed.start(payload)
+        if operation == "managed_finish":
+            return self.managed.finish(payload)
         if operation == "observe":
             return self._observe_lifecycle_direct(self.native, payload)
         if operation == "session_observe":

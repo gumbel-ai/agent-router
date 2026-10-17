@@ -259,16 +259,18 @@ def _project_record(record: dict, allowed: frozenset[str], required: tuple[str, 
         "status", "cwd", "model", "coordinator_role", "visibility_reason", "activity",
         "last_event", "task", "agent_type", "requested_model", "resolved_model", "model_source",
         "executor", "owner", "control_mode", "subject", "teammate_name", "failure_reason", "label",
-        "command", "worktree", "last_observed_status", "managed_id", "attribution",
+        "command", "worktree", "last_observed_status", "managed_id", "attribution", "executable",
+        "argument_hash",
     }
     positive_integer_fields = {"pid", "pgid"}
     nonnegative_integer_fields = {
         "started_at", "last_event_at", "finished_at", "duration_ms", "observation_age_ms",
         "elapsed_ms", "inflight_tool_count", "created_at", "completed_at", "attempts", "rss_bytes",
+        "argument_count", "peak_rss_bytes", "signal",
     }
     boolean_fields = {"needs_input", "runtime_partial",
                       "tool_visibility_partial", "cleanup_pending", "shutdown_unconfirmed",
-                      "parent_reference_omitted", "cleanup_failed"}
+                      "parent_reference_omitted", "cleanup_failed", "shutdown_uncertain"}
     for key in allowed & record.keys():
         value = record[key]
         if key in text_fields:
@@ -470,7 +472,10 @@ def _validate_snapshot(payload: bytes) -> dict:
                                    "cleanup_pending", "cleanup_failed", "shutdown_unconfirmed",
                                    "parent_reference_omitted"}),
         "managed_processes": frozenset({"host_id", "managed_id", "status", "label", "pid", "pgid",
-                                        "started_at", "finished_at", "exit_code", "visibility_reason"}),
+                                        "started_at", "finished_at", "exit_code", "visibility_reason",
+                                        "attribution", "session_id", "agent_id", "executable",
+                                        "argument_count", "argument_hash", "cwd", "elapsed_ms", "signal",
+                                        "peak_rss_bytes", "shutdown_uncertain"}),
         "inferred_processes": frozenset({"host_id", "pid", "pgid", "status", "label", "started_at",
                                          "visibility_reason", "attribution", "source", "session_id",
                                          "cpu_pct", "rss_bytes"}),
