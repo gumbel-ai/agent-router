@@ -50,11 +50,18 @@ class DispatchTests(unittest.TestCase):
             "git status": None,
             "router status --json": None,
             "my-router start": None,
-            "echo 'unbalanced router start": None,  # The shell cannot run it either.
+            "echo 'unbalanced router start": "start",  # Unparseable text falls back to plain words.
+            "cat <<'EOF'\nit's\nEOF\nrouter start --json '{}'": "start",
+            "echo $'it\\'s'; router start --json '{}'": "start",
+            "curl http://h/p#x && router start --json '{}'": "start",
+            "printf '%s\\n' value#; router start --json '{}'": "start",
+            "router start --json '{}'\nprintf '%s\\n' '": "start",  # Runs before the later parse error.
         }
         for command, expected in cases.items():
             with self.subTest(command=command):
                 self.assertEqual(mutation_operation(command), expected)
+        with self.assertRaises(TypeError):
+            mutation_operation(None)
         # A found mutation is allowed only as the standalone canonical form.
         self.assertEqual(literal_payload("router review --json '{}'", "review"), {})
         for command in ("cd repo && router start --json '{}'", "bash -c 'router start --json {}'",

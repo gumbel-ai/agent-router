@@ -13,6 +13,7 @@ def _shell_words(command: str) -> list[str]:
     """POSIX shell words, with control operators and substitution delimiters split out."""
     lexer = shlex.shlex(command, posix=True, punctuation_chars="();<>|&`")
     lexer.whitespace_split = True
+    lexer.commenters = ""  # Bash starts comments only at word starts; keep every word visible.
     return list(lexer)
 
 
@@ -20,12 +21,15 @@ def mutation_operation(command: str, depth: int = 0) -> str | None:
     """Return the Router mutation a shell command would invoke anywhere, else None.
 
     Words are re-parsed as shell text so commands hidden in `bash -c '...'`, `eval`, or a
-    quoted `$(...)` are still found. Text that does not parse cannot run as written.
+    quoted `$(...)` are still found. Shell text shlex cannot read (heredoc bodies, `$'...'`)
+    falls back to whitespace-separated words, so a mutation beside it is still found.
     """
+    if not isinstance(command, str):
+        raise TypeError("Shell command must be text")
     try:
         words = _shell_words(command)
     except ValueError:
-        return None
+        words = command.split()
     for index, word in enumerate(words):
         following = words[index + 1] if index + 1 < len(words) else None
         if PurePath(word).name == "router" and following in MUTATIONS:
