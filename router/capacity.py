@@ -11,7 +11,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
-from router.redaction import redact_secrets
+from router.sanitize import bound_text
 from router.validation import is_wire_integer
 
 GIB = 1024**3
@@ -81,7 +81,8 @@ def _darwin_memory() -> tuple[int, int, int]:
     if library.host_statistics64(host, 4, ctypes.byref(statistics), ctypes.byref(count)) != 0:
         raise OSError("host_statistics64 failed")
     total = os.sysconf("SC_PHYS_PAGES") * page_size.value
-    available = (statistics.free_count + statistics.inactive_count + statistics.speculative_count) * page_size.value
+    # free_count already includes speculative pages (vm_stat subtracts them back out).
+    available = (statistics.free_count + statistics.inactive_count) * page_size.value
     swap = _SwapUsage()
     size = ctypes.c_size_t(ctypes.sizeof(swap))
     if library.sysctlbyname(b"vm.swapusage", ctypes.byref(swap), ctypes.byref(size), None, 0) != 0:
@@ -167,7 +168,7 @@ def classify(sample: dict, thresholds: CapacityThresholds, stale_after_ms: float
         available_reasons.append(f"available disk {disk_gib:.1f} GiB is below {thresholds.minimum_disk_available_gib:.1f} GiB")
     if sample.get("reservation_active"):
         available_reasons.append(
-            f"reserved by {redact_secrets(sample['reserved_by'], 240)} until {sample['reserved_until']}"
+            f"reserved by {bound_text(sample['reserved_by'], 240)} until {sample['reserved_until']}"
         )
     active_reasons = []
     for field, label in (("active_claude_sessions", "Claude sessions"),
@@ -314,17 +315,17 @@ class CapacitySampler:
         sample.update({"active_claude_sessions": 0, "active_agents": 0,
                        "active_managed_processes": 0}, **counts)
         if sample.get("error") is not None:
-            sample["error"] = redact_secrets(str(sample["error"]), 500)
+            sample["error"] = bound_text(str(sample["error"]), 500)
         try:
             reservation = self.reservations.read(reservation_at)
             for field in ("reserved_by", "reservation_source"):
                 if reservation.get(field) is not None:
-                    reservation[field] = redact_secrets(reservation[field], 240)
+                    reservation[field] = bound_text(reservation[field], 240)
             sample.update(reservation)
         except (OSError, ValueError) as error:
             sample.update({field: None for field in RESERVATION_FIELDS})
             sample.update(reservation_active=False, partial=True,
-                          error=redact_secrets(str(error), 500),
+                          error=bound_text(str(error), 500),
                           capacity_state="unknown",
                           capacity_reasons=["reservation data unavailable"])
             return sample

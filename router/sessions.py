@@ -11,7 +11,7 @@ from router.native import (
     safe_text,
     text,
 )
-from router.redaction import redact_structure
+from router.sanitize import sanitize_structure
 from router.validation import MAX_WIRE_INTEGER, is_wire_integer
 
 RECENT_HISTORY_MS = 300_000
@@ -31,6 +31,12 @@ class SessionObserver:
             for row in db.execute("SELECT data FROM sessions WHERE host_id=? AND source='claude'", (self.host_id,)):
                 record = json.loads(row[0])
                 if record["status"] in {"running", "idle"} or record.get("needs_input"):
+                    # Work that would still count as active is unresolved, not stopped:
+                    # until fresh evidence or this deadline, capacity cannot be exact.
+                    deadlines = [(record.get("last_event_at") or 0) + STALE_AFTER_MS]
+                    if is_wire_integer(record.get("tool_active_until")):
+                        deadlines.append(record["tool_active_until"])
+                    record["restart_uncertain_until"] = min(MAX_WIRE_INTEGER, max(deadlines))
                     record.update(status="unknown", needs_input=False,
                                   visibility_reason="Router restarted; awaiting session lifecycle evidence",
                                   inflight_tools=[], tool_event_at={}, tool_finished_at={}, waiting_agents=[],
@@ -234,9 +240,13 @@ class SessionObserver:
         if event["kind"] == "tool_start" and at <= record.get("tool_reset_at", -1):
             return False, False
         event_times = dict(record.get("tool_event_at", {}))
-        if at < event_times.get(tool_use_id, -1):
-            return False, False
         finished_times = dict(record.get("tool_finished_at", {}))
+        # tool_event_at is bounded to 128 entries; a long-running tool's start may
+        # be evicted from it while active_tool_times still holds it. Order against
+        # every retained timestamp so a delayed event cannot clear newer state.
+        if at < max(event_times.get(tool_use_id, -1), finished_times.get(tool_use_id, -1),
+                    SessionObserver._active_tool_times(record).get(tool_use_id, -1)):
+            return False, False
         if event["kind"] == "tool_start" and at <= finished_times.get(tool_use_id, -1):
             return False, False
         if (event["kind"] == "tool_start"
@@ -359,9 +369,9 @@ class SessionObserver:
             "inflight_tools", "tool_event_at", "tool_finished_at", "waiting_agents",
             "tool_reset_at", "tool_active_until", "tool_overflow_until", "tool_overflow_active",
             "active_tool_times", "tool_correlation_partial", "tool_correlation_partial_until",
-            "tool_terminal_floor", "tool_history_partial",
+            "tool_terminal_floor", "tool_history_partial", "restart_uncertain_until",
         }}
-        result = redact_structure(result)
+        result = sanitize_structure(result)
         clock_rollback = record["last_event_at"] > at
         result["observation_age_ms"] = age
         active_times = record.get("active_tool_times")
@@ -410,8 +420,10 @@ class SessionObserver:
                     json_extract(data,'$.last_event_at')>? OR
                     json_extract(data,'$.tool_overflow_active')=1 OR
                     (json_extract(data,'$.tool_correlation_partial')=1 AND
-                     COALESCE(json_extract(data,'$.tool_correlation_partial_until'),?)>=?))""",
-                                           (self.host_id, at, at, at)).fetchone()[0]
+                     COALESCE(json_extract(data,'$.tool_correlation_partial_until'),?)>=?) OR
+                    (json_extract(data,'$.status')='unknown' AND
+                     json_extract(data,'$.restart_uncertain_until')>=?))""",
+                                           (self.host_id, at, at, at, at)).fetchone()[0]
             # One predicate, so each session counts once: fresh running/waiting
             # work, or any unexpired tool (a reordered tool_start can leave a
             # live tool under a newer, fresh "idle" status).
@@ -442,4 +454,4 @@ class SessionObserver:
         for key in ("host_id", "source", "session_id", "task_id", "agent_id"):
             if record.get(key) is not None:
                 identifier(record[key], key)
-        return redact_structure(record)
+        return sanitize_structure(record)

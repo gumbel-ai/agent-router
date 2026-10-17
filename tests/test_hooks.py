@@ -148,49 +148,7 @@ class HookTests(TransportHarness, unittest.TestCase):
             observe({"hook_event_name": "SubagentStart", "session_id": "S", "agent_id": "A"})
         self.assertEqual(calls, ["lifecycle_observe", "observe"])
 
-    def test_observer_redacts_task_metadata_before_bounding_hook_payload(self):
-        requests = []
-        secret = "x" * 217 + " https://user:swordfish@example.com"
-
-        def send(operation, payload, timeout):
-            requests.append((operation, payload))
-            return {"accepted": True}
-
-        with patch("router.observer_hook.request", side_effect=send):
-            observe({"hook_event_name": "TaskCreated", "session_id": "S",
-                     "task_id": "T", "task_subject": secret})
-            observe({"hook_event_name": "PostToolUse", "session_id": "S", "tool_name": "Agent",
-                     "tool_input": {"description": secret},
-                     "tool_response": {"agentId": "A", "isAsync": True}})
-            observe({"hook_event_name": "SubagentStop", "session_id": "S", "agent_id": "A",
-                     "last_assistant_message": "status=failed\nclientSecret=swordfish"})
-
-        serialized = json.dumps(requests)
-        self.assertNotIn("swordfish", serialized)
-        self.assertEqual(requests[0][1]["session"]["task_subject"].count("[REDACTED]"), 1)
-        self.assertEqual(requests[1][1]["native"]["task"].count("[REDACTED]"), 1)
-        self.assertNotIn("swordfish", requests[2][1]["native"]["summary"])
-
-    def test_observer_redacts_activity_and_file_path_before_bounding(self):
-        requests = []
-        credential = " https://user:swordfish@example.com"
-        # Truncating at 240/2000 before redaction would drop the trailing "@".
-        tool, file_path = "x" * 217 + credential, "x" * 1977 + credential
-
-        def send(operation, payload, timeout):
-            requests.append(payload)
-            return {"accepted": True}
-
-        with patch("router.observer_hook.request", side_effect=send):
-            observe({"hook_event_name": "PreToolUse", "session_id": "S", "agent_id": "A",
-                     "tool_name": tool, "tool_input": {"file_path": file_path}})
-
-        self.assertNotIn("swordfish", json.dumps(requests))
-        self.assertIn("[REDACTED]", requests[0]["session"]["activity"])
-        self.assertIn("[REDACTED]", requests[0]["native"]["activity"])
-        self.assertIn("[REDACTED]", requests[0]["native"]["file_path"])
-
-    def test_observer_strips_terminal_sequences_before_redaction(self):
+    def test_observer_keeps_text_strips_controls_and_bounds_each_field(self):
         requests = []
 
         def send(operation, payload, timeout):
@@ -199,10 +157,25 @@ class HookTests(TransportHarness, unittest.TestCase):
 
         with patch("router.observer_hook.request", side_effect=send):
             observe({"hook_event_name": "TaskCreated", "session_id": "S", "task_id": "T",
-                     "task_subject": "API_\x1b[0mKEY=swordfish"})
+                     "task_subject": "Rotate \x1b[31mkeys\x1b[0m for https://user:pw@host " + "s" * 600})
+            observe({"hook_event_name": "PostToolUse", "session_id": "S", "tool_name": "Agent",
+                     "tool_input": {"description": "Fix parser " + "d" * 300},
+                     "tool_response": {"agentId": "A", "isAsync": True}})
             observe({"hook_event_name": "SubagentStop", "session_id": "S", "agent_id": "A",
-                     "last_assistant_message": "tok\x1b[31men=swordfish"})
-        self.assertNotIn("swordfish", json.dumps(requests))
+                     "last_assistant_message": "Done.\nSet API_KEY=example in .env " + "m" * 900})
+            observe({"hook_event_name": "PreToolUse", "session_id": "S", "agent_id": "A",
+                     "tool_name": "Bash\x1b]0;title\x07", "tool_input": {"file_path": "/p/" + "f" * 2100}})
+
+        subject = requests[0]["session"]["task_subject"]
+        self.assertTrue(subject.startswith("Rotate keys for https://user:pw@host s"))
+        self.assertEqual(len(subject), 500)
+        self.assertEqual(len(requests[1]["native"]["task"]), 240)
+        summary = requests[2]["native"]["summary"]
+        self.assertTrue(summary.startswith("Done. Set API_KEY=example in .env m"))
+        self.assertEqual(len(summary), 800)
+        self.assertEqual(requests[3]["native"]["activity"], "Bash")
+        self.assertEqual(len(requests[3]["native"]["file_path"]), 2000)
+        self.assertNotIn("\\u001b", json.dumps(requests))
 
     def test_observer_reports_only_terminal_lifecycle_failures(self):
         cases = {

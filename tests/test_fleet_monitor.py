@@ -21,6 +21,7 @@ from router.capacity import (
     CapacitySampler,
     CapacityThresholds,
     ReservationReader,
+    _darwin_memory,
     _linux_cpu_ticks,
     _linux_memory,
     classify,
@@ -28,13 +29,14 @@ from router.capacity import (
 from router.cli import fleet_table
 from router.cli import main as cli_main
 from router.client import request
+from router.config import Settings
 from router.db import Store
 from router.fleet import (
     MAX_COLLECTION_RECORDS,
     FleetConfig,
     FleetHost,
+    _error_text,
     _prefix_identities,
-    _redact_error,
     _validate_snapshot,
     capacity_projection,
     fleet_exit_ok,
@@ -45,7 +47,7 @@ from router.fleet import (
 from router.fleet_snapshot import MAX_SNAPSHOT_BYTES, AlertHistory, bound, compose
 from router.host import HostIdentity, current_boot_id, stable_host_id
 from router.native import NativeObserver
-from router.redaction import redact_secrets
+from router.sanitize import bound_text
 from router.sessions import MAX_EXACT_INFLIGHT_TOOLS, SessionObserver
 from router.validation import HOST_STRING_LIMITS
 
@@ -71,20 +73,18 @@ def snapshot(host_id="host-1"):
 
 
 class HostAndMigrationTests(unittest.TestCase):
-    def test_host_view_redacts_every_display_field_and_rejects_unsafe_identity(self):
+    def test_host_view_keeps_display_text_strips_controls_and_rejects_unsafe_identity(self):
         host = HostIdentity.__new__(HostIdentity)
         host.host_id = "host"
         host._static = {
-            "host_id": "host", "hostname": "password is correct horse battery staple",
-            "boot_id": "token=secret-value", "platform": "secret=platform value",
-            "architecture": "api key is architecture value", "router_version": "pwd=router value",
-            "claude_version": "access key is claude value",
+            "host_id": "host", "hostname": "build \x1b[31mbox\x1b[0m", "boot_id": "boot-1",
+            "platform": "darwin", "architecture": "arm64", "router_version": "0.4.0",
+            "claude_version": "2.1.300",
         }
-        serialized = json.dumps(host.view(1))
-        for leaked in ("correct horse", "secret-value", "platform value", "architecture value",
-                       "router value", "claude value"):
-            self.assertNotIn(leaked, serialized)
-        host.host_id = "token=secret-value"
+        view = host.view(1)
+        self.assertEqual(view["hostname"], "build box")
+        self.assertEqual(view["platform"], "darwin")
+        host.host_id = "host\x1b[2J"
         with self.assertRaisesRegex(ValueError, "host identity"):
             host.view(1)
 
@@ -284,6 +284,17 @@ class SessionAndCapacityTests(unittest.TestCase):
         self.assertNotEqual(records[0]["status"], "unknown")
         self.assertEqual(active, 1)
 
+    def test_delayed_completion_cannot_clear_tool_evicted_from_event_history(self):
+        start = self.now - 61_000
+        self.event("tool_start", tool_use_id="long", activity="Bash", observed_at=start)
+        for index in range(130):  # Evicts "long" from the 128-entry event history.
+            self.event("tool_start", tool_use_id=f"short-{index}", observed_at=start + 1 + 2 * index)
+            self.event("tool_end", tool_use_id=f"short-{index}", observed_at=start + 2 + 2 * index)
+        self.event("tool_end", tool_use_id="long", observed_at=start - 1)  # Older than the start.
+        records, active = self.observer.fleet_records(10)
+        self.assertEqual(records[0]["inflight_tool_count"], 1)
+        self.assertEqual(active, 1)
+
     def test_delayed_tool_start_after_agent_completed_counts_once_as_active(self):
         self.event("prompt", observed_at=self.now - 3000)
         completed = self.event("notification", notification_type="agent_completed", observed_at=self.now - 1000)
@@ -346,73 +357,47 @@ class SessionAndCapacityTests(unittest.TestCase):
         self.assertEqual(self.observer.sessions(), [])
         self.assertEqual(native.snapshot(), [])
 
-    def test_operator_visible_task_metadata_redacts_credentials(self):
+    def test_operator_visible_task_text_is_kept_bounded_and_control_free(self):
         self.event("session_start")
-        self.event("task_created", task_id="T", task_subject="status=failed\napiKey=swordfish")
-        task = self.observer.tasks()[0]
-        self.assertNotIn("swordfish", task["subject"])
-        self.assertIn("[REDACTED]", task["subject"])
-        self.assertIn("status=failed", task["subject"])
+        self.event("task_created", task_id="T", task_subject="status=failed\napiKey=example")
+        self.assertEqual(self.observer.tasks()[0]["subject"], "status=failed apiKey=example")
+        self.event("task_created", task_id="long", task_subject="x" * 600)
+        bounded = next(task for task in self.observer.tasks() if task["task_id"] == "long")
+        self.assertEqual(bounded["subject"], "x" * 500)
 
         native = NativeObserver(self.store, host_id="host")
         record = native.observe({
-            "source": "claude", "session_id": "S", "agent_id": "A",
-            "kind": "launch", "observed_at": self.now,
-            "task": "status=failed accessToken=sk-ant-abcdefghijklmnop next=ok",
+            "source": "claude", "session_id": "S", "agent_id": "A", "kind": "launch",
+            "observed_at": self.now, "task": "Fix https://user:pw@example.com/repo \x1b[31mnow",
         })
-        self.assertNotIn("sk-ant-abcdefghijklmnop", record["task"])
-        self.assertIn("[REDACTED]", record["task"])
-        self.assertIn("status=failed", record["task"])
-        self.assertIn("next=ok", record["task"])
-
-        session_boundary_secret = "x" * 477 + " https://user:swordfish@example.com"
-        self.event("task_created", task_id="boundary", task_subject=session_boundary_secret)
-        bounded_task = next(task for task in self.observer.tasks() if task["task_id"] == "boundary")
-        native_boundary_secret = "x" * 217 + " https://user:swordfish@example.com"
-        bounded_native = native.observe({
-            "source": "claude", "session_id": "S", "agent_id": "boundary",
-            "kind": "launch", "observed_at": self.now, "task": native_boundary_secret,
-        })
-        self.assertNotIn("swordfish", bounded_task["subject"])
-        self.assertNotIn("swordfish", bounded_native["task"])
-
-        task_id = record["task_id"]
-        legacy = native.get(task_id)
-        legacy["task"] = "legacy password=swordfish"
+        self.assertEqual(record["task"], "Fix https://user:pw@example.com/repo now")
+        legacy = native.get(record["task_id"])
+        legacy["task"] = "legacy \x1b]0;title\x07text"
         with self.store.transaction() as db:
             native.put(db, legacy)
-        visible = native.snapshot()[0]
-        self.assertNotIn("swordfish", visible["task"])
-        self.assertIn("[REDACTED]", visible["task"])
+        self.assertEqual(native.snapshot()[0]["task"], "legacy text")
 
-    def test_session_and_task_serialization_redacts_displays_and_rejects_identities(self):
-        secret = "password is correct horse battery staple"
-        visible = self.event("session_start", cwd=f"/tmp/{secret}", model=secret,
-                             start_source=secret)
-        self.assertNotIn("correct horse", json.dumps(visible))
-        self.event("task_created", task_id="safe-task", task_subject=secret,
-                   teammate_name=secret)
-        self.assertNotIn("correct horse", json.dumps(self.observer.tasks()))
+    def test_session_and_task_serialization_strips_controls_and_rejects_unsafe_identities(self):
+        control = "build \x1b[31mred\x1b[0m"
+        visible = self.event("session_start", cwd=f"/tmp/{control}", model="opus",
+                             start_source="resume")
+        self.assertEqual(visible["cwd"], "/tmp/build red")
+        self.event("task_created", task_id="safe-task", task_subject=control, teammate_name=control)
+        self.assertNotIn("\x1b", json.dumps(self.observer.tasks()))
 
-        for field, value in (("session_id", "token=secret-value"),
-                             ("parent_session_id", "password=secret-value")):
+        for field, value in (("session_id", "bad\x1b[2J"), ("parent_session_id", " padded ")):
             event = {"source": "claude", "session_id": "safe", "kind": "session_start",
                      "observed_at": self.now, field: value}
             with self.subTest(field=field), self.assertRaises((TypeError, ValueError)):
                 self.observer.observe(event)
         with self.assertRaisesRegex(ValueError, "invalid task_id"):
-            self.event("task_created", task_id="token=secret-value")
+            self.event("task_created", task_id="task\x07")
         with self.assertRaisesRegex(ValueError, "invalid tool_use_id"):
-            self.event("tool_start", tool_use_id="token=secret-value")
+            self.event("tool_start", tool_use_id="tool\x1b]0;x\x07")
 
         with self.store.transaction() as db:
             record = self.observer._session(db, "claude", "S", self.now)
-            record["activity"] = secret
-            self.observer._put_session(db, record)
-        self.assertNotIn("correct horse", json.dumps(self.observer.sessions()))
-        with self.store.transaction() as db:
-            record = self.observer._session(db, "claude", "S", self.now)
-            record["session_id"] = "token=secret-value"
+            record["session_id"] = "bad\x1b[2J"
             db.execute("DELETE FROM sessions WHERE host_id=? AND source=? AND session_id=?",
                        ("host", "claude", "S"))
             self.observer._put_session(db, record)
@@ -746,14 +731,6 @@ class SessionAndCapacityTests(unittest.TestCase):
         with patch("router.sessions.now_ms", return_value=self.now - 1):
             self.assertIsNone(self.observer.active_count())
 
-    def test_persisted_session_activity_redacts_notification_secrets(self):
-        self.event("session_start")
-        self.event("notification", notification_type="status API_KEY=swordfish")
-        with self.store.connect() as db:
-            raw = db.execute("SELECT data FROM sessions").fetchone()[0]
-        self.assertNotIn("swordfish", raw)
-        self.assertIn("[REDACTED]", raw)
-
     def test_active_reservation_prevents_available_capacity_and_malformed_record_is_partial(self):
         reservation = Path(self.temp.name) / "reservation.json"
         reservation.write_text(json.dumps({
@@ -789,16 +766,13 @@ class SessionAndCapacityTests(unittest.TestCase):
             self.assertEqual(partial["capacity_state"], "unknown")
             with patch.object(
                     sampler.reservations, "read",
-                    side_effect=ValueError("reservation password=swordfish")):
+                    side_effect=ValueError("reservation \x1b[31mbad\x1b[0m field")):
                 reservation_error = sampler.view(CapacityThresholds())
-            self.assertNotIn("swordfish", reservation_error["error"])
+            self.assertEqual(reservation_error["error"], "reservation bad field")
             reservation.unlink()
-            sampler._latest = {
-                "observed_at": self.now, "partial": True,
-                "error": "sampler MY_SERVICE_API_KEY=swordfish",
-            }
+            sampler._latest = {"observed_at": self.now, "partial": True, "error": "sampler " + "e" * 600}
             sample_error = sampler.view(CapacityThresholds())
-            self.assertNotIn("swordfish", sample_error["error"])
+            self.assertEqual(sample_error["error"], ("sampler " + "e" * 600)[:500])
 
     def test_snapshot_reservation_state_uses_one_generated_at_boundary(self):
         observed = {}
@@ -882,6 +856,30 @@ class SessionAndCapacityTests(unittest.TestCase):
         projected = sampler.view(CapacityThresholds())
         self.assertTrue(projected["partial"])
         self.assertEqual(projected["capacity_state"], "unknown")
+
+    def test_darwin_available_memory_counts_speculative_pages_once(self):
+        gib = 1024**3
+
+        class Library:
+            def mach_host_self(self):
+                return 1
+            def host_page_size(self, host, page_size):
+                page_size._obj.value = 16384
+                return 0
+            def host_statistics64(self, host, flavor, statistics, count):
+                pages = statistics._obj
+                # Kernel free_count already includes the speculative pages.
+                pages.free_count, pages.speculative_count = 3 * gib // 16384, gib * 3 // 2 // 16384
+                pages.inactive_count = gib // 2 // 16384
+                return 0
+            def sysctlbyname(self, name, swap, size, new, new_size):
+                return 0
+
+        with patch("router.capacity._darwin_library", return_value=Library()), \
+                patch("router.capacity.os.sysconf", return_value=16 * gib // 16384):
+            total, available, _ = _darwin_memory()
+        self.assertEqual(total, 16 * gib)
+        self.assertEqual(available, 3 * gib + gib // 2)
 
     def test_deeply_nested_reservation_reports_unknown_capacity(self):
         reservation = Path(self.temp.name) / "reservation.json"
@@ -1039,7 +1037,7 @@ class SnapshotAndFleetTests(unittest.TestCase):
         hostile = snapshot()
         hostile.update(prompt="PRIVATE", transcript="PRIVATE", environment={"TOKEN": "PRIVATE"},
                        messages=["PRIVATE"], future_schema_field="drop-me",
-                       errors={"capacity": "status=failed apiKey=swordfish next=ok",
+                       errors={"capacity": "status=failed apiKey=example next=ok",
                                "unknown": "PRIVATE"})
         hostile["sessions"][0].update(prompt="PRIVATE", messages=["PRIVATE"], unknown="drop-me")
         hostile["agents"][0].update(transcript="PRIVATE", environment={"TOKEN": "PRIVATE"})
@@ -1048,10 +1046,8 @@ class SnapshotAndFleetTests(unittest.TestCase):
         serialized = json.dumps(projected)
         self.assertNotIn("PRIVATE", serialized)
         self.assertNotIn("drop-me", serialized)
-        self.assertNotIn("swordfish", serialized)
-        self.assertIn("[REDACTED]", projected["errors"]["capacity"])
-        self.assertIn("status=failed", projected["errors"]["capacity"])
-        self.assertIn("next=ok", projected["errors"]["capacity"])
+        # Known fields are projected; their text is kept as written.
+        self.assertIn("status=failed apiKey=example next=ok", projected["errors"]["capacity"])
         self.assertTrue(projected["partial"])
         self.assertIn("unsupported field", projected["errors"]["projection"])
         self.assertIn("unsupported field", projected["errors"]["sessions"])
@@ -1072,12 +1068,12 @@ class SnapshotAndFleetTests(unittest.TestCase):
             "busy",
         )
         unsafe_identity = snapshot()
-        unsafe_identity["sessions"][0]["session_id"] = "token=secret-value"
+        unsafe_identity["sessions"][0]["session_id"] = "id\x1b[2J"
         with self.assertRaisesRegex(ValueError, "unsafe sessions session_id"):
             _validate_snapshot(json.dumps(unsafe_identity).encode())
 
-    def test_remote_projection_redacts_known_displays_rejects_all_identities_and_bounds_usage(self):
-        secret = "password is correct horse battery staple"
+    def test_remote_projection_strips_display_controls_rejects_unsafe_identities_and_bounds_usage(self):
+        secret = "build \x1b[31mred\x1b]0;title\x07 done"
         value = snapshot()
         for key in ("hostname", "boot_id", "platform", "architecture", "router_version", "claude_version"):
             value["host"][key] = secret
@@ -1092,26 +1088,27 @@ class SnapshotAndFleetTests(unittest.TestCase):
                            "teammate_name": secret, "created_at": 0, "last_event_at": 0}]
         value["capacity"].update(capacity_reasons=[secret], error=secret)
         projected = _validate_snapshot(json.dumps(value).encode())
-        self.assertNotIn("correct horse", json.dumps(projected))
+        self.assertNotIn("\\u001b", json.dumps(projected))
+        self.assertEqual(projected["agents"][0]["task"], "build red done")
 
         identity_cases = {
             "host host_id": lambda item: (
-                item["host"].update(host_id="token=secret-value"),
-                [record.update(host_id="token=secret-value")
+                item["host"].update(host_id="host\x1b[2J"),
+                [record.update(host_id="host\x1b[2J")
                  for collection in ("sessions", "agents", "tasks", "managed_processes", "inferred_processes")
                  for record in item[collection]],
             ),
             "sessions parent_session_id": lambda item: item["sessions"][0].update(
-                parent_session_id="token=secret-value"),
+                parent_session_id="id\x07"),
             "sessions line-separated session_id": lambda item: item["sessions"][0].update(
                 session_id="safe\u2028spoofed"),
             "sessions surrogate session_id": lambda item: item["sessions"][0].update(
                 session_id="safe\ud800spoofed"),
             "agents parent_agent_id": lambda item: item["agents"][0].update(
-                parent_agent_id="token=secret-value"),
+                parent_agent_id="id\x07"),
             "tasks task_id": lambda item: item.update(tasks=[{
                 "host_id": "host-1", "source": "claude", "session_id": "same",
-                "task_id": "token=secret-value", "status": "created",
+                "task_id": "task\x1b]0;x\x07", "status": "created",
                 "created_at": 0, "last_event_at": 0,
             }]),
         }
@@ -1147,12 +1144,12 @@ class SnapshotAndFleetTests(unittest.TestCase):
         }]
         value["agents"][0].update(
             price_overrides_used=["MODEL_RATE"],
-            transcript_error="Cookie: session=swordfish",
+            transcript_error="read failed \x1b[31mhere",
         )
         projected = _validate_snapshot(json.dumps(value).encode())
         self.assertEqual(len(projected["tasks"][0]["subject"]), 500)
         self.assertEqual(projected["agents"][0]["price_overrides_used"], ["MODEL_RATE"])
-        self.assertNotIn("swordfish", projected["agents"][0]["transcript_error"])
+        self.assertEqual(projected["agents"][0]["transcript_error"], "read failed here")
         self.assertTrue(projected["partial"])
         self.assertIn("changed for output safety", projected["errors"]["tasks"])
         self.assertIn("changed for output safety", projected["errors"]["agents"])
@@ -1184,7 +1181,7 @@ class SnapshotAndFleetTests(unittest.TestCase):
             -9,
         )
 
-        for identity in ("unsafe\nidentity", "unsafe\x85identity", "unsafe\u202eidentity", "[REDACTED]"):
+        for identity in ("unsafe\nidentity", "unsafe\x85identity", "unsafe\u202eidentity", "unsafe\x1b[2J"):
             value = snapshot()
             value["sessions"][0]["session_id"] = identity
             with self.subTest(identity=identity), self.assertRaisesRegex(ValueError, "unsafe"):
@@ -1773,7 +1770,7 @@ required = false
         self.assertTrue(result["hosts"][1]["ok"])
         good = result["hosts"][1]
         self.assertEqual(good["snapshot"]["capacity"]["capacity_state"], "busy")
-        self.assertIn("memory_low", {alert["kind"] for alert in good["snapshot"]["alerts"]})
+        self.assertIn("memory_low", {alert["kind"] for alert in good["alerts"]})
         projected = capacity_projection(result)
         self.assertNotIn("sessions", projected["hosts"][1]["snapshot"])
         self.assertEqual(projected["hosts"][1]["alerts"], good["alerts"])
@@ -1864,6 +1861,17 @@ required = false
                 result = query_fleet(config)
                 self.assertIs(result["hosts"][0]["snapshot"]["capacity"]["reservation_active"], active)
 
+    def test_viewer_capacity_alerts_keep_nested_snapshot_chronology_valid(self):
+        peer = snapshot("peer")
+        peer["capacity"].update(memory_available_bytes=256 * 1024**2, load_1m=40, cpu_busy_pct=99)
+        config = FleetConfig((FleetHost("peer", "ssh", target="peer"),))
+        with patch("router.fleet.ssh_snapshot", side_effect=lambda host, timeout: peer):
+            record = query_fleet(config)["hosts"][0]
+        kinds = {alert["kind"] for alert in record["alerts"]}
+        self.assertTrue({"memory_low", "host_saturated"} <= kinds, kinds)
+        self.assertFalse({"memory_low", "host_saturated"} & {alert["kind"] for alert in record["snapshot"]["alerts"]})
+        _validate_snapshot(json.dumps(record["snapshot"]).encode())  # Still a valid producer snapshot.
+
     def test_fleet_stale_classification_and_alert_share_one_threshold(self):
         # With a 10 s refresh, a 16 s old sample is fresh for alerting, so it
         # must not be classified unknown-for-staleness either.
@@ -1921,8 +1929,9 @@ required = false
             options.append(kwargs)
             return popen([sys.executable, "-c", "import sys;sys.stdout.write(" + repr(json.dumps(snapshot())) + ")"],
                          **kwargs)
+        # A generous timeout: the success path returns as soon as output arrives.
         with patch("router.fleet.subprocess.Popen", side_effect=launch):
-            self.assertEqual(ssh_snapshot(host, 2)["host"]["host_id"], "host-1")
+            self.assertEqual(ssh_snapshot(host, 15)["host"]["host_id"], "host-1")
         command = commands[0]
         self.assertEqual(command[-4:], ["odd; target", "router", "snapshot", "--json"])
         self.assertIn("--", command)
@@ -1960,23 +1969,22 @@ required = false
         self.assertEqual(host["snapshot"]["capacity"]["capacity_reasons"],
                          ["reservation data unavailable"])
 
-    def test_reservation_expiry_is_recomputed_and_sensitive_labels_are_redacted(self):
+    def test_reservation_expiry_is_recomputed_and_labels_are_kept(self):
         now = int(time.time() * 1000)
         for active, until in ((False, now + 60_000), (True, now - 1)):
             value = snapshot()
             value["generated_at"] = now
             value["capacity"].update(
-                reserved_by="password=swordfish", reserved_until=until,
+                reserved_by="ci-coordinator", reserved_until=until,
                 reserved_cpu_slots=1, reserved_memory_bytes=0,
-                reservation_source="token=secret-source", reservation_active=active,
+                reservation_source="scheduler", reservation_active=active,
             )
             result = query_fleet(FleetConfig((FleetHost("local", "local"),)),
                                  local_snapshot=lambda thresholds, value=value: value)
             capacity = result["hosts"][0]["snapshot"]["capacity"]
             self.assertEqual(capacity["capacity_state"], "unknown")
             self.assertTrue(result["partial"])
-            self.assertNotIn("swordfish", json.dumps(result))
-            self.assertNotIn("secret-source", json.dumps(result))
+            self.assertEqual(capacity["reserved_by"], "ci-coordinator")
 
     def test_reservation_can_legitimately_expire_after_source_snapshot(self):
         value = snapshot()
@@ -2074,6 +2082,82 @@ required = false
         self.assertTrue(result["partial"])
         self.assertIn("incomplete", result["errors"]["alerts"])
 
+    def test_restart_uncertainty_keeps_capacity_unknown_until_it_expires(self):
+        base = snapshot()
+        for observer_kind in ("session", "agent"):
+            with self.subTest(observer=observer_kind), tempfile.TemporaryDirectory() as temp:
+                store = Store(Path(temp) / "router.sqlite3", "host-1")
+                sessions, native = SessionObserver(store, "host-1"), NativeObserver(store, host_id="host-1")
+                now = int(time.time() * 1000)
+                if observer_kind == "session":
+                    sessions.observe({"source": "claude", "session_id": "busy", "kind": "prompt",
+                                      "observed_at": now - 1000})
+                else:
+                    native.observe({"source": "claude", "session_id": "S", "agent_id": "busy",
+                                    "kind": "start", "observed_at": now - 1000})
+                sessions.reconcile_restart()
+                native.reconcile_restart()
+                # Created after the restart, so only the "busy" record is uncertain; these
+                # newer idle sessions push it off the one-row display page.
+                for index in range(3):
+                    sessions.observe({"source": "claude", "session_id": f"quiet-{index}", "kind": "stop",
+                                      "observed_at": now - index})
+
+                class Host:
+                    def view(self, at):
+                        return {**base["host"], "host_id": "host-1", "observed_at": at}
+                class Capacity:
+                    def view(self, thresholds, now=now, **counts):
+                        return {**base["capacity"], "observed_at": now, "sample_age_ms": 0,
+                                "partial": False, "load_1m": 0, "cpu_busy_pct": 1, **counts}
+                controller = type("Controller", (), {"host": Host(), "sessions": sessions,
+                                                     "native": native, "capacity": Capacity()})()
+                with patch("router.fleet_snapshot.now_ms", return_value=now):
+                    uncertain = compose(controller, history_limit=1)
+                self.assertTrue(uncertain["partial"])
+                self.assertEqual(uncertain["capacity"]["capacity_state"], "unknown")
+                fleet = query_fleet(FleetConfig((FleetHost("local", "local"),)),
+                                    local_snapshot=lambda thresholds, value=uncertain: value)
+                self.assertNotEqual(fleet["hosts"][0]["snapshot"]["capacity"]["capacity_state"], "available")
+                later = now + 61_000
+                with patch("router.sessions.now_ms", return_value=later), \
+                        patch("router.native.now_ms", return_value=later):
+                    self.assertIsNotNone(sessions.fleet_records(1)[1])
+                    self.assertIsNotNone(native.fleet_records(1)[1])
+
+    def test_fleet_text_sharing_is_on_by_default_and_can_be_withheld_by_the_producer(self):
+        base = snapshot()
+
+        class Host:
+            def view(self, at):
+                return {**base["host"], "observed_at": at}
+        class Sessions:
+            def fleet_records(self, limit): return [], 0
+            def tasks(self, limit):
+                return [{"host_id": "host-1", "source": "claude", "session_id": "S", "task_id": "T",
+                         "status": "created", "subject": "Rotate staging keys", "created_at": 1,
+                         "last_event_at": 1}]
+        class Native:
+            def fleet_records(self, limit):
+                return [{"host_id": "host-1", "source": "claude", "parent_session_id": "S",
+                         "agent_id": "A", "status": "stopped", "task": "Fix parser",
+                         "started_at": 1, "last_event_at": 1}], 0
+        class Capacity:
+            def view(self, thresholds, **counts):
+                return {**base["capacity"], "observed_at": 100, "sample_age_ms": 0, "partial": False, **counts}
+
+        for share, task, subject in ((True, "Fix parser", "Rotate staging keys"), (False, None, None)):
+            controller = type("Controller", (), {
+                "host": Host(), "sessions": Sessions(), "native": Native(), "capacity": Capacity(),
+                "settings": type("Settings", (), {"fleet_share_text": share})(),
+            })()
+            with self.subTest(share=share), patch("router.fleet_snapshot.now_ms", return_value=100):
+                result = compose(controller)
+                self.assertEqual(result["agents"][0]["task"], task)
+                self.assertEqual(result["tasks"][0]["subject"], subject)
+        self.assertTrue(Settings().fleet_share_text)
+        self.assertFalse(Settings(AGENT_ROUTER_FLEET_SHARE_TEXT="false").fleet_share_text)
+
     def test_zero_and_future_alert_times_are_normalized_and_round_trip(self):
         base = snapshot()
 
@@ -2145,13 +2229,12 @@ required = false
 
     def test_capacity_projection_preserves_operator_visible_snapshot_errors(self):
         value = snapshot()
-        value.update(partial=True, errors={"capacity": "password=swordfish"})
+        value.update(partial=True, errors={"capacity": "sampler failed: disk unavailable"})
         result = query_fleet(FleetConfig((FleetHost("local", "local"),)),
                              local_snapshot=lambda thresholds: value)
         projected = capacity_projection(result)
         errors = projected["hosts"][0]["snapshot"]["errors"]
-        self.assertIn("capacity", errors)
-        self.assertNotIn("swordfish", json.dumps(errors))
+        self.assertIn("sampler failed: disk unavailable", errors["capacity"])
 
     def test_watch_mode_keeps_refreshing_when_all_hosts_are_offline(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -2180,7 +2263,7 @@ required = false
             self.assertEqual(len(lines), 2)
             self.assertEqual([json.loads(line) for line in lines], [result, result])
 
-    def test_ssh_output_is_bounded_drained_reaped_and_redacted(self):
+    def test_ssh_output_is_bounded_drained_reaped_and_error_text_kept(self):
         host = FleetHost("remote", "ssh", target="remote")
         actual_popen = subprocess.Popen
         launched = []
@@ -2190,7 +2273,7 @@ required = false
             launched.append(process)
             return process
         with patch("router.fleet.subprocess.Popen", side_effect=launch):
-            self.assertEqual(ssh_snapshot(host, 2)["host"]["host_id"], "host-1")
+            self.assertEqual(ssh_snapshot(host, 15)["host"]["host_id"], "host-1")
         self.assertIsNotNone(launched[0].poll())
 
         def run_script(source, timeout=.2):
@@ -2207,9 +2290,8 @@ required = false
 
         self.assertIn("one MiB", run_script("import os;os.write(1,b'x'*(1024*1024+1))"))
         self.assertIn("timed out", run_script("import time;time.sleep(2)", .05))
-        error = run_script("import os,sys;os.write(2,b'password: swordfish');sys.exit(2)")
-        self.assertNotIn("swordfish", error)
-        self.assertIn("[REDACTED]", error)
+        error = run_script("import os,sys;os.write(2,b'Permission denied\\x1b[31m (publickey)');sys.exit(2)")
+        self.assertEqual(error, "Permission denied (publickey)")
 
     def test_ssh_setup_failure_and_pipe_holding_descendant_are_group_cleaned(self):
         host = FleetHost("remote", "ssh", target="remote")
@@ -2250,8 +2332,8 @@ required = false
                 with patch("router.fleet.subprocess.Popen", side_effect=fork_launch), \
                         self.assertRaisesRegex(ValueError, "timed out"):
                     # Long enough for the descendant to start and report its PID.
-                    ssh_snapshot(host, 1)
-                self.assertLess(time.monotonic() - started, 2.2)
+                    ssh_snapshot(host, 3)
+                self.assertLess(time.monotonic() - started, 4.5)  # Timeout plus bounded group cleanup.
                 self.assertTrue(descendant_pid_file.exists(), "forked descendant never reported its PID")
                 descendant_pid = int(descendant_pid_file.read_text())
                 deadline = time.monotonic() + 2
@@ -2291,7 +2373,7 @@ required = false
                 with patch("router.fleet.subprocess.Popen",
                            side_effect=lambda command, **kwargs: actual_popen([sys.executable, "-c", script], **kwargs)), \
                         self.assertRaisesRegex(ValueError, "timed out"):
-                    ssh_snapshot(host, 1)
+                    ssh_snapshot(host, 3)  # Long enough for the member to fork and report.
                 self.assertTrue(pid_file.exists(), "group member never reported its PID")
                 member = int(pid_file.read_text())
                 deadline = time.monotonic() + 2
@@ -2332,7 +2414,7 @@ required = false
             ssh_snapshot(host, .05)
         self.assertLess(time.monotonic() - started, 1.2)
 
-    def test_snapshot_augmentation_stays_bounded_and_common_credentials_are_redacted(self):
+    def test_snapshot_augmentation_stays_bounded_and_error_text_is_kept_but_made_safe(self):
         expanded = snapshot("h" * 128)
         expanded["agents"] = []
         expanded["sessions"] = [
@@ -2349,78 +2431,33 @@ required = false
             result["hosts"][0]["error"],
             "Host snapshot exceeds one MiB after fleet identity augmentation",
         )
-        for secret, leaked in (
-                ("Authorization: Basic dXNlcjpwYXNz", "dXNlcjpwYXNz"),
-                ('password: "orchid meadow"', "orchid meadow"),
-                ('"password": "orchid meadow"', "orchid meadow"),
-                ('"password": "orchid \\"meadow\\""', "meadow"),
-                ('"AWS_SECRET_ACCESS_KEY": "abcd 1234"', "abcd 1234"),
-                ('password: "orchid meadow', "meadow"),
-                ('password: "orchid\nmeadow"', "meadow"),
-                ('password: "orchid\nmeadow', "meadow"),
-                ("password is correct horse battery staple", "correct horse"),
-                ("API key is alpha beta gamma", "alpha beta"),
-                ("AWS_SECRET_ACCESS_KEY='abcd 1234", "1234"),
-                ("passphrase=hunter2", "hunter2"),
-                ("pwd=hunter2", "hunter2"),
-                ("SECRET_KEY=swordfish", "swordfish"),
-                ("PRIVATE_KEY_PEM=swordfish", "swordfish"),
-                ("MY_SERVICE_API_KEY=swordfish", "swordfish"),
-                ("MY-SERVICE-API-KEY=swordfish", "swordfish"),
-                ("status=failed api_key=swordfish next=ok", "swordfish"),
-                ("FOO=bar\nAPI_KEY=swordfish\nOTHER=ok", "swordfish"),
-                ('$env:API_KEY = "swordfish"', "swordfish"),
-                ('{"apiKey":"swordfish"}', "swordfish"),
-                ("accessToken = swordfish next=value", "swordfish"),
-                ("clientSecret: swordfish", "swordfish"),
-                ("secretAccessKey=swordfish", "swordfish"),
-                ("apikey=swordfish", "swordfish"),
-                ("--apiKey 'swordfish' --other value", "swordfish"),
-                ("Cookie: session=swordfish", "swordfish"),
-                ("Set-Cookie: session=swordfish; HttpOnly", "swordfish"),
-                ('{"secret_key": "swordfish"}', "swordfish"),
-                ("https://user:pass@example.com/path", "user:pass"),
-                ("AWS_SECRET_ACCESS_KEY=abcd1234secret", "abcd1234secret"),
-                ("ANTHROPIC_API_KEY=sk-ant-abcdefghijklmnop", "sk-ant-abcdefghijklmnop"),
-                ("credential ghp_abcdefghijklmnop", "ghp_abcdefghijklmnop"),
-                ("credential github_pat_abcdefghijklmnop", "github_pat_abcdefghijklmnop"),
-                ("credential gho_abcdefghijklmnop", "gho_abcdefghijklmnop"),
-                ("credential ghs_abcdefghijklmnop", "ghs_abcdefghijklmnop"),
-                ("credential ghu_abcdefghijklmnop", "ghu_abcdefghijklmnop"),
-                ("credential ghr_abcdefghijklmnop", "ghr_abcdefghijklmnop"),
-                ('{"Authorization": "Basic c3dvcmRmaXNo"}', "c3dvcmRmaXNo"),
-                ('headers = {"Cookie": "session=swordfish"}', "swordfish"),
-                ('Payload was "{\\"password\\": \\"swordfish\\"}".', "swordfish"),
-                (json.dumps({"cmd": json.dumps({"password": 'sword"fish', "user": "bob"})}), "fish"),
-                (json.dumps(json.dumps(json.dumps({"password": "swordfish", "user": "bob"}))), "swordfish"),
-                (json.dumps(json.dumps(json.dumps(json.dumps({"password": 'sw"ordfish'})))), "ordfish"),
-                # Unterminated: the string is cut inside the secret.
-                ((nested := json.dumps(json.dumps(json.dumps({"password": "canary"}))))[
-                    :nested.index("canary") + 4], "cana"),
-                ("C:\\password=swordfish", "swordfish"),
-                ("line\\npassword=swordfish", "swordfish"),
-                ("API_\x1b[0mKEY=swordfish", "swordfish"),
-                ("pass\x1b]8;;http://x\x07word=swordfish", "swordfish"),
-                (json.dumps({"cmd": json.dumps({"password": "swordfish\\", "user": "bob"})}), "swordfish"),
-                ("credential sk-abcdefghijklmnop", "sk-abcdefghijklmnop"),
-                ("credential AKIAABCDEFGHIJKLMNOP", "AKIAABCDEFGHIJKLMNOP"),
-                ("credential glpat-abcdefghijklmnop", "glpat-abcdefghijklmnop"),
-                ("credential xoxb-1234567890-abcdefghijkl", "xoxb-1234567890-abcdefghijkl"),
-                ("-----BEGIN OPENSSH PRIVATE KEY-----\nprivate-body\n-----END OPENSSH PRIVATE KEY-----",
-                 "private-body"),
+        # Text is kept as written; only terminal controls, line breaks, and length change.
+        for raw, shown in (
+                ("Authorization: Basic dXNlcjpwYXNz", "Authorization: Basic dXNlcjpwYXNz"),
+                ('{"password": "orchid meadow"}', '{"password": "orchid meadow"}'),
+                ("C:\\Users\\x\\notes.txt", "C:\\Users\\x\\notes.txt"),
+                ("line one\nline two\r\nthree", "line one line two  three"),
+                ("\x1b[31mred\x1b[0m text", "red text"),
+                ("API_\x1b[0mKEY=value", "API_KEY=value"),
+                ("link \x1b]8;;https://x\x07label\x1b]8;;\x07 end", "link label end"),
+                ("title \x1b]0;owned\x1b\\ ok", "title  ok"),
+                ("eight\x9b31mbit", "eight31mbit"),  # 8-bit C1: only the control is dropped.
+                ("caf\u0090e rest of text", "cafe rest of text"),
+                ("a\x1b(B\x1b[mb", "ab"),  # tput sgr0
+                ("a\x1b7b\x1b8c", "abc"),
+                ("a\x1b=b", "ab"),
+                ("a\x1b[3\n1mb", "ab"),
+                ("a\x1b]0;title xx\x1b[31mred", "ared"),
+                ("dcs \x1bPpayload\x1b\\ done", "dcs  done"),
+                ("unterminated \x1b]0;rest of text", "unterminated "),
+                ("zero\u200bwidth \u202eflip", "zerowidth flip"),
         ):
-            redacted = _redact_error(secret)
-            self.assertNotIn(leaked, redacted)
-            self.assertIn("[REDACTED", redacted)
+            with self.subTest(raw=raw[:30]):
+                self.assertEqual(_error_text(raw), shown)
+        self.assertEqual(bound_text("x" * 5000, 1000), "x" * 1000)
 
-    def test_redaction_stays_linear_on_long_backslash_runs(self):
-        # An unbounded escaped-key prefix backtracks quadratically (13 s at 20k).
-        started = time.monotonic()
-        redact_secrets("\\" * 200_000 + " x=1", 10)
-        self.assertLess(time.monotonic() - started, 1)
-
-    def test_local_snapshot_final_boundary_redacts_all_error_and_display_canaries(self):
-        secret = "MY_SERVICE_API_KEY=swordfish"
+    def test_local_snapshot_final_boundary_strips_controls_from_errors_and_displays(self):
+        secret = "build \x1b[31mred\x1b]0;title\x07 \u202eflip"
 
         class Host:
             def view(self, at):
@@ -2430,35 +2467,31 @@ required = false
                 return [{"host_id": "host", "source": "claude", "session_id": "safe",
                          "status": "running", "activity": secret}], 1
             def tasks(self, limit):
-                raise OSError(f"Cookie: session=swordfish {secret}")
+                raise OSError(f"tasks failed {secret}")
         class Native:
             def fleet_records(self, limit):
                 return [], 0
         class Capacity:
             def view(self, thresholds, **counts):
-                return {"partial": True, "error": f"Set-Cookie: token=swordfish {secret}",
+                return {"partial": True, "error": f"sampler failed {secret}",
                         "capacity_state": "unknown", "capacity_reasons": [secret], **counts}
 
         result = compose(type("Controller", (), {
             "host": Host(), "sessions": Sessions(), "native": Native(), "capacity": Capacity(),
         })())
         serialized = json.dumps(result)
-        self.assertNotIn("swordfish", serialized)
+        for control in ("\\u001b", "\\u0007", "\\u202e"):
+            self.assertNotIn(control, serialized)
         self.assertTrue(result["partial"])
-        self.assertIn("[REDACTED", serialized)
+        self.assertIn("tasks failed build red flip", serialized)
 
-    def test_cli_credentials_and_unicode_controls_are_sanitized_through_fleet_output(self):
+    def test_cli_unicode_controls_are_sanitized_through_fleet_output(self):
         value = snapshot()
         value["sessions"][0]["activity"] = "safe\u202eevil\u2066\u2028fake-row\u2029tail\ud800\udcff"
         value.update(
             partial=True,
             errors={
-                "sessions": (
-                    "remote failed: --password swordfish "
-                    "--api-key \"orchid bloom\" --token='abcdef ghi'; "
-                    "--pass\u200bword correct horse battery; "
-                    "API\u2060_KEY=hidden-value; Bearer\u200b bearer-value"
-                ),
+                "sessions": "remote failed: --pass\u200bword example\u2060 value\x1b[2J done",
             },
         )
         result = query_fleet(
@@ -2467,16 +2500,12 @@ required = false
         )
         serialized = json.dumps(result, ensure_ascii=False)
         rendered = fleet_table(result)
-        for leaked in (
-            "swordfish", "orchid bloom", "abcdef ghi", "correct horse battery",
-            "hidden-value", "bearer-value", "\u202e", "\u2066", "\u2028", "\u2029",
-            "\ud800", "\udcff",
-        ):
+        for leaked in ("\u202e", "\u2066", "\u2028", "\u2029", "\ud800", "\udcff", "\u200b", "\x1b"):
             self.assertNotIn(leaked, serialized)
             self.assertNotIn(leaked, rendered)
         serialized.encode("utf-8")
         rendered.encode("utf-8")
-        self.assertIn("[REDACTED]", serialized)
+        self.assertIn("remote failed: --password example value done", serialized)
         host = result["hosts"][0]["snapshot"]
         self.assertTrue(host["partial"])
         self.assertIn("changed for output safety", host["errors"]["sessions"])

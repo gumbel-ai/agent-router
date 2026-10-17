@@ -100,8 +100,8 @@ class NativeTests(unittest.TestCase):
         self.assertNotIn("PRIVATE", json.dumps(result))
         self.assertNotIn("PRIVATE", self.control.store.path.read_bytes().decode(errors="ignore"))
 
-    def test_transcript_display_strings_are_redacted_before_persistence(self):
-        transcript = self.root / "redaction.jsonl"
+    def test_transcript_display_strings_keep_text_without_controls(self):
+        transcript = self.root / "display.jsonl"
         transcript.write_text(json.dumps({
             "type": "assistant",
             "message": {
@@ -110,24 +110,16 @@ class NativeTests(unittest.TestCase):
                 "usage": {"input_tokens": 1, "output_tokens": 1},
                 "content": [{
                     "type": "tool_use",
-                    "name": "password=swordfish",
-                    "input": {"file_path": "/tmp/token=credential-value"},
+                    "name": "Edit\x1b[31m",
+                    "input": {"file_path": "/tmp/token=value/notes.md"},
                 }],
             },
         }) + "\n")
-        record = self.event("stop", agent="redacted-transcript", transcript=str(transcript))
-
-        visible = self.control.handle("status", {"task_id": record["task_id"]})
-        with self.control.store.connect() as db:
-            persisted = db.execute(
-                "SELECT data FROM observations WHERE task_id=?", (record["task_id"],),
-            ).fetchone()[0]
-
-        self.assertNotIn("swordfish", persisted)
-        self.assertNotIn("credential-value", persisted)
-        self.assertNotIn("swordfish", json.dumps(visible))
-        self.assertIn("[REDACTED]", persisted)
-
+        record = self.event("stop", agent="display-transcript", transcript=str(transcript))
+        self.control.handle("status", {"task_id": record["task_id"]})
+        persisted = self.control.native.get(record["task_id"])
+        self.assertEqual(persisted["activity"], "Edit")
+        self.assertEqual(persisted["files_touched"], ["/tmp/token=value/notes.md"])
     def test_stopped_transcript_eof_detects_late_append_and_replacement(self):
         transcript = self.root / "late.jsonl"
         transcript.write_text(json.dumps({
@@ -613,16 +605,6 @@ class NativeTests(unittest.TestCase):
         self.assertEqual(failed["status"], "failed")
         self.assertEqual(failed["duration_ms"], 1500)
 
-    def test_token_like_transcript_path_keeps_lifecycle_evidence(self):
-        transcript = "/Users/x/.claude/projects/-Users-x-work-sk-learn-experiments/S/subagents/agent-e.jsonl"
-        self.event("start", agent="sk-path", at=1000, transcript=transcript)
-        stopped = self.event("stop", agent="sk-path", at=2000, transcript=transcript)
-        persisted = self.control.native.get(stopped["task_id"])
-        self.assertEqual(persisted["status"], "stopped")
-        self.assertIsNone(persisted["transcript"])
-        self.assertTrue(stopped["usage_partial"])
-        self.assertIsNone(stopped["usage"])
-
     def test_unchanged_transcript_at_eof_is_not_rehashed_for_any_status(self):
         transcript = self.root / "quiet.jsonl"
         transcript.write_text(json.dumps({"type": "assistant", "message": {
@@ -674,13 +656,6 @@ class NativeTests(unittest.TestCase):
         failed = self.event("failed", agent="elapsed", at=2000)
         self.assertEqual(failed["elapsed_ms"], 1000)
 
-    def test_terminal_sequences_cannot_split_credentials_before_persistence(self):
-        record = self.event("result", agent="ansi", at=1000, task="API_\x1b[0mKEY=swordfish",
-                            summary="pass\x1b[1mword=swordfish")
-        with self.control.store.connect() as db:
-            persisted = db.execute("SELECT data FROM observations WHERE task_id=?", (record["task_id"],)).fetchone()[0]
-        self.assertNotIn("swordfish", persisted)
-
     def test_late_launch_enriches_terminal_record_without_reopening_it(self):
         self.event("start", at=1000)
         stopped = self.event("stop", at=2000)
@@ -728,11 +703,11 @@ class NativeTests(unittest.TestCase):
         )
         self.assertEqual(delayed["parent_agent_id"], "new-parent")
 
-    def test_identifiers_ordering_restart_segments_and_legacy_summary_redaction(self):
+    def test_identifiers_ordering_restart_segments_and_legacy_summary_sanitizing(self):
         exact = "s" * 240
         self.assertEqual(self.event("start", session=exact, agent=exact)["agent_id"], exact)
         for key, value in (("session", "s" * 241), ("agent", "a" * 241),
-                           ("session", "token=secret-value"), ("agent", "bad\x00id")):
+                           ("session", "bad\x1b[2Jid"), ("agent", "bad\x00id")):
             values = {key: value}
             with self.subTest(key=key, value=value[:20]), self.assertRaisesRegex(ValueError, "invalid"):
                 self.event("start", **values)
@@ -758,8 +733,8 @@ class NativeTests(unittest.TestCase):
         self.assertEqual(ended["duration_ms"], 1500)
 
         legacy = self.control.native.get(record["task_id"])
-        legacy["summary"] = "password=swordfish"
-        self.assertNotIn("swordfish", self.control.native.view(legacy)["summary"])
+        legacy["summary"] = "done \x1b[31mok"
+        self.assertEqual(self.control.native.view(legacy)["summary"], "done ok")
 
     def test_restart_preserves_a_valid_zero_timestamp_without_inflating_duration(self):
         record = self.event("start", agent="epoch", at=0)
@@ -975,34 +950,33 @@ class NativeTests(unittest.TestCase):
         self.assertIsNone(nested["usage"])
         self.assertIn("malformed", nested["transcript_error"].lower())
 
-    def test_native_output_redacts_every_display_field_and_rejects_unsafe_identities(self):
-        secret = "password is correct horse battery staple"
+    def test_native_output_strips_controls_from_displays_and_rejects_unsafe_identities(self):
+        control = "build \x1b[31mred\x1b]0;title\x07 done"
         record = self.event(
-            "launch", agent="privacy", task=secret, activity=secret, summary=secret,
-            agent_type=secret, requested_model=secret, resolved_model=secret,
-            cwd=f"/tmp/{secret}", worktree=f"/tmp/{secret}",
+            "launch", agent="display", task=control, activity=control, summary=control,
+            agent_type=control, requested_model=control, resolved_model=control,
+            cwd=f"/tmp/{control}", worktree=f"/tmp/{control}",
         )
-        self.assertNotIn("correct horse", json.dumps(record))
+        self.assertEqual(record["task"], "build red done")
         with self.control.store.connect() as db:
             persisted = db.execute(
                 "SELECT data FROM observations WHERE task_id=?", (record["task_id"],),
             ).fetchone()[0]
-        self.assertNotIn("correct horse", persisted)
+        self.assertNotIn("\\u001b", persisted)
         with self.assertRaisesRegex(ValueError, "invalid parent_agent_id"):
-            self.event("launch", agent="identity", parent_agent_id="token=secret-value")
-        for index, transcript in enumerate(("x" * 2001, "/tmp/token=secret-value")):
+            self.event("launch", agent="identity", parent_agent_id="parent\x1b[2J")
+        for index, transcript in enumerate(("x" * 2001, "/tmp/bad\x07path")):
             with self.subTest(transcript=transcript[:20]):
-                # Unsafe paths are never stored, but lifecycle evidence is kept.
+                # Unusable paths are never stored, but lifecycle evidence is kept.
                 started = self.event("start", agent=f"path-{index}", transcript=transcript)
                 self.assertIsNone(self.control.native.get(started["task_id"])["transcript"])
                 self.assertTrue(started["usage_partial"])
-                self.assertNotIn("secret-value", json.dumps(started))
 
         legacy = self.control.native.get(record["task_id"])
-        legacy.update(summary=secret, activity=secret, files_touched=[secret],
-                      price_sources={secret: secret})
-        self.assertNotIn("correct horse", json.dumps(self.control.native.view(legacy)))
-        legacy["agent_id"] = "token=secret-value"
+        legacy.update(summary=control, activity=control, files_touched=[control],
+                      price_sources={control: control})
+        self.assertNotIn("\\u001b", json.dumps(self.control.native.view(legacy)))
+        legacy["agent_id"] = "agent\x1b[2J"
         with self.assertRaisesRegex(ValueError, "invalid agent_id"):
             self.control.native.view(legacy)
 

@@ -12,7 +12,7 @@ from pydantic import ValidationError
 from router.client import request
 from router.config import load_settings, socket_path, state_dir
 from router.dispatch import MUTATIONS
-from router.redaction import sanitize_output_text
+from router.sanitize import sanitize_output_text
 
 MAX_DISPLAYED_SNAPSHOT_ERRORS = 5
 MAX_DISPLAYED_SNAPSHOT_ERROR_LENGTH = 160

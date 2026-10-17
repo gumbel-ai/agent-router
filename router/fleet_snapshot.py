@@ -8,7 +8,7 @@ import threading
 from router.capacity import GIB, RESERVATION_FIELDS, CapacityThresholds, classify
 from router.db import now_ms
 from router.dispatch import canonical
-from router.redaction import redact_secrets, redact_structure
+from router.sanitize import bound_text, sanitize_structure
 from router.validation import is_wire_integer
 
 SCHEMA_VERSION = 1
@@ -32,6 +32,9 @@ CAPACITY_DEPENDENCY_SECTIONS = frozenset({
     "lifecycle", "lifecycle_consistency",
 })
 
+
+# Free text written by users or agents; withheld when fleet text sharing is off.
+FLEET_TEXT_FIELDS = frozenset({"task", "subject"})
 
 class AlertHistory:
     """Preserve first-seen time while an alert remains continuously active."""
@@ -105,11 +108,11 @@ def _section(snapshot: dict, key: str, producer, fallback) -> None:
         if isinstance(value, dict) and value.get("partial") is True:
             snapshot["partial"] = True
             if value.get("error"):
-                snapshot.setdefault("errors", {})[key] = redact_secrets(str(value["error"]), 500)
+                snapshot.setdefault("errors", {})[key] = bound_text(str(value["error"]), 500)
     except (OSError, ValueError, KeyError, TypeError, sqlite3.Error) as error:
         snapshot[key] = fallback
         snapshot["partial"] = True
-        snapshot.setdefault("errors", {})[key] = redact_secrets(str(error), 500)
+        snapshot.setdefault("errors", {})[key] = bound_text(str(error), 500)
 
 
 def _collection(snapshot: dict, key: str, producer, limit: int,
@@ -144,7 +147,7 @@ def _observed_collection(snapshot: dict, key: str, producer, limit: int,
     except (OSError, ValueError, KeyError, TypeError, sqlite3.Error) as error:
         snapshot[key] = []
         snapshot["partial"] = True
-        snapshot.setdefault("errors", {})[key] = redact_secrets(str(error), 500)
+        snapshot.setdefault("errors", {})[key] = bound_text(str(error), 500)
         snapshot.setdefault("errors", {})[count_error_key] = "Exact active count is unavailable"
         return None
 
@@ -185,6 +188,12 @@ def compose(controller, thresholds: CapacityThresholds | None = None, history_li
         "agent_active_count",
     )
     _collection(snapshot, "tasks", controller.sessions.tasks, history_limit)
+    if not getattr(getattr(controller, "settings", None), "fleet_share_text", True):
+        # The producing host decides whether user- and agent-written text leaves it.
+        for key in ("agents", "tasks"):
+            for record in snapshot[key]:
+                for field in FLEET_TEXT_FIELDS & record.keys():
+                    record[field] = None
     sessions = snapshot["sessions"]
     agents = snapshot["agents"]
     _section(snapshot, "capacity", lambda: controller.capacity.view(
@@ -249,13 +258,13 @@ def compose(controller, thresholds: CapacityThresholds | None = None, history_li
 
 
 def bound(snapshot: dict, maximum_bytes: int = MAX_SNAPSHOT_BYTES) -> dict:
-    redacted = redact_structure(snapshot)
-    if redacted != snapshot:
-        redacted["partial"] = True
-        redacted.setdefault("errors", {})["output"] = (
-            "Snapshot values were redacted at the output boundary"
+    sanitized = sanitize_structure(snapshot)
+    if sanitized != snapshot:
+        sanitized["partial"] = True
+        sanitized.setdefault("errors", {})["output"] = (
+            "Snapshot values had terminal controls removed at the output boundary"
         )
-    snapshot = redacted
+    snapshot = sanitized
     if len(canonical(snapshot).encode()) <= maximum_bytes:
         return snapshot
     result = dict(snapshot)

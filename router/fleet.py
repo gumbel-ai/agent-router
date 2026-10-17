@@ -22,7 +22,7 @@ from router.fleet_snapshot import (
     AlertHistory,
     capacity_alerts,
 )
-from router.redaction import redact_secrets
+from router.sanitize import bound_text, sanitize_output_text
 from router.validation import (
     HOST_STRING_LIMITS,
     MAX_HOST_DISPLAY_LENGTH,
@@ -111,7 +111,7 @@ def _threshold_number(value: object, name: str) -> float:
 def _config_text(value: object, name: str, maximum: int) -> str:
     if not isinstance(value, str) or not value.strip() or len(value) > maximum:
         raise ValueError(f"{name} must be a non-empty string up to {maximum} characters")
-    if value != value.strip() or redact_secrets(value, maximum + 1) != value:
+    if value != value.strip() or sanitize_output_text(value) != value:
         raise ValueError(f"{name} contains unsafe output text")
     return value
 
@@ -200,8 +200,8 @@ def load_fleet_config(path: Path = DEFAULT_CONFIG) -> FleetConfig:
     )
 
 
-def _redact_error(value: str) -> str:
-    return redact_secrets(value)
+def _error_text(value: str) -> str:
+    return bound_text(value)
 
 
 def _nonnegative_number(value: object, name: str, maximum: float | None = None) -> None:
@@ -220,7 +220,7 @@ def _wire_text(value: object, name: str, limit: int = 1000, required: bool = Fal
         return None
     if not isinstance(value, str) or (required and not value.strip()):
         raise ValueError(f"Host snapshot has invalid {name}")
-    projected = redact_secrets(value, limit)
+    projected = bound_text(value, limit)
     if required and not projected.strip():
         raise ValueError(f"Host snapshot has invalid {name}")
     return projected
@@ -230,7 +230,7 @@ def _wire_identity(value: object, name: str, limit: int = MAX_IDENTITY_LENGTH,
                    required: bool = False) -> str | None:
     projected = _wire_text(value, name, limit, required)
     if (projected is not None
-            and (projected != value or "[REDACTED" in projected.upper()
+            and (projected != value
                  or any(unicodedata.category(character) in {"Cc", "Cf"}
                         for character in projected))):
         raise ValueError(f"Host snapshot has unsafe {name}")
@@ -355,7 +355,7 @@ def _add_projection_error(errors: dict, section: str, *, changed: int = 0,
         return
     evidence = "Projection: " + "; ".join(details)
     existing = errors.get(section)
-    errors[section] = redact_secrets(
+    errors[section] = bound_text(
         f"{evidence}; {existing}" if existing else evidence,
         500,
     )
@@ -786,7 +786,7 @@ def ssh_snapshot(host: FleetHost, timeout: float) -> dict:
         raise ValueError(failure)
     if process.returncode:
         detail = stderr.decode(errors="replace").strip() or f"ssh exited {process.returncode}"
-        raise ValueError(_redact_error(detail))
+        raise ValueError(_error_text(detail))
     return _validate_snapshot(bytes(stdout))
 
 
@@ -887,7 +887,7 @@ def query_fleet(config: FleetConfig, local_snapshot=None, only: str | None = Non
                     "snapshot": snapshot, "_started_at": started, "_received_at": received_at}
         except (OSError, ValueError, KeyError, TypeError, RecursionError, UnicodeError, OverflowError) as error:
             return {**wrapper, "ok": False, "latency_ms": round((time.monotonic() - started) * 1000),
-                    "error": _redact_error(str(error))}
+                    "error": _error_text(str(error))}
 
     records = {}
     with ThreadPoolExecutor(max_workers=min(len(selected), MAX_HOSTS)) as pool:
@@ -967,7 +967,9 @@ def query_fleet(config: FleetConfig, local_snapshot=None, only: str | None = Non
             alert for alert in snapshot["alerts"] if alert.get("kind") not in CAPACITY_ALERT_KINDS
         ]
         if snapshot["host"] and capacity:
-            snapshot["alerts"].extend(capacity_alerts(
+            # Reclassified on the viewer's clock, so these belong on the wrapper; the
+            # nested snapshot keeps only producer-timed alerts (generation chronology).
+            record["alerts"].extend(capacity_alerts(
                 snapshot["host"], capacity, configured_hosts[record["name"]].thresholds,
                 generated_at,
             ))

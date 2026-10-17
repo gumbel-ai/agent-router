@@ -12,7 +12,7 @@ from functools import lru_cache
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 
-from router.redaction import redact_secrets
+from router.sanitize import sanitize_output_text
 from router.validation import HOST_STRING_LIMITS
 
 
@@ -152,7 +152,7 @@ class HostIdentity:
     def view(self, observed_at: int) -> dict:
         if (self._static.get("host_id") != self.host_id
                 or len(self.host_id) > HOST_STRING_LIMITS["host_id"]
-                or redact_secrets(self.host_id, len(self.host_id) + 16) != self.host_id):
+                or sanitize_output_text(self.host_id) != self.host_id):
             raise ValueError("Generated host identity is unsafe to serialize")
         result = {"host_id": self.host_id}
         for key, limit in HOST_STRING_LIMITS.items():
@@ -161,7 +161,7 @@ class HostIdentity:
             value = self._static.get(key)
             if not isinstance(value, str) or not value.strip():
                 raise ValueError(f"Host identity has invalid {key}")
-            projected = redact_secrets(value, len(value) + 16)
+            projected = sanitize_output_text(value)
             if not projected.strip() or len(projected) > limit:
                 raise ValueError(f"Host identity has invalid {key}")
             result[key] = projected

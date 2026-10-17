@@ -11,7 +11,7 @@ from pathlib import Path
 from router.db import Store, now_ms
 from router.dispatch import canonical
 from router.pricing import DEFAULT_PRICES, PRICE_DATE, PRICE_SOURCE, estimate
-from router.redaction import redact_secrets, redact_structure, strip_terminal_sequences
+from router.sanitize import bound_text, sanitize_structure, strip_terminal_sequences
 from router.validation import MAX_WIRE_INTEGER, is_wire_integer
 
 LOGGER = logging.getLogger(__name__)
@@ -41,21 +41,19 @@ def identifier(value: object, name: str, limit: int = 240) -> str:
         raise TypeError(f"Native observation requires {name}")
     normalized = text(value, None)
     if (normalized is None or normalized != value or len(normalized) > limit
-            or any(ord(character) < 32 or ord(character) == 127 for character in value)
-            or redact_secrets(normalized) != normalized):
+            or any(ord(character) < 32 or ord(character) == 127 for character in value)):
         raise ValueError(f"Native observation has invalid {name}")
     return normalized
 
 
 def safe_text(value: object, limit: int) -> str | None:
     normalized = text(value, None)
-    return redact_secrets(normalized, limit) if normalized is not None else None
+    return bound_text(normalized, limit) if normalized is not None else None
 
 
 def _private_path(value: object, name: str) -> str:
     if (not isinstance(value, str) or not value or len(value) > 2000
-            or any(ord(character) < 32 or ord(character) == 127 for character in value)
-            or redact_secrets(value, 2001) != value):
+            or any(ord(character) < 32 or ord(character) == 127 for character in value)):
         raise ValueError(f"Native observation has invalid {name}")
     return value
 
@@ -93,6 +91,9 @@ class NativeObserver:
                                                  + max(0, observed_until - record["run_started_at"]))
                     record.update(status="unknown", run_started_at=None, runtime_partial=True,
                                   continuity_uncertain=True,
+                                  # Unresolved, not stopped: capacity cannot be exact until then.
+                                  restart_uncertain_until=min(
+                                      MAX_WIRE_INTEGER, (record.get("last_event_at") or 0) + STALE_AFTER_MS),
                                   visibility_reason="Router restarted; awaiting native lifecycle evidence")
                     self.put(db, record)
 
@@ -208,8 +209,8 @@ class NativeObserver:
                 try:
                     transcript = _private_path(event["transcript"], "transcript")
                 except ValueError:
-                    # A token-like path segment must not discard lifecycle
-                    # evidence; only usage from that transcript is lost.
+                    # An unusable path (controls or length) must not discard
+                    # lifecycle evidence; only usage from that transcript is lost.
                     self._mark_usage_incomplete(record, "Transcript path unusable; usage is incomplete")
                     transcript = record.get("transcript")
                 if transcript != record.get("transcript"):
@@ -763,11 +764,11 @@ class NativeObserver:
             "continuity_uncertain", "result_at", "result_segment_started_at",
             "result_segment_base_duration", "session_ended_at", "session_end_uncertain",
             "session_end_segment_started_at", "session_end_segment_base_duration",
-            "session_end_prior_state_at", "usage_invalid", "model_history_partial",
+            "session_end_prior_state_at", "usage_invalid", "model_history_partial", "restart_uncertain_until",
             "transcript_file_id", "transcript_file_size", "transcript_file_mtime_ns",
             "transcript_boundary", "transcript_revision", "transcript_error_irreversible",
             "transcript_transient_error"}}
-        result = redact_structure(result)
+        result = sanitize_structure(result)
         models = result.get("models")
         if isinstance(models, list) and len(models) > MAX_MODELS:
             result.update(models=models[:MAX_MODELS], usage_partial=True)
@@ -842,8 +843,12 @@ class NativeObserver:
                 WHERE json_extract(data,'$.host_id')=?
                   AND json_extract(data,'$.status') IN ('running','idle','needs_input')
                   AND json_extract(data,'$.last_event_at')>?""", (self.host_id, at)).fetchone()[0]
-        if future:
-            # Clock rollback: an exact active total cannot be established, even off-page.
+            unresolved = db.execute("""SELECT COUNT(*) FROM observations
+                WHERE json_extract(data,'$.host_id')=? AND json_extract(data,'$.status')='unknown'
+                  AND json_extract(data,'$.restart_uncertain_until')>=?""", (self.host_id, at)).fetchone()[0]
+        if future or unresolved:
+            # Clock rollback or restart uncertainty: an exact active total cannot be
+            # established, even off-page, so capacity becomes unknown.
             active = None
         visible = []
         for record in records:

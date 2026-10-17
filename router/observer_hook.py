@@ -6,7 +6,7 @@ import time
 from pathlib import Path
 
 from router.client import request
-from router.redaction import redact_secrets, strip_terminal_sequences
+from router.sanitize import bound_text, strip_terminal_sequences
 
 
 def text(value: object, limit: int | None = 240) -> str | None:
@@ -19,9 +19,9 @@ def text(value: object, limit: int | None = 240) -> str | None:
     return (normalized if limit is None else normalized[:limit]) or None
 
 
-def redacted_text(value: object, limit: int) -> str | None:
+def bounded_text(value: object, limit: int) -> str | None:
     normalized = text(value, None)
-    return redact_secrets(normalized, limit) if normalized is not None else None
+    return bound_text(normalized, limit) if normalized is not None else None
 
 
 def observe(event: dict) -> dict:
@@ -43,12 +43,12 @@ def observe(event: dict) -> dict:
     if session_kind:
         session_payload = {"source": "claude", "session_id": event.get("session_id"), "observed_at": at,
                            "kind": session_kind, "cwd": event.get("cwd"), "model": event.get("model"),
-                           "parent_session_id": event.get("parent_session_id"), "activity": redacted_text(tool, 240),
+                           "parent_session_id": event.get("parent_session_id"), "activity": bounded_text(tool, 240),
                            "tool_use_id": event.get("tool_use_id"),
                            "start_source": event.get("source"),
                            "notification_type": event.get("notification_type"),
                            "background_tasks": event.get("background_tasks"), "task_id": event.get("task_id"),
-                           "task_subject": redacted_text(event.get("task_subject"), 500),
+                           "task_subject": bounded_text(event.get("task_subject"), 500),
                            "teammate_name": event.get("teammate_name"), "agent_id": event.get("agent_id")}
     payload = {"source": "claude", "session_id": event.get("session_id"), "observed_at": at,
                "agent_id": event.get("agent_id"), "agent_type": event.get("agent_type"), "cwd": event.get("cwd")}
@@ -58,20 +58,20 @@ def observe(event: dict) -> dict:
     elif name in {"SubagentStart", "SubagentStop"}:
         payload["kind"] = "start" if name == "SubagentStart" else "stop"
         if name == "SubagentStop":
-            payload["summary"] = redacted_text(event.get("last_assistant_message"), 800)
+            payload["summary"] = bounded_text(event.get("last_assistant_message"), 800)
             payload["transcript"] = event.get("agent_transcript_path")
     elif name == "PostToolUse" and tool in {"Agent", "Task"} and isinstance(response, dict) and response.get("agentId"):
         asynchronous = response.get("isAsync") is True or response.get("status") == "async_launched"
         payload.update(kind="launch" if asynchronous else "result", agent_id=response["agentId"],
                        parent_agent_id=event.get("agent_id") or "main",
-                       task=redacted_text(inputs.get("description"), 240),
+                       task=bounded_text(inputs.get("description"), 240),
                        agent_type=inputs.get("subagent_type"), requested_model=inputs.get("model"),
                        resolved_model=response.get("resolvedModel"))
         if isinstance(response.get("costUSD"), (int, float)):
             payload["cost"] = response["costUSD"]
     elif name in {"PreToolUse", "PostToolUse", "PostToolUseFailure"} and payload["agent_id"]:
-        payload.update(kind="activity", activity=redacted_text(tool, 240),
-                       file_path=redacted_text(inputs.get("file_path"), 2000))
+        payload.update(kind="activity", activity=bounded_text(tool, 240),
+                       file_path=bounded_text(inputs.get("file_path"), 2000))
     elif name == "TeammateIdle" and payload["agent_id"]:
         payload.update(kind="idle", activity="teammate idle")
     elif name == "Notification" and payload["agent_id"] and event.get("notification_type") == "agent_needs_input":

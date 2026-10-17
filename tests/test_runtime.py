@@ -104,7 +104,7 @@ class RuntimeTests(RuntimeHarness, unittest.TestCase):
             "session": {"source": "claude", "session_id": "partial-write",
                         "kind": "session_start", "observed_at": at},
             "native": {"source": "claude", "session_id": "S",
-                       "agent_id": "token=unsafe-identity", "kind": "result",
+                       "agent_id": "unsafe\x1b[2Jidentity", "kind": "result",
                        "observed_at": at},
         })
         self.assertEqual(failed["accepted"], False)
@@ -148,7 +148,7 @@ class RuntimeTests(RuntimeHarness, unittest.TestCase):
     @patch("router.daemon.LIFECYCLE_ACK_TIMEOUT_SECONDS", 5)
     def test_lifecycle_failure_identifies_component_when_nothing_persists(self):
         failed = self.control.handle("lifecycle_observe", {"native": {
-            "source": "claude", "session_id": "S", "agent_id": "token=unsafe-identity",
+            "source": "claude", "session_id": "S", "agent_id": "unsafe\x1b[2Jidentity",
             "kind": "result", "observed_at": int(time.time() * 1000),
         }})
         self.assertEqual(failed, {

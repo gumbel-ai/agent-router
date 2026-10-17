@@ -81,6 +81,8 @@ Run `router snapshot --json` for the local bounded schema, `router fleet status 
 
 The fleet command invokes only `router snapshot --json` remotely. It does not copy SQLite files, change SSH configuration, schedule work, kill processes, or write project state. Capacity states are summaries over explicit CPU, load, memory, and disk thresholds; inspect the accompanying raw measurements and reason list for job-specific decisions. Milestone A intentionally leaves `managed_processes` and `inferred_processes` empty until process visibility is implemented.
 
+Snapshots carry text as written, such as task descriptions, task subjects, and error messages. Router removes terminal control sequences and bounds length, but it does not scan text for secrets or rewrite it. Each host decides whether its task text leaves the machine: set `AGENT_ROUTER_FLEET_SHARE_TEXT=false` on a host to withhold its task descriptions and subjects from fleet snapshots. The default is to share.
+
 An external coordinator can reserve a host without granting Router any control authority by atomically writing `~/.agent-router/reservation.json` on that host:
 
 ```json
