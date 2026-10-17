@@ -158,7 +158,8 @@ sources with correct host identity and capacity.
 ## 6. Simplify fleet snapshot validation
 
 **Status:** Done. Change and omission accounting removed; unknown fields are dropped and
-text is sanitized without marking a snapshot partial. Hostile-input rejections are
+control characters removed without marking a snapshot partial. Truncated text still marks
+its section partial. Hostile-input rejections are
 unchanged; tests no longer assert the removed diagnostic messages.
 
 **Why:** `_validate_snapshot` and `_project_record` treat every peer as hostile and

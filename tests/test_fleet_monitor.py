@@ -1294,7 +1294,7 @@ class SnapshotAndFleetTests(unittest.TestCase):
         self.assertNotIn("future_field", projected["agents"][0])
 
 
-    def test_projection_bounds_and_sanitizes_text_without_marking_partial(self):
+    def test_projection_marks_truncated_text_partial_but_not_removed_controls(self):
         value = snapshot()
         value["tasks"] = [{
             "host_id": "host-1", "source": "claude", "session_id": "same",
@@ -1305,7 +1305,11 @@ class SnapshotAndFleetTests(unittest.TestCase):
         projected = _validate_snapshot(json.dumps(value).encode())
         self.assertEqual(len(projected["tasks"][0]["subject"]), 500)
         self.assertEqual(projected["agents"][0]["activity"], "Edit now")
-        self.assertFalse(projected["partial"])
+        self.assertTrue(projected["partial"])  # The subject lost text.
+        self.assertIn("truncated", projected["errors"]["tasks"])
+        self.assertNotIn("agents", projected["errors"])  # Removing controls alone is not partial.
+        value["tasks"][0]["subject"] = "x" * 500
+        self.assertFalse(_validate_snapshot(json.dumps(value).encode())["partial"])
 
     def test_wire_numeric_and_identity_domains_are_field_specific(self):
         cases = {

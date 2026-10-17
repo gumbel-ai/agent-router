@@ -281,6 +281,8 @@ def _project_record(record: dict, allowed: frozenset[str], required: tuple[str, 
                 )
             else:
                 projected[key] = _wire_text(value, f"{collection} {key}", limit)
+                if isinstance(value, str) and len(sanitize_output_text(value)) > limit:
+                    projected["_truncated"] = True  # Lost text must stay visibly partial.
         elif key in positive_integer_fields:
             if value is not None and not is_wire_integer(value, minimum=1):
                 raise ValueError(f"Host snapshot has invalid {collection} {key}")
@@ -498,6 +500,11 @@ def _validate_snapshot(payload: bytes) -> dict:
             _project_record(record, record_fields[collection], ("host_id",), collection, host["host_id"])
             for record in snapshot[collection]
         ]
+    truncated_sections = []
+    for collection, records in projected_collections.items():
+        flags = [record.pop("_truncated", False) for record in records]  # Pop from every record.
+        if any(flags):
+            truncated_sections.append(collection)
     projected_alerts = []
     alert_entity_fields = frozenset({
         "source", "session_id", "parent_session_id", "agent_id", "task_id", "configured_host",
@@ -598,6 +605,8 @@ def _validate_snapshot(payload: bytes) -> dict:
     unknown_error_count = len(set(errors) - recognized_error_sections)
     if unknown_error_count:
         projected_errors["other"] = f"{unknown_error_count} unrecognized error section(s) omitted"
+    for section in truncated_sections:
+        projected_errors.setdefault(section, "Text truncated to the fleet length bound")
     if rejected_router_tasks:
         projected_errors["router_tasks"] = bound_text(
             f"{rejected_router_tasks} invalid Router task record(s) omitted"
