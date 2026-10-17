@@ -4,7 +4,9 @@
 runtime_dir="${AGENT_ROUTER_STATE_DIR:-$HOME/.agent-router}"
 if [ -r "$runtime_dir/python-path" ]; then
     IFS= read -r interpreter < "$runtime_dir/python-path"
-    exec "$interpreter" -I -m router.observer_hook --source codex
+    if [ -x "$interpreter" ]; then
+        exec "$interpreter" -I -m router.observer_hook --source codex
+    fi
 fi
 if command -v router-observe >/dev/null 2>&1; then
     exec router-observe --source codex

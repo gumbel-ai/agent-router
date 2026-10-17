@@ -147,6 +147,12 @@ calling `router/plugin/codex/hook.sh` against an isolated Router daemon:
 - Resuming the session (`codex exec resume <id>`) did not continue the earlier
   subagent: the model could only `wait` with no receivers. Treating a Codex
   session's end as the end of its subagents therefore holds for exec sessions.
+- Installed-plugin path: with the plugin added from the local marketplace and its hooks
+  trusted only by writing the hashes `router/codex_plugin.py` computes (no bypass
+  flag), Codex ran Router's hooks and Router recorded the session and subagent. This
+  confirms the trust key format (`agent-router@agent-router:router/plugin/codex/hooks.json:<event>:<group>:<handler>`,
+  the manifest's `./` removed) and that `${PLUGIN_ROOT}` is hashed unexpanded (Codex
+  passes it as an environment variable).
 - Not observed live: `PermissionRequest` (exec runs without approvals), `Interrupt`,
   and compaction. Their mapping rests on the documentation and source.
 
@@ -157,9 +163,13 @@ calling `router/plugin/codex/hook.sh` against an isolated Router daemon:
 best effort and never blocks setup. The repository root ships `.codex-plugin/plugin.json`
 so Codex loads its own hooks file rather than falling back to the Claude manifest.
 Hooks must then be trusted once in Codex (`/hooks`). `router status` reports Codex
-observation readiness read-only by recomputing Codex's trust hash for each Router hook
-(`router/codex_plugin.py`), so an untrusted, modified, or disabled hook is reported
-instead of looking like an idle Codex.
+observation readiness read-only (`router/codex_plugin.py`): it reads the hooks file from
+the plugin copy Codex loads (`$CODEX_HOME/plugins/cache/agent-router/agent-router/<version>`,
+`local` first, else the highest version, as Codex selects it), recomputes Codex's trust
+hash for each hook, and checks the `[features] hooks` switch. An untrusted, modified, or
+disabled hook is reported instead of looking like an idle Codex. Codex keeps a Git
+marketplace snapshot until `codex plugin marketplace upgrade agent-router`; status
+reflects that installed copy, not Router's package.
 
 ## Testing implications for item 4
 

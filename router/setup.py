@@ -225,7 +225,13 @@ def uninstall(yes: bool = False) -> None:
     stop(uninstall=True)
     run(["claude", "plugin", "uninstall", PLUGIN_ID, "--scope", "user", "--keep-data"])
     if shutil.which("codex"):
-        subprocess.run(["codex", "plugin", "remove", PLUGIN_ID], capture_output=True, check=False)
+        try:
+            removed = subprocess.run(["codex", "plugin", "remove", PLUGIN_ID], stdin=subprocess.DEVNULL,
+                                     capture_output=True, timeout=120, check=False).returncode == 0
+        except subprocess.TimeoutExpired:
+            removed = False
+        if not removed:
+            print(f"Codex plugin not removed; remove it with: codex plugin remove {PLUGIN_ID}")
     runtime_pointer().unlink(missing_ok=True)
     run(["uv", "tool", "uninstall", "agent-router"])
     print("Agent Router uninstalled. Configuration, execution artifacts, and history retained.")

@@ -1,6 +1,7 @@
 import json
 import subprocess
 import tempfile
+import tomllib
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -27,8 +28,13 @@ class CodexPluginTests(unittest.TestCase):
         which.start()
         self.addCleanup(which.stop)
 
-    def configure(self, plugin="enabled = true\n", entries=None):
-        lines = []
+    def install(self, version, declarations=HOOKS):
+        hooks = self.home.joinpath("plugins", "cache", "agent-router", "agent-router", version, HOOKS_FILE)
+        hooks.parent.mkdir(parents=True, exist_ok=True)
+        hooks.write_text(json.dumps(declarations))
+
+    def configure(self, plugin="enabled = true\n", entries=None, extra=""):
+        lines = [extra]
         if plugin is not None:
             lines.append(f'[plugins."{PLUGIN_ID}"]\n{plugin}')
         for key, entry in (entries or {}).items():
@@ -48,11 +54,16 @@ class CodexPluginTests(unittest.TestCase):
                     for group in groups for handler in group["hooks"]}
         self.assertEqual(commands, {'sh "${PLUGIN_ROOT}/router/plugin/codex/hook.sh"'})
         self.assertTrue((ROOT / "router" / "plugin" / "codex" / "hook.sh").is_file())
-        self.assertEqual(len(expected_trust()), len(HOOKS["hooks"]))
+        self.assertEqual(len(expected_trust(HOOKS)), len(HOOKS["hooks"]))
+        # Codex caches the plugin under its manifest version; keep it tied to the package.
+        project = tomllib.loads((ROOT / "pyproject.toml").read_text())
+        self.assertEqual(manifest["version"], project["project"]["version"])
 
     def test_availability_names_the_missing_prerequisite(self):
-        trusted = {key: {"trusted_hash": value} for key, value in expected_trust().items()}
+        trusted = {key: {"trusted_hash": value} for key, value in expected_trust(HOOKS).items()}
         first = next(iter(trusted))
+        self.assertEqual(self.configure(entries=trusted), "plugin_not_installed")
+        self.install("0.9.0")
         self.assertEqual(self.configure(plugin=None), "plugin_not_installed")
         self.assertEqual(self.configure("enabled = false\n", trusted), "plugin_disabled")
         self.assertEqual(self.configure(entries={}), "hooks_untrusted")
@@ -60,17 +71,38 @@ class CodexPluginTests(unittest.TestCase):
         self.assertEqual(self.configure(entries={**trusted, first: {**trusted[first], "enabled": False}}),
                          "hooks_disabled")
         self.assertEqual(self.configure(entries=trusted), "ready")
+        for extra, state in (("[features]\nhooks = false\n", "hooks_disabled"),
+                             ("[features]\ncodex_hooks = false\n", "hooks_disabled"),
+                             ("[features]\ncodex_hooks = false\nhooks = true\n", "ready"),
+                             ("plugins = 1\n", "unknown"), ("hooks = true\n", "unknown")):
+            with self.subTest(extra=extra):
+                self.assertEqual(self.configure(entries=trusted, extra=extra), state)
+        # Codex trusts the copy it loads: the highest cached version, not Router's package.
+        changed = json.loads(json.dumps(HOOKS))
+        next(iter(changed["hooks"].values()))[0]["hooks"][0]["timeout"] = 3
+        self.install("0.10.0", changed)
+        self.assertEqual(self.configure(entries=trusted), "hooks_untrusted")
+        retrusted = {key: {"trusted_hash": value} for key, value in expected_trust(changed).items()}
+        self.assertEqual(self.configure(entries=retrusted), "ready")
+        (self.home / "config.toml").write_bytes(b"\xff")
+        self.assertEqual(availability(self.home)["state"], "unknown")
         (self.home / "config.toml").write_text("[plugins\n")
         self.assertEqual(availability(self.home)["state"], "unknown")
         with patch("router.codex_plugin.shutil.which", return_value=None):
             self.assertEqual(availability(self.home)["state"], "codex_not_installed")
 
     def test_hook_answers_codex_even_without_router(self):
-        environment = {"PATH": "/usr/bin:/bin", "HOME": str(self.home), "AGENT_ROUTER_STATE_DIR": str(self.home / "none")}
-        result = subprocess.run(["sh", str(ROOT / "router" / "plugin" / "codex" / "hook.sh")], env=environment,
-                                input='{"hook_event_name":"Stop"}', capture_output=True, text=True,
-                                timeout=30, check=False)
-        self.assertEqual((result.returncode, result.stdout.strip()), (0, "{}"), result.stderr)
+        state = self.home / "state"
+        environment = {"PATH": "/usr/bin:/bin", "HOME": str(self.home), "AGENT_ROUTER_STATE_DIR": str(state)}
+        for pointer in (None, str(self.home / "removed" / "python")):
+            if pointer:
+                state.mkdir()
+                (state / "python-path").write_text(pointer + "\n")
+            with self.subTest(pointer=pointer):
+                result = subprocess.run(["sh", str(ROOT / "router" / "plugin" / "codex" / "hook.sh")], env=environment,
+                                        input='{"hook_event_name":"Stop"}', capture_output=True, text=True,
+                                        timeout=30, check=False)
+                self.assertEqual((result.returncode, result.stdout.strip()), (0, "{}"), result.stderr)
 
     def test_setup_install_is_best_effort(self):
         for codes, installed in (([0, 0], True), ([0, 1], False)):
