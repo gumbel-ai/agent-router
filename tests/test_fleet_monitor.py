@@ -2817,9 +2817,26 @@ class RouterTaskFleetTests(unittest.TestCase):
         self.assertIn("router:parent-sess", table)
 
     def test_router_task_text_follows_fleet_text_sharing(self):
-        self.task("running")
+        self.task("failed", failure_reason="[Errno 2] No such file: '/Users/me/worktree'")
         self.control.settings = Settings(AGENT_ROUTER_FLEET_SHARE_TEXT="false")
-        self.assertIsNone(compose(self.control)["router_tasks"][0]["task"])
+        [record] = compose(self.control)["router_tasks"]
+        self.assertEqual((record["task"], record["failure_reason"]), (None, None))
+
+    def test_one_odd_router_task_cannot_take_the_host_out_of_the_fleet(self):
+        self.assertNotIn("router_tasks", compose(self.control))  # Older viewers never see an empty section.
+        now = int(time.time() * 1000)
+        long_id = "p" * 241
+        self.task("closed", at=now - 1000)
+        self.task("awaiting_review", at=now - 5000, session_id=long_id, parent_agent_id=long_id,
+                  duration_ms=-2000, invocation={"task": "x" * 200_000, "parent_worktree": "/work"})
+        local = compose(self.control)
+        projected = _validate_snapshot(json.dumps(local).encode())
+        self.assertNotIn("router_tasks", projected.get("errors", {}))
+        decision, finished = projected["router_tasks"]  # Waiting on a decision sorts before finished work.
+        self.assertEqual((decision["status"], finished["status"]), ("awaiting_review", "closed"))
+        self.assertEqual((decision["parent_session_id"], decision["parent_agent_id"],
+                          decision["parent_reference_omitted"]), (None, None, True))
+        self.assertEqual((decision["elapsed_ms"], len(decision["task"])), (0, 240))
 
 
 if __name__ == "__main__":

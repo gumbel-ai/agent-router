@@ -34,7 +34,7 @@ CAPACITY_DEPENDENCY_SECTIONS = frozenset({
 
 
 # Free text written by users or agents; withheld when fleet text sharing is off.
-FLEET_TEXT_FIELDS = frozenset({"task", "subject"})
+FLEET_TEXT_FIELDS = frozenset({"task", "subject", "failure_reason"})
 
 class AlertHistory:
     """Preserve first-seen time while an alert remains continuously active."""
@@ -190,6 +190,9 @@ def compose(controller, thresholds: CapacityThresholds | None = None, history_li
     _collection(snapshot, "tasks", controller.sessions.tasks, history_limit)
     if hasattr(controller, "router_task_records"):
         _collection(snapshot, "router_tasks", controller.router_task_records, history_limit)
+        if not snapshot["router_tasks"] and "router_tasks" not in snapshot.get("errors", {}):
+            # Older fleet viewers treat unknown sections as partial; send it only when there is something to show.
+            del snapshot["router_tasks"]
     if not getattr(getattr(controller, "settings", None), "fleet_share_text", True):
         # The producing host decides whether user- and agent-written text leaves it.
         for key in ("agents", "tasks", "router_tasks"):

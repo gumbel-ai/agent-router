@@ -279,7 +279,8 @@ def _project_record(record: dict, allowed: frozenset[str], required: tuple[str, 
         "elapsed_ms", "inflight_tool_count", "created_at", "completed_at", "attempts",
     }
     boolean_fields = {"needs_input", "runtime_partial",
-                      "tool_visibility_partial", "cleanup_pending", "shutdown_unconfirmed"}
+                      "tool_visibility_partial", "cleanup_pending", "shutdown_unconfirmed",
+                      "parent_reference_omitted"}
     for key in allowed & record.keys():
         value = record[key]
         if key in text_fields:
@@ -497,7 +498,7 @@ def _validate_snapshot(payload: bytes) -> dict:
         "router_tasks": frozenset({"host_id", "task_id", "status", "executor", "requested_model", "resolved_model",
                                    "attempts", "parent_session_id", "parent_agent_id", "task", "activity",
                                    "failure_reason", "created_at", "started_at", "elapsed_ms", "last_event_at",
-                                   "cleanup_pending", "shutdown_unconfirmed"}),
+                                   "cleanup_pending", "shutdown_unconfirmed", "parent_reference_omitted"}),
         "managed_processes": frozenset({"host_id", "managed_id", "status", "label", "pid", "pgid",
                                         "started_at", "finished_at", "exit_code", "visibility_reason"}),
         "inferred_processes": frozenset({"host_id", "pid", "pgid", "status", "label", "started_at",
