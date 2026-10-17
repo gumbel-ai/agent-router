@@ -244,21 +244,9 @@ ROUTER_TASK_STATUSES = frozenset({
 })
 
 
-# Native usage and cost moved to Langfuse. Peers on older versions still send these;
-# drop them quietly rather than flagging every such snapshot as partial.
-RETIRED_AGENT_FIELDS = frozenset({
-    "models", "cost", "cost_source", "cost_note", "usage", "usage_source", "price_date",
-    "price_source", "price_overrides_used", "usage_partial", "transcript_pending", "transcript_error",
-    "worktree",
-})
-
-
 def _project_record(record: dict, allowed: frozenset[str], required: tuple[str, ...],
                     collection: str, host_id: str) -> dict:
     projected = {}
-    changed = 0
-    retired = RETIRED_AGENT_FIELDS if collection == "agents" else frozenset()
-    omitted = len(set(record) - allowed - retired)
     if collection == "agents" and record.get("model_source") == "transcript":
         # Older peers may report transcript-derived models; keep only host-reported ones.
         record = {**record, "resolved_model": None, "model_source": None}
@@ -293,7 +281,8 @@ def _project_record(record: dict, allowed: frozenset[str], required: tuple[str, 
                 )
             else:
                 projected[key] = _wire_text(value, f"{collection} {key}", limit)
-                changed += projected[key] != value
+                if isinstance(value, str) and len(sanitize_output_text(value)) > limit:
+                    projected["_truncated"] = True  # Lost text must stay visibly partial.
         elif key in positive_integer_fields:
             if value is not None and not is_wire_integer(value, minimum=1):
                 raise ValueError(f"Host snapshot has invalid {collection} {key}")
@@ -320,26 +309,7 @@ def _project_record(record: dict, allowed: frozenset[str], required: tuple[str, 
         raise ValueError(f"Host snapshot has unsafe {collection} identity")
     if projected.get("host_id") != host_id:
         raise ValueError(f"Host snapshot has mismatched {collection} host identity")
-    projected["_projection_changes"] = changed
-    projected["_projection_omissions"] = omitted
     return projected
-
-
-def _add_projection_error(errors: dict, section: str, *, changed: int = 0,
-                          omitted: int = 0) -> None:
-    details = []
-    if changed:
-        details.append(f"{changed} value(s) changed for output safety")
-    if omitted:
-        details.append(f"{omitted} unsupported field(s) omitted")
-    if not details:
-        return
-    evidence = "Projection: " + "; ".join(details)
-    existing = errors.get(section)
-    errors[section] = bound_text(
-        f"{evidence}; {existing}" if existing else evidence,
-        500,
-    )
 
 
 def _capacity_semantic_reasons(capacity: dict, collections: dict[str, list[dict]],
@@ -428,11 +398,6 @@ def _validate_snapshot(payload: bytes) -> dict:
     if (not isinstance(snapshot, dict) or not isinstance(snapshot.get("schema_version"), int)
             or isinstance(snapshot.get("schema_version"), bool) or snapshot["schema_version"] != SCHEMA_VERSION):
         raise ValueError("Host returned an unsupported snapshot schema")
-    top_level_fields = frozenset({
-        "schema_version", "generated_at", "partial", "host", "capacity", "sessions",
-        "agents", "tasks", "router_tasks", "managed_processes", "inferred_processes", "alerts", "errors",
-    })
-    top_level_omissions = len(set(snapshot) - top_level_fields)
     generated_at = snapshot.get("generated_at")
     if not is_wire_integer(generated_at):
         raise ValueError("Host snapshot has invalid generated_at")
@@ -506,8 +471,6 @@ def _validate_snapshot(payload: bytes) -> dict:
                                          "visibility_reason"}),
     }
     projected_collections = {}
-    collection_projection_partial = False
-    collection_projection_evidence: dict[str, tuple[int, int]] = {}
     rejected_router_tasks = 0
     for collection, required in identity_fields.items():
         if collection == "router_tasks":
@@ -537,21 +500,12 @@ def _validate_snapshot(payload: bytes) -> dict:
             _project_record(record, record_fields[collection], ("host_id",), collection, host["host_id"])
             for record in snapshot[collection]
         ]
+    truncated_sections = []
     for collection, records in projected_collections.items():
-        changed = 0
-        omitted = 0
-        for record in records:
-            changed += int(record.pop("_projection_changes", 0))
-            omitted += int(record.pop("_projection_omissions", 0))
-            changed += bool(record.pop("_projection_partial", False))
-        collection_projection_evidence[collection] = changed, omitted
-        collection_projection_partial |= bool(changed or omitted)
+        flags = [record.pop("_truncated", False) for record in records]  # Pop from every record.
+        if any(flags):
+            truncated_sections.append(collection)
     projected_alerts = []
-    alert_projection_changes = 0
-    alert_projection_omissions = 0
-    alert_fields = frozenset({
-        "alert_id", "host_id", "severity", "kind", "first_seen_at", "last_seen_at", "entity", "evidence",
-    })
     alert_entity_fields = frozenset({
         "source", "session_id", "parent_session_id", "agent_id", "task_id", "configured_host",
     })
@@ -583,12 +537,9 @@ def _validate_snapshot(payload: bytes) -> dict:
                            "first_seen_at": alert["first_seen_at"], "last_seen_at": alert["last_seen_at"],
                            "entity": entity,
                            "evidence": _wire_text(alert["evidence"], "alert evidence", 1000, True)}
-        alert_projection_changes += sum(
-            projected_alert[key] != alert[key] for key in ("severity", "kind", "evidence")
-        )
-        alert_projection_omissions += len(set(alert) - alert_fields)
-        alert_projection_omissions += len(set(alert["entity"]) - alert_entity_fields)
         projected_alerts.append(projected_alert)
+        if any(len(sanitize_output_text(alert[key])) > limit for key, limit in (("severity", 40), ("kind", 120))):
+            truncated_sections.append("alerts")  # Evidence is length-checked above; these are not.
     capacity_fields = frozenset({
         "logical_cpus", "load_1m", "load_5m", "cpu_busy_pct", "memory_total_bytes",
         "memory_available_bytes", "swap_used_bytes", "disk_available_bytes", "observed_at", "partial",
@@ -596,8 +547,6 @@ def _validate_snapshot(payload: bytes) -> dict:
         "reserved_by", "reserved_until", "reserved_cpu_slots", "reserved_memory_bytes", "reservation_source",
         "reservation_active", "capacity_state", "capacity_reasons",
     })
-    capacity_projection_omissions = len(set(capacity) - capacity_fields)
-    capacity_projection_changes = 0
     if "partial" in capacity and not isinstance(capacity["partial"], bool):
         raise ValueError("Host snapshot has invalid capacity partial flag")
     if capacity:
@@ -634,22 +583,22 @@ def _validate_snapshot(payload: bytes) -> dict:
     projected_capacity = {key: value for key, value in capacity.items() if key in capacity_fields}
     for key in ("reserved_by", "reservation_source", "error"):
         if key in projected_capacity and projected_capacity[key] is not None:
-            original = projected_capacity[key]
-            projected_capacity[key] = _wire_text(original, f"capacity {key}", 500 if key == "error" else 240)
-            capacity_projection_changes += projected_capacity[key] != original
+            projected_capacity[key] = _wire_text(projected_capacity[key], f"capacity {key}",
+                                                 500 if key == "error" else 240)
+    if capacity.get("error") is not None and not projected_capacity.get("error"):
+        # A reported failure stays a failure even if its text was only control characters.
+        projected_capacity["error"] = "Capacity error reported without printable text"
     if projected_capacity.get("capacity_reasons") is not None:
-        original_reasons = projected_capacity["capacity_reasons"]
         projected_capacity["capacity_reasons"] = [
             _wire_text(reason, "capacity reason", 500, True) for reason in projected_capacity["capacity_reasons"]
         ]
-        capacity_projection_changes += projected_capacity["capacity_reasons"] != original_reasons
     projected_errors = {}
     errors = snapshot.get("errors", {})
     if not isinstance(errors, dict):
         raise TypeError("Host snapshot has invalid errors")
     recognized_error_sections = {
         "host", "sessions", "agents", "tasks", "router_tasks", "managed_processes", "inferred_processes",
-        "capacity", "alerts", "lifecycle", "lifecycle_consistency", "output", "projection",
+        "capacity", "alerts", "lifecycle", "lifecycle_consistency", "output",
         "session_active_count", "agent_active_count", "managed_process_active_count",
     }
     for key, value in errors.items():
@@ -658,26 +607,15 @@ def _validate_snapshot(payload: bytes) -> dict:
     unknown_error_count = len(set(errors) - recognized_error_sections)
     if unknown_error_count:
         projected_errors["other"] = f"{unknown_error_count} unrecognized error section(s) omitted"
+    for section in dict.fromkeys(truncated_sections):
+        projected_errors.setdefault(section, "Text truncated to the fleet length bound")
     if rejected_router_tasks:
         projected_errors["router_tasks"] = bound_text(
             f"{rejected_router_tasks} invalid Router task record(s) omitted"
             + (f"; {projected_errors['router_tasks']}" if "router_tasks" in projected_errors else ""), 500)
-    for section, (changed, omitted) in collection_projection_evidence.items():
-        _add_projection_error(projected_errors, section, changed=changed, omitted=omitted)
-    _add_projection_error(
-        projected_errors, "alerts", changed=alert_projection_changes,
-        omitted=alert_projection_omissions,
-    )
-    _add_projection_error(
-        projected_errors, "capacity", changed=capacity_projection_changes,
-        omitted=capacity_projection_omissions,
-    )
-    _add_projection_error(projected_errors, "projection", omitted=top_level_omissions)
-    host_fields = frozenset({*host_string_fields, "observed_at"})
     projected_host = {"host_id": _wire_identity(
         host["host_id"], "host host_id", MAX_HOST_ID_LENGTH, True,
     )}
-    host_projection_changes = 0
     for key in host_string_fields:
         if key == "host_id":
             continue
@@ -686,16 +624,10 @@ def _validate_snapshot(payload: bytes) -> dict:
             HOST_STRING_LIMITS[key],
             True,
         )
-        host_projection_changes += projected_host[key] != host[key]
-    _add_projection_error(
-        projected_errors, "host", changed=host_projection_changes,
-        omitted=len(set(host) - host_fields),
-    )
     projected_host["observed_at"] = observed_at
     projected = {"schema_version": SCHEMA_VERSION, "generated_at": generated_at,
                  "partial": bool(snapshot["partial"] or projected_capacity.get("partial") is True
-                                 or projected_capacity.get("error") or projected_errors
-                                 or collection_projection_partial),
+                                 or projected_capacity.get("error") or projected_errors),
                  "host": projected_host, "capacity": projected_capacity,
                  **projected_collections, "alerts": projected_alerts}
     if projected_errors:

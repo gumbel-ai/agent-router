@@ -1198,16 +1198,19 @@ class SnapshotAndFleetTests(unittest.TestCase):
         self.assertNotIn("drop-me", serialized)
         # Known fields are projected; their text is kept as written.
         self.assertIn("status=failed apiKey=example next=ok", projected["errors"]["capacity"])
-        self.assertTrue(projected["partial"])
-        self.assertIn("unsupported field", projected["errors"]["projection"])
-        self.assertIn("unsupported field", projected["errors"]["sessions"])
-        self.assertIn("unsupported field", projected["errors"]["agents"])
+        self.assertTrue(projected["partial"])  # From the reported capacity error, not the dropped fields.
         self.assertEqual(projected["capacity"]["capacity_state"], "unknown")
 
         display_only = snapshot()
         display_only["sessions"][0]["unknown_display_field"] = "omitted"
         display_projection = _validate_snapshot(json.dumps(display_only).encode())
-        self.assertTrue(display_projection["partial"])
+        self.assertFalse(display_projection["partial"])
+        unprintable = snapshot()
+        unprintable["capacity"]["error"] = "\x1b[31m\u200b"
+        unprintable_projection = _validate_snapshot(json.dumps(unprintable).encode())
+        self.assertTrue(unprintable_projection["partial"])
+        self.assertEqual(unprintable_projection["capacity"]["capacity_state"], "unknown")
+        self.assertNotIn("unknown_display_field", display_projection["sessions"][0])
         self.assertFalse(display_projection["capacity"].get("partial", False))
         fleet_projection = query_fleet(
             FleetConfig((FleetHost("local", "local"),)),
@@ -1285,10 +1288,13 @@ class SnapshotAndFleetTests(unittest.TestCase):
                          "claude-opus")
         unknown = snapshot()
         unknown["agents"][0]["future_field"] = 1
-        self.assertTrue(_validate_snapshot(json.dumps(unknown).encode())["partial"])
+        # Unknown fields from newer peers are dropped; that alone is not a partial snapshot.
+        projected = _validate_snapshot(json.dumps(unknown).encode())
+        self.assertFalse(projected["partial"])
+        self.assertNotIn("future_field", projected["agents"][0])
 
 
-    def test_projection_preserves_producer_fields_and_reports_safe_transformations(self):
+    def test_projection_marks_truncated_text_partial_but_not_removed_controls(self):
         value = snapshot()
         value["tasks"] = [{
             "host_id": "host-1", "source": "claude", "session_id": "same",
@@ -1299,9 +1305,17 @@ class SnapshotAndFleetTests(unittest.TestCase):
         projected = _validate_snapshot(json.dumps(value).encode())
         self.assertEqual(len(projected["tasks"][0]["subject"]), 500)
         self.assertEqual(projected["agents"][0]["activity"], "Edit now")
-        self.assertTrue(projected["partial"])
-        self.assertIn("changed for output safety", projected["errors"]["tasks"])
-        self.assertIn("changed for output safety", projected["errors"]["agents"])
+        self.assertTrue(projected["partial"])  # The subject lost text.
+        self.assertIn("truncated", projected["errors"]["tasks"])
+        self.assertNotIn("agents", projected["errors"])  # Removing controls alone is not partial.
+        value["tasks"][0]["subject"] = "x" * 500
+        self.assertFalse(_validate_snapshot(json.dumps(value).encode())["partial"])
+        alerted = snapshot()
+        alerted["alerts"] = [{"alert_id": "a", "host_id": "host-1", "severity": "w" * 41, "kind": "k",
+                              "first_seen_at": 1, "last_seen_at": 1, "entity": {}, "evidence": "e"}]
+        projected = _validate_snapshot(json.dumps(alerted).encode())
+        self.assertEqual((len(projected["alerts"][0]["severity"]), projected["partial"]), (40, True))
+        self.assertIn("truncated", projected["errors"]["alerts"])
 
     def test_wire_numeric_and_identity_domains_are_field_specific(self):
         cases = {
@@ -1348,7 +1362,7 @@ class SnapshotAndFleetTests(unittest.TestCase):
         self.assertTrue(projected["partial"])
         self.assertTrue(projected["capacity"]["partial"])
         self.assertEqual(projected["capacity"]["capacity_state"], "unknown")
-        self.assertIn("unsupported field", projected["errors"]["capacity"])
+        self.assertNotIn("future_metric", projected["capacity"])
         self.assertIn("managed_processes", projected["errors"])
         self.assertIn("inferred_processes", projected["errors"])
 
@@ -2653,7 +2667,6 @@ required = false
         self.assertIn("remote failed: --password example value done", serialized)
         host = result["hosts"][0]["snapshot"]
         self.assertTrue(host["partial"])
-        self.assertIn("changed for output safety", host["errors"]["sessions"])
         self.assertEqual(host["capacity"]["capacity_state"], "busy")
 
     def test_tables_strip_terminal_controls_and_agent_only_host_keeps_metrics(self):
