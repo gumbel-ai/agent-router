@@ -175,6 +175,26 @@ class SessionObserver:
         return (waiters, cleared, partial) != before
 
     @staticmethod
+    def _observe_root_turn(record: dict, event: dict, kind: str, at: int, tool_evidence: bool) -> bool:
+        """Order whether the root turn is open by root events' own timestamps.
+
+        Child events advance the session's latest event, so a delayed root stop or
+        prompt must still be applied here, independently of them.
+        """
+        root = event.get("agent_id") is None
+        if kind in {"session_start", "prompt"} or (kind == "tool_start" and root and tool_evidence):
+            state = True
+        elif kind in {"stop", "stop_failure", "session_end"}:
+            state = False
+        else:
+            return False
+        if at < record.get("root_turn_at", -1):
+            return False
+        changed = record.get("root_turn_open") is not state or record.get("root_turn_at") != at
+        record.update(root_turn_open=state, root_turn_at=at)
+        return changed
+
+    @staticmethod
     def _waiter_history_partial(record: dict) -> bool:
         # An earlier format kept an eviction floor instead; it means the same uncertainty.
         floor = record.get("waiter_clear_floor")
@@ -215,7 +235,8 @@ class SessionObserver:
                 return self.view(record, max(now_ms(), at))
             tool_changed, tool_state_evidence = self._observe_tool(record, event, at)
             waiter_changed = self._observe_waiter(record, event, kind, at, tool_changed or tool_state_evidence)
-            evidence_changed = tool_changed or waiter_changed
+            root_changed = self._observe_root_turn(record, event, kind, at, tool_state_evidence)
+            evidence_changed = tool_changed or waiter_changed or root_changed
             if waiter_changed and record.get("visibility_reason") in {None, WAITING_REASON}:
                 # Keep the reason consistent with the waiters whatever the arrival order.
                 record["visibility_reason"] = WAITING_REASON if record["needs_input"] else None
@@ -327,10 +348,6 @@ class SessionObserver:
                 record["activity"] = "teammate idle"
             else:
                 raise ValueError("Unsupported session observation")
-            if kind in {"session_start", "prompt"}:
-                record["root_turn_open"] = True
-            elif kind in {"stop", "stop_failure", "session_end"}:
-                record["root_turn_open"] = False
             if kind in {"session_start", "session_end", "prompt", "stop", "stop_failure"}:
                 record["tool_reset_at"] = max(record.get("tool_reset_at", -1), at)
             self._put_session(db, record)
@@ -476,7 +493,7 @@ class SessionObserver:
         age = max(0, at - record["last_event_at"])
         result = {key: value for key, value in record.items() if key not in {
             "inflight_tools", "tool_event_at", "tool_finished_at", "waiting_agents", "waiters", "waiter_cleared_at",
-            "waiter_history_partial", "waiter_clear_floor", "waiter_evicted_at", "root_turn_open",
+            "waiter_history_partial", "waiter_clear_floor", "waiter_evicted_at", "root_turn_open", "root_turn_at",
             "tool_reset_at", "tool_active_until", "tool_overflow_until", "tool_overflow_active",
             "active_tool_times", "tool_correlation_partial", "tool_correlation_partial_until",
             "tool_terminal_floor", "tool_history_partial", "restart_uncertain_until",

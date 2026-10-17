@@ -180,6 +180,33 @@ class CodexObservationTests(unittest.TestCase):
         with patch("router.sessions.now_ms", return_value=self.clock + 1):
             self.assertEqual(self.control.sessions.fleet_records(10)[1], 0)
 
+    def test_root_turn_state_is_ordered_by_root_events(self):
+        child = {"agent_id": CHILD, "turn_id": "t2"}
+        cases = {
+            # Root tool activity after Stop reopens the root turn.
+            "root tool after stop": ([("Stop", 30, {}), ("PreToolUse", 40, {"tool_use_id": "r1"}),
+                                      ("PostToolUse", 50, {"tool_use_id": "r1"}), ("SubagentStop", 60, child)],
+                                     "running"),
+            # A delayed root Stop still closes the turn despite newer child events.
+            "delayed root stop": ([("PreToolUse", 45, {**child, "tool_use_id": "c1"}),
+                                   ("PostToolUse", 50, {**child, "tool_use_id": "c1"}),
+                                   ("Stop", 40, {}), ("SubagentStop", 60, child)], "idle"),
+        }
+        for name, (events, status) in cases.items():
+            with self.subTest(name):
+                self.control = Controller(settings(self.root / "repo"), {}, self.root / f"state-{name}")
+                self.control.start_lifecycle_writer()
+                self.addCleanup(self.control.stop_lifecycle_writer)
+                start = self.clock
+                self.hook("SessionStart", source="startup")
+                self.hook("UserPromptSubmit", turn_id="t1", prompt=CONTENT)
+                self.hook("SubagentStart", agent_type="default", **child)
+                for hook_name, offset, fields in events:
+                    self.clock = start + offset
+                    self.hook(hook_name, tool_name="Bash", tool_input={}, tool_response="", **fields)
+                self.assertEqual(self.session()["status"], status)
+                self.clock = start + 100
+
     def test_status_and_fleet_tables_label_the_source(self):
         self.hook("SessionStart", source="startup")
         self.hook("SubagentStart", turn_id="t2", agent_id=CHILD, agent_type="default")
