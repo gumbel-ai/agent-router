@@ -10,6 +10,7 @@ from pathlib import Path
 from pydantic import ValidationError
 
 from router.client import request
+from router.codex_plugin import availability as codex_availability
 from router.config import load_settings, socket_path, state_dir
 from router.dispatch import MUTATIONS
 from router.sanitize import sanitize_output_text
@@ -326,6 +327,9 @@ def main() -> None:
                         snapshot = request("snapshot", {"history_limit": 50})
                         print("\n" + sessions_table(snapshot.get("sessions", []),
                                                     snapshot.get("errors", {}).get("sessions")), flush=True)
+                        codex = codex_availability()
+                        if codex["state"] != "codex_not_installed":
+                            print(f"Codex observation: {codex['state']} - {_cell(codex['detail'], 160)}", flush=True)
                 if not args.watch:
                     break
                 time.sleep(2)

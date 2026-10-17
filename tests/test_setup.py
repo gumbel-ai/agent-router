@@ -143,8 +143,10 @@ class SetupTests(unittest.TestCase):
                 patch("router.service.sys.platform", "darwin"), \
                 patch("router.setup.shutil.which", return_value="/usr/bin/tool"), \
                 patch("router.setup.run", side_effect=command), \
+                patch("router.setup.install_codex_plugin") as codex, \
                 patch("router.setup.start", return_value={"version": "0.2.0"}):
             setup(yes=True)
+        codex.assert_called_once_with("gumbel-ai/agent-router")
         self.assertEqual(calls, [["uv", "tool", "dir"], ["claude", "plugin", "install", "agent-router",
                               "--marketplace", "gumbel-ai/agent-router", "--scope", "user"]])
         pointer = self.root / "state" / "python-path"

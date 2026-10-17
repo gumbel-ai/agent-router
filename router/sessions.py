@@ -270,6 +270,10 @@ class SessionObserver:
             if event.get("parent_session_id") is not None:
                 record["parent_session_id"] = identifier(event["parent_session_id"], "parent_session_id")
             if kind == "session_start":
+                if record["status"] == "stopped":
+                    # Reopened after its end (resume). Compaction and clear starts keep this boundary,
+                    # which lets native agents tell resumed work from late pre-end events.
+                    record["root_started_at"] = at
                 record.update(status="running", finished_at=None, visibility_reason=None,
                               activity="session " + (safe_text(event.get("start_source"), 240) or "start"))
                 self._reset_waiters(record, at)
@@ -496,7 +500,7 @@ class SessionObserver:
             "waiter_history_partial", "waiter_clear_floor", "waiter_evicted_at", "root_turn_open", "root_turn_at",
             "tool_reset_at", "tool_active_until", "tool_overflow_until", "tool_overflow_active",
             "active_tool_times", "tool_correlation_partial", "tool_correlation_partial_until",
-            "tool_terminal_floor", "tool_history_partial", "restart_uncertain_until",
+            "tool_terminal_floor", "tool_history_partial", "restart_uncertain_until", "root_started_at",
         }}
         result = sanitize_structure(result)
         clock_rollback = record["last_event_at"] > at

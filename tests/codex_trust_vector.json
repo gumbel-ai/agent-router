@@ -1,0 +1,14 @@
+{
+ "source": "evo@evo-hq 0.8.0 hooks/hooks.json PreToolUse group, trusted by Codex CLI 0.162.1 /hooks",
+ "event": "PreToolUse",
+ "group": {
+  "matcher": ".*",
+  "hooks": [
+   {
+    "type": "command",
+    "command": "node -e \"eval(Buffer.from('Y29uc3QgZnM9cmVxdWlyZSgnZnMnKSxvcz1yZXF1aXJlKCdvcycpLHBhdGg9cmVxdWlyZSgncGF0aCcpLGNwPXJlcXVpcmUoJ2NoaWxkX3Byb2Nlc3MnKSx0dHk9cmVxdWlyZSgndHR5Jyk7bGV0IGlucHV0PUJ1ZmZlci5hbGxvYygwKTt0cnl7aWYoIXR0eS5pc2F0dHkoMCkpaW5wdXQ9ZnMucmVhZEZpbGVTeW5jKDApfWNhdGNoKGUpe31jb25zdCBuYW1lcz1wcm9jZXNzLnBsYXRmb3JtPT09J3dpbjMyJz9bJ2V2by1ob29rLWRyYWluLmV4ZScsJ2V2by1ob29rLWRyYWluJ106Wydldm8taG9vay1kcmFpbiddO2NvbnN0IGNhbmRpZGF0ZXM9W107Y29uc3Qgcm9vdD1wcm9jZXNzLmVudi5DTEFVREVfUExVR0lOX1JPT1Q7aWYocm9vdCl7Zm9yKGNvbnN0IG4gb2YgbmFtZXMpY2FuZGlkYXRlcy5wdXNoKHBhdGguam9pbihyb290LCdiaW4nLG4pKX1jb25zdCBob21lPXByb2Nlc3MuZW52LkVWT19IT01FfHxwYXRoLmpvaW4ob3MuaG9tZWRpcigpLCcuZXZvJyk7Zm9yKGNvbnN0IG4gb2YgbmFtZXMpY2FuZGlkYXRlcy5wdXNoKHBhdGguam9pbihob21lLCdiaW4nLG4pKTtmb3IoY29uc3QgYiBvZiBjYW5kaWRhdGVzKXt0cnl7aWYoZnMuZXhpc3RzU3luYyhiKSl7Y29uc3Qgcj1jcC5zcGF3blN5bmMoYixbXSx7aW5wdXQsdGltZW91dDoyMDAwLGtpbGxTaWduYWw6J1NJR0tJTEwnfSk7aWYoci5zdGF0dXM9PT0wJiZyLnN0ZG91dCYmci5zdGRvdXQubGVuZ3RoKXtwcm9jZXNzLnN0ZG91dC53cml0ZShyLnN0ZG91dCk7cHJvY2Vzcy5leGl0KDApfX19Y2F0Y2goZSl7fX1wcm9jZXNzLnN0ZG91dC53cml0ZSgne31cbicpOw==','base64').toString())\""
+   }
+  ]
+ },
+ "trusted_hash": "sha256:2063dee80a93d61dd910b1de6ca64c619922bb7ed426add5db079b26da48bd17"
+}

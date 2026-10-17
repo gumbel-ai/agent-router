@@ -120,10 +120,11 @@ Router's `failed` agent state therefore never appears for Codex.
 - **Trust.** Every non-managed hook must be trusted against its current hash via
   Codex's `/hooks` command. Enabling a plugin does not trust its hooks, and a hook
   update changes its hash and requires re-trust. [D, S]
-- **Fail open.** Register hooks with `async: true`. Background hooks cannot block or
-  alter the session; at most eight run concurrently and unfinished ones are cancelled
-  at session end. A synchronous hook that is slow stalls the agent until its timeout
-  (600 s default). [D]
+- **Fail open, in order.** Background (`async: true`) hooks cannot block the session,
+  but they may finish in any order, and Router stamps events on receipt: a delayed
+  `PreToolUse` after `Stop` would reopen finished work. Router's Codex hooks are
+  therefore synchronous with a 2 s timeout, like its Claude observe hooks. The hook
+  always answers `{}` and measured 60-90 ms locally, so it delays but never blocks Codex. [D, V]
 - **Execution environment.** Hooks run through `$SHELL -lc` with a cleared environment
   replayed from the session snapshot. Profile scripts run on every hook, which adds
   latency and can print to stdout. The Router hook must not depend on inherited
@@ -134,6 +135,43 @@ Router's `failed` agent state therefore never appears for Codex.
   record the last Codex event seen per host, and, on explicit request, read Codex's
   config read-only for Router's trusted-hash entries.
 
+## Live verification (item 4b)
+
+Verified on 2026-10-17 with Codex CLI 0.162.1. Real `codex exec` sessions ran with
+this repository's `router/plugin/codex/hooks.json` supplied as per-run overrides,
+calling `router/plugin/codex/hook.sh` against an isolated Router daemon:
+
+- A root session with a shell command and one spawned subagent appeared in Router as
+  a `codex` session and a `codex/observe` agent, with the subagent's tool activity,
+  timing, and `stopped` ("Codex session ended") after the session ended. No snapshot
+  section was partial.
+- Resuming the session (`codex exec resume <id>`) did not continue the earlier
+  subagent: the model could only `wait` with no receivers. Treating a Codex
+  session's end as the end of its subagents therefore holds for exec sessions.
+- Installed-plugin path: with the plugin added from the local marketplace and its hooks
+  trusted only by writing the hashes `router/codex_plugin.py` computes (no bypass
+  flag), Codex ran Router's hooks and Router recorded the session and subagent. This
+  confirms the trust key format (`agent-router@agent-router:router/plugin/codex/hooks.json:<event>:<group>:<handler>`,
+  the manifest's `./` removed) and that `${PLUGIN_ROOT}` is hashed unexpanded (Codex
+  passes it as an environment variable).
+- Not observed live: `PermissionRequest` (exec runs without approvals), `Interrupt`,
+  and compaction. Their mapping rests on the documentation and source.
+
+## Installation and trust (implemented)
+
+`router setup` runs `codex plugin marketplace add <marketplace>` and
+`codex plugin add agent-router@agent-router` when Codex is installed. This step is
+best effort and never blocks setup. The repository root ships `.codex-plugin/plugin.json`
+so Codex loads its own hooks file rather than falling back to the Claude manifest.
+Hooks must then be trusted once in Codex (`/hooks`). `router status` reports Codex
+observation readiness read-only (`router/codex_plugin.py`): it reads the hooks file from
+the plugin copy Codex loads (`$CODEX_HOME/plugins/cache/agent-router/agent-router/<version>`,
+`local` first, else the highest version, as Codex selects it), recomputes Codex's trust
+hash for each hook, and checks the `[features] hooks` switch. An untrusted, modified, or
+disabled hook is reported instead of looking like an idle Codex. Codex keeps a Git
+marketplace snapshot until `codex plugin marketplace upgrade agent-router`; status
+reflects that installed copy, not Router's package.
+
 ## Testing implications for item 4
 
 - Router-launched Codex children disable delegation and ignore user config
@@ -142,10 +180,10 @@ Router's `failed` agent state therefore never appears for Codex.
   with placeholders), and verify the inferred behaviours marked **I** against a real
   session: per-turn `SubagentStop`, `send_input` turns, `Stop` continuation,
   `Interrupt`, and whether a `resume`d session continues existing subagent threads.
-  Router marks a Codex session's subagents stopped when the session ends; if resume
-  can continue them, their later activity must be allowed to reopen them.
-- Async hooks are stamped when they run, so a subagent hook can arrive after the
-  session's `SessionEnd` with a later timestamp. Decide from the real session whether
-  post-end subagent activity is allowed only after a later root `SessionStart`
-  (`resume`), and test both new and existing subagent records.
+  Router marks a Codex session's subagents stopped when the session ends. Live
+  verification showed resume does not continue them, so they stay stopped.
+- Hooks are stamped when they run, so a subagent event can still be stamped after the
+  session's `SessionEnd`. Decided: such an event leaves the agent stopped unless a later
+  root `SessionStart` (`resume`) has reopened the session (`router/native.py`), tested
+  for new and existing subagent records.
 - Capturing a session with subagents requires a persisted (non-ephemeral) session.

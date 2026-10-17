@@ -118,6 +118,10 @@ contract tests pass unchanged.
 
 ## 4. Native Codex activity observation
 
+**Status:** 4a (observer mapping, restart reconcile, sessions and source in status) and
+4b (Codex plugin, setup install, readiness in status, live check) done. Live results:
+[codex-lifecycle.md](codex-lifecycle.md#live-verification-item-4b). Fleet check is item 5.
+
 **Why:** Parity with Claude Code for the Claude/Codex switching workflow.
 
 **Scope:**

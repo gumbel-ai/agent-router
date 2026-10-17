@@ -61,7 +61,8 @@ def setup(yes: bool = False, marketplace: str = MARKETPLACE) -> None:
         raise ValueError("Install Claude Code and uv first")
     load_settings()
     current = require_idle()
-    confirm("Install Agent Router's user-scoped Claude plugin and a background service? Local observation history stays on this machine.", yes)
+    codex = " and its Codex plugin" if shutil.which("codex") else ""
+    confirm(f"Install Agent Router's user-scoped Claude plugin{codex} and a background service? Local observation history stays on this machine.", yes)
     tool_dir = Path(run(["uv", "tool", "dir"])) / "agent-router"
     if current:
         label, _ = identity()
@@ -79,6 +80,7 @@ def setup(yes: bool = False, marketplace: str = MARKETPLACE) -> None:
             raise ValueError("Persistent Router setup failed; retry router setup after resolving the reported error")
         return
     run(["claude", "plugin", "install", "agent-router", "--marketplace", marketplace, "--scope", "user"])
+    install_codex_plugin(marketplace)
     private_write(runtime_pointer(), str(Path(sys.executable).absolute()) + "\n")
     result = start(restart=bool(current))
     print(f"Agent Router ready ({result['version']}). Run ordinary claude in any project, and router status --watch in a terminal.")
@@ -197,11 +199,39 @@ def init(args) -> None:
     initialize(repo, model, setup_command, permission, cap, timeout, attempts, executor=args.executor, sandbox=sandbox)
 
 
+def install_codex_plugin(marketplace: str) -> None:
+    """Best effort: Codex observation is optional and must not block Router setup."""
+    if not shutil.which("codex"):
+        return
+    for command in (["codex", "plugin", "marketplace", "add", marketplace],
+                    ["codex", "plugin", "add", PLUGIN_ID]):
+        # Both commands are idempotent in Codex 0.162.1: re-adding exits 0.
+        try:
+            failed = subprocess.run(command, stdin=subprocess.DEVNULL, capture_output=True,
+                                    timeout=120, check=False).returncode != 0
+        except (subprocess.TimeoutExpired, OSError):  # Codex optional: never abort setup.
+            failed = True
+        if failed:
+            print(f"Codex plugin not installed ({' '.join(command)} failed). "
+                  f"Install it later with: codex plugin marketplace add {marketplace} && codex plugin add {PLUGIN_ID}")
+            return
+    print("Codex plugin installed. Trust its hooks once: open Codex and run /hooks "
+          "(router status shows whether Codex observation is ready).")
+
+
 def uninstall(yes: bool = False) -> None:
     require_idle()
     confirm("Remove Agent Router's user-scoped Claude plugin, service, and CLI? Keep configuration and history.", yes)
     stop(uninstall=True)
     run(["claude", "plugin", "uninstall", PLUGIN_ID, "--scope", "user", "--keep-data"])
+    if shutil.which("codex"):
+        try:
+            removed = subprocess.run(["codex", "plugin", "remove", PLUGIN_ID], stdin=subprocess.DEVNULL,
+                                     capture_output=True, timeout=120, check=False).returncode == 0
+        except (subprocess.TimeoutExpired, OSError):  # Codex optional: finish uninstalling.
+            removed = False
+        if not removed:
+            print(f"Codex plugin not removed; remove it with: codex plugin remove {PLUGIN_ID}")
     runtime_pointer().unlink(missing_ok=True)
     run(["uv", "tool", "uninstall", "agent-router"])
     print("Agent Router uninstalled. Configuration, execution artifacts, and history retained.")

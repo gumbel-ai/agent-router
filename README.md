@@ -7,7 +7,7 @@ Delegate coding tasks to another agent while the parent stays in control.
 - Delegate across agent CLIs: Claude Code to OpenCode or Codex.
 - Choose the exact child model, with no silent substitution.
 - Run tasks in parallel while the parent keeps working.
-- Watch native Claude subagents and Router-launched children across projects with `router status --watch`.
+- Watch native Claude Code and Codex sessions and subagents, and Router-launched children, across projects with `router status --watch`.
 - View configured macOS and Linux hosts, Claude sessions, subagents, and available capacity with `router fleet status --watch`.
 - Give each child its own Git worktree and dependencies, not a security sandbox.
 - Start from your current files, including uncommitted changes.
@@ -28,7 +28,7 @@ Requires Git, uv, and Claude Code 2.1.292+ (sign in to run agents). Automatic ba
 uvx --python 3.14 --from git+https://github.com/gumbel-ai/agent-router router setup
 ```
 
-Approve the one-time user-scoped plugin and background-service installation. Then use ordinary `claude` in any project; no launch flags or project setup are needed for native visibility. Restart already-open Claude sessions. Watch all connected projects in another terminal:
+Approve the one-time user-scoped plugin and background-service installation. Then use ordinary `claude` in any project; no launch flags or project setup are needed for native visibility. Restart already-open Claude sessions. If the Codex CLI is installed, setup also adds Router's Codex plugin; open Codex once and trust its hooks with `/hooks`. `router status` reports whether Codex observation is ready. Watch all connected projects in another terminal:
 
 ```sh
 router status --watch
