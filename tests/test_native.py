@@ -202,6 +202,56 @@ class NativeTests(unittest.TestCase):
         self.assertIn("rewritten", rewritten["transcript_error"].lower())
         self.assertEqual(set(persisted["messages"]), {"new-and-longer"})
 
+    def test_rewrite_preserving_consumed_suffix_cannot_keep_stale_usage(self):
+        def line(message_id, tokens):
+            return json.dumps({"type": "assistant", "message": {
+                "id": message_id, "model": "claude-haiku-5-5",
+                "usage": {"input_tokens": tokens, "output_tokens": tokens},
+                "content": [{"type": "text", "text": "x" * 120}]}}) + "\n"
+
+        for grow in (False, True):
+            transcript = self.root / f"suffix-{grow}.jsonl"
+            original = line("aaa", 1) + line("tail", 1)
+            transcript.write_text(original)
+            record = self.event("stop", agent=f"suffix-{grow}", transcript=str(transcript))
+            first = self.control.handle("status", {"task_id": record["task_id"]})
+            self.assertEqual(first["usage"]["output_tokens"], 2)
+            inode = transcript.stat().st_ino
+            # Same length, same inode, unchanged 64-byte suffix; earlier tokens differ.
+            rewritten = line("aaa", 9) + line("tail", 1)
+            self.assertEqual(len(rewritten), len(original))
+            with transcript.open("r+") as stream:
+                stream.write(rewritten + (line("more", 1) if grow else ""))
+            self.assertEqual(transcript.stat().st_ino, inode)
+            later = self.control.handle("status", {"task_id": record["task_id"]})
+            self.assertTrue(later["usage_partial"], grow)
+            self.assertIsNone(later["cost"])
+            self.assertIn("rewritten", later["transcript_error"].lower())
+
+    def test_legacy_suffix_boundary_upgrades_without_losing_usage(self):
+        import hashlib
+
+        def line(message_id):
+            return json.dumps({"type": "assistant", "message": {
+                "id": message_id, "model": "claude-haiku-5-5",
+                "usage": {"input_tokens": 1, "output_tokens": 1}}}) + "\n"
+
+        transcript = self.root / "legacy.jsonl"
+        transcript.write_text(line("one"))
+        record = self.event("start", agent="legacy-boundary", transcript=str(transcript))
+        self.control.handle("status", {"task_id": record["task_id"]})
+        data = transcript.read_bytes()
+        legacy = hashlib.sha256(data[-64:]).hexdigest()
+        with self.control.store.transaction() as db:
+            db.execute("UPDATE observations SET data=json_set(data,'$.transcript_boundary',?) WHERE task_id=?",
+                       (legacy, record["task_id"]))
+        with transcript.open("a") as stream:
+            stream.write(line("two"))
+        upgraded = self.control.handle("status", {"task_id": record["task_id"]})
+        self.assertEqual(upgraded["usage"]["output_tokens"], 2)
+        self.assertIsNone(upgraded.get("transcript_error"))
+        self.assertTrue(self.control.native.get(record["task_id"])["transcript_boundary"].startswith("sha256-prefix:"))
+
     def test_transient_transcript_failure_recovers_after_complete_reread(self):
         transcript = self.root / "appears-later.jsonl"
         record = self.event("stop", agent="transient", transcript=str(transcript))
@@ -467,6 +517,99 @@ class NativeTests(unittest.TestCase):
         self.assertTrue(resumed["runtime_partial"])
         self.assertEqual(resumed["duration_ms"], 1599)
 
+    def test_terminal_result_blocks_older_delayed_start(self):
+        for terminal in ("stop", "failed"):
+            agent = "after-" + terminal
+            self.event("start", agent=agent, at=1000)
+            closed = self.event(terminal, agent=agent, at=1100)
+            self.event("result", agent=agent, at=1300)
+            for at in (1200, 1300):
+                delayed = self.event("start", agent=agent, at=at)
+                self.assertEqual(delayed["status"], closed["status"], (terminal, at))
+                self.assertEqual(delayed["finished_at"], closed["finished_at"])
+            reopened = self.event("start", agent=agent, at=1301)
+            self.assertEqual(self.control.native.get(reopened["task_id"])["status"], "running")
+
+    def test_delayed_failure_closes_like_delayed_stop(self):
+        self.event("start", agent="after-result", at=1000)
+        self.event("result", agent="after-result", at=2100)
+        failed = self.event("failed", agent="after-result", at=2000)
+        self.assertEqual(failed["status"], "failed")
+        self.assertEqual(failed["duration_ms"], 1000)
+        self.event("start", agent="after-end", session="E", at=1000)
+        self.event("session_end", agent=None, session="E", at=3000)
+        failed = self.event("failed", agent="after-end", session="E", at=2500)
+        self.assertEqual(failed["status"], "failed")
+        self.assertEqual(failed["duration_ms"], 1500)
+
+    def test_token_like_transcript_path_keeps_lifecycle_evidence(self):
+        transcript = "/Users/x/.claude/projects/-Users-x-work-sk-learn-experiments/S/subagents/agent-e.jsonl"
+        self.event("start", agent="sk-path", at=1000, transcript=transcript)
+        stopped = self.event("stop", agent="sk-path", at=2000, transcript=transcript)
+        persisted = self.control.native.get(stopped["task_id"])
+        self.assertEqual(persisted["status"], "stopped")
+        self.assertIsNone(persisted["transcript"])
+        self.assertTrue(stopped["usage_partial"])
+        self.assertIsNone(stopped["usage"])
+
+    def test_unchanged_transcript_at_eof_is_not_rehashed_for_any_status(self):
+        transcript = self.root / "quiet.jsonl"
+        transcript.write_text(json.dumps({"type": "assistant", "message": {
+            "id": "one", "model": "claude-haiku-5-5",
+            "usage": {"input_tokens": 1, "output_tokens": 1}}}) + "\n")
+        self.event("start", agent="quiet", at=1000, transcript=str(transcript))
+        record = self.event("failed", agent="quiet", at=2000)
+        self.control.handle("status", {"task_id": record["task_id"]})
+        with patch.object(type(self.control.native), "_prefix_hash", side_effect=AssertionError("rehash")):
+            again = self.control.handle("status", {"task_id": record["task_id"]})
+        self.assertEqual(again["usage"]["output_tokens"], 1)
+
+    def test_legacy_row_with_invalid_identity_does_not_hide_other_agents(self):
+        at = int(time.time() * 1000)
+        self.event("start", agent="good", at=at)
+        legacy = self.event("start", agent="legacy", at=at)
+        with self.control.store.transaction() as db:
+            db.execute("UPDATE observations SET data=json_set(data,'$.agent_id',' spaced') WHERE task_id=?",
+                       (legacy["task_id"],))
+        with self.assertLogs("router.native", "WARNING"):
+            rows = self.control.native.status()
+        self.assertEqual([row["agent_id"] for row in rows], ["good"])
+        with self.assertLogs("router.native", "WARNING"):
+            records, active = self.control.native.fleet_records(10)
+        self.assertEqual([record["agent_id"] for record in records], ["good"])
+        self.assertIsNone(active)
+
+    def test_fleet_page_keeps_needs_input_agent_ahead_of_running_agents(self):
+        at = int(time.time() * 1000)
+        self.event("needs_input", agent="waiting", at=at - 5000)
+        for index in range(3):
+            self.event("start", agent=f"busy-{index}", at=at - index)
+        records, _ = self.control.native.fleet_records(1)
+        self.assertEqual(records[0]["agent_id"], "waiting")
+
+    def test_native_clock_rollback_is_uncertain_not_fresh(self):
+        at = int(time.time() * 1000)
+        record = self.event("start", agent="ahead", at=at)
+        with patch("router.native.now_ms", return_value=at - 5000):
+            active = self.control.native.fleet_records(0)[1]
+            view = self.control.native.view(self.control.native.get(record["task_id"]))
+        self.assertIsNone(active)
+        self.assertEqual(view["status"], "unknown")
+        self.assertIn("clock", view["visibility_reason"])
+        self.assertEqual(self.control.native.fleet_records(0)[1], 1)
+
+    def test_failed_agent_reports_known_elapsed_time(self):
+        self.event("start", agent="elapsed", at=1000)
+        failed = self.event("failed", agent="elapsed", at=2000)
+        self.assertEqual(failed["elapsed_ms"], 1000)
+
+    def test_terminal_sequences_cannot_split_credentials_before_persistence(self):
+        record = self.event("result", agent="ansi", at=1000, task="API_\x1b[0mKEY=swordfish",
+                            summary="pass\x1b[1mword=swordfish")
+        with self.control.store.connect() as db:
+            persisted = db.execute("SELECT data FROM observations WHERE task_id=?", (record["task_id"],)).fetchone()[0]
+        self.assertNotIn("swordfish", persisted)
+
     def test_late_launch_enriches_terminal_record_without_reopening_it(self):
         self.event("start", at=1000)
         stopped = self.event("stop", at=2000)
@@ -577,7 +720,8 @@ class NativeTests(unittest.TestCase):
         self.assertEqual(stopped["duration_ms"], 2000)
 
     def test_session_end_watermark_survives_restart_and_allows_delayed_stop(self):
-        base = int(time.time() * 1000)
+        # Keep every synthetic event in the past; future stamps read as clock rollback.
+        base = int(time.time() * 1000) - 10_000
         record = self.event("start", agent="ended", at=base)
         self.event("session_end", agent=None, at=base + 1000)
 
@@ -629,7 +773,8 @@ class NativeTests(unittest.TestCase):
         self.assertEqual(observed["status"], "running")
 
     def test_session_end_before_first_agent_blocks_delayed_start_but_allows_newer_segment(self):
-        base = int(time.time() * 1000)
+        # Keep every synthetic event in the past; future stamps read as clock rollback.
+        base = int(time.time() * 1000) - 10_000
         self.event("session_end", agent=None, at=base + 1000)
 
         delayed = self.event("start", agent="late", at=base)
@@ -774,9 +919,13 @@ class NativeTests(unittest.TestCase):
         self.assertNotIn("correct horse", persisted)
         with self.assertRaisesRegex(ValueError, "invalid parent_agent_id"):
             self.event("launch", agent="identity", parent_agent_id="token=secret-value")
-        for transcript in ("x" * 2001, "/tmp/token=secret-value"):
-            with self.subTest(transcript=transcript[:20]), self.assertRaisesRegex(ValueError, "invalid transcript"):
-                self.event("start", agent="path", transcript=transcript)
+        for index, transcript in enumerate(("x" * 2001, "/tmp/token=secret-value")):
+            with self.subTest(transcript=transcript[:20]):
+                # Unsafe paths are never stored, but lifecycle evidence is kept.
+                started = self.event("start", agent=f"path-{index}", transcript=transcript)
+                self.assertIsNone(self.control.native.get(started["task_id"])["transcript"])
+                self.assertTrue(started["usage_partial"])
+                self.assertNotIn("secret-value", json.dumps(started))
 
         legacy = self.control.native.get(record["task_id"])
         legacy.update(summary=secret, activity=secret, files_touched=[secret],

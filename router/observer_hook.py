@@ -6,14 +6,15 @@ import time
 from pathlib import Path
 
 from router.client import request
-from router.redaction import redact_secrets
+from router.redaction import redact_secrets, strip_terminal_sequences
 
 
 def text(value: object, limit: int | None = 240) -> str | None:
     if not isinstance(value, str):
         return None
     normalized = " ".join("".join(
-        character for character in value if character.isprintable() or character.isspace()
+        character for character in strip_terminal_sequences(value)
+        if character.isprintable() or character.isspace()
     ).split())
     return (normalized if limit is None else normalized[:limit]) or None
 
@@ -42,7 +43,7 @@ def observe(event: dict) -> dict:
     if session_kind:
         session_payload = {"source": "claude", "session_id": event.get("session_id"), "observed_at": at,
                            "kind": session_kind, "cwd": event.get("cwd"), "model": event.get("model"),
-                           "parent_session_id": event.get("parent_session_id"), "activity": text(tool),
+                           "parent_session_id": event.get("parent_session_id"), "activity": redacted_text(tool, 240),
                            "tool_use_id": event.get("tool_use_id"),
                            "start_source": event.get("source"),
                            "notification_type": event.get("notification_type"),
@@ -69,7 +70,8 @@ def observe(event: dict) -> dict:
         if isinstance(response.get("costUSD"), (int, float)):
             payload["cost"] = response["costUSD"]
     elif name in {"PreToolUse", "PostToolUse", "PostToolUseFailure"} and payload["agent_id"]:
-        payload.update(kind="activity", activity=text(tool), file_path=text(inputs.get("file_path"), 2000))
+        payload.update(kind="activity", activity=redacted_text(tool, 240),
+                       file_path=redacted_text(inputs.get("file_path"), 2000))
     elif name == "TeammateIdle" and payload["agent_id"]:
         payload.update(kind="idle", activity="teammate idle")
     elif name == "Notification" and payload["agent_id"] and event.get("notification_type") == "agent_needs_input":

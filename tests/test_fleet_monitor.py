@@ -115,7 +115,8 @@ class HostAndMigrationTests(unittest.TestCase):
             first = stable_host_id(directory, "darwin")
             self.assertEqual(stable_host_id(directory, "darwin"), first)
             self.assertEqual((directory / "host-id").stat().st_mode & 0o777, 0o600)
-        completed = lambda value: subprocess.CompletedProcess([], 0, stdout=value, stderr=b"")
+        def completed(value):
+            return subprocess.CompletedProcess([], 0, stdout=value, stderr=b"")
         with patch("router.host.subprocess.run", side_effect=[completed(b"boot one"), completed(b"boot two")]):
             self.assertNotEqual(current_boot_id("darwin"), current_boot_id("darwin"))
 
@@ -270,6 +271,31 @@ class SessionAndCapacityTests(unittest.TestCase):
     def event(self, kind, **values):
         return self.observer.observe({"source": "claude", "session_id": "S", "kind": kind,
                                       "observed_at": values.pop("observed_at", self.now), **values})
+
+    def test_waiting_notification_does_not_hide_uncompleted_tool_after_freshness_window(self):
+        start = self.now - 61_000
+        self.event("tool_start", tool_use_id="tool-1", activity="Bash", observed_at=start)
+        waiting = self.event("notification", notification_type="permission_prompt",
+                             agent_id="other-agent", observed_at=start + 1)
+        self.assertTrue(waiting["needs_input"])
+        records, active = self.observer.fleet_records(10)
+        self.assertEqual(records[0]["inflight_tool_count"], 1)
+        self.assertNotEqual(records[0]["status"], "unknown")
+        self.assertEqual(active, 1)
+
+    def test_same_time_task_or_subagent_event_does_not_reopen_stopped_turn(self):
+        for kind in ("task_completed", "subagent_stop", "subagent_start", "task_created"):
+            session = "tie-" + kind
+            self.observer.observe({"source": "claude", "session_id": session, "kind": "prompt",
+                                   "observed_at": self.now})
+            self.observer.observe({"source": "claude", "session_id": session, "kind": "stop",
+                                   "observed_at": self.now + 1})
+            tied = self.observer.observe({"source": "claude", "session_id": session, "kind": kind,
+                                          "observed_at": self.now + 1, "task_id": "T", "agent_id": "A"})
+            self.assertEqual(tied["status"], "idle", kind)
+            later = self.observer.observe({"source": "claude", "session_id": session, "kind": kind,
+                                           "observed_at": self.now + 2, "task_id": "T", "agent_id": "A"})
+            self.assertEqual(later["status"], "running", kind)
 
     def test_session_tasks_needs_input_stop_and_restart_uncertainty(self):
         self.assertEqual(self.event("session_start", cwd="/project")["status"], "running")
@@ -1791,6 +1817,42 @@ required = false
             alert["kind"] for alert in result["hosts"][1]["alerts"]
         })
 
+    def test_remote_reservation_expiry_uses_source_clock_not_viewer_clock(self):
+        # The viewer's wall clock (time.time) is decades past the remote's
+        # generated_at=1; only 16 s of monotonic collection time elapsed.
+        main_thread = threading.current_thread()
+
+        def monotonic():
+            return 116 if threading.current_thread() is main_thread else 100
+
+        for reserved_until, active in ((60_001, True), (10_001, False)):
+            remote = snapshot("peer")
+            remote["capacity"].update(reserved_by="coordinator", reserved_until=reserved_until,
+                                      reserved_cpu_slots=8, reserved_memory_bytes=0,
+                                      reservation_source="test", reservation_active=True)
+            config = FleetConfig((FleetHost("peer", "ssh", target="peer"),), refresh_seconds=10)
+            with self.subTest(reserved_until=reserved_until), \
+                    patch("router.fleet.time.monotonic", side_effect=monotonic), \
+                    patch("router.fleet.ssh_snapshot", side_effect=lambda host, timeout, value=remote: value):
+                result = query_fleet(config)
+                self.assertIs(result["hosts"][0]["snapshot"]["capacity"]["reservation_active"], active)
+
+    def test_fleet_stale_classification_and_alert_share_one_threshold(self):
+        # With a 10 s refresh, a 16 s old sample is fresh for alerting, so it
+        # must not be classified unknown-for-staleness either.
+        main_thread = threading.current_thread()
+
+        def monotonic():
+            return 116 if threading.current_thread() is main_thread else 100
+
+        config = FleetConfig((FleetHost("local", "local"),), refresh_seconds=10)
+        with patch("router.fleet.time.monotonic", side_effect=monotonic):
+            result = query_fleet(config, local_snapshot=lambda thresholds: snapshot("local"))
+        capacity = result["hosts"][0]["snapshot"]["capacity"]
+        self.assertEqual(capacity["sample_age_ms"], 16_001)
+        self.assertFalse(any("stale" in reason for reason in capacity["capacity_reasons"]))
+        self.assertNotIn("host_snapshot_stale", {alert["kind"] for alert in result["hosts"][0]["alerts"]})
+
     def test_snapshot_rejects_record_with_missing_or_mismatched_host_identity(self):
         for host_id in (None, "other-host"):
             with self.subTest(host_id=host_id):
@@ -1942,6 +2004,48 @@ required = false
         history.track([])
         third = [{"alert_id": "same", "first_seen_at": 30, "last_seen_at": 30}]
         self.assertEqual(history.track(third)[0]["first_seen_at"], 30)
+
+    def test_alert_history_is_scoped_per_configured_host(self):
+        history = AlertHistory()
+        tracked = history.track([{"alert_id": "shared", "first_seen_at": 1, "last_seen_at": 1},
+                                 {"alert_id": "shared", "first_seen_at": 9000, "last_seen_at": 9000}],
+                                ["host-a", "host-b"])
+        self.assertEqual([alert["first_seen_at"] for alert in tracked], [1, 9000])
+
+    def test_needs_input_alert_survives_history_truncation(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        store = Store(Path(temp.name) / "router.sqlite3", "host")
+        sessions = SessionObserver(store, "host")
+        now = int(time.time() * 1000)
+        sessions.observe({"source": "claude", "session_id": "waiting", "kind": "notification",
+                          "notification_type": "permission_prompt", "observed_at": now - 5000})
+        for index in range(3):
+            sessions.observe({"source": "claude", "session_id": f"idle-{index}", "kind": "stop",
+                              "observed_at": now - index})
+        records, _ = sessions.fleet_records(3)
+        self.assertEqual(records[0]["session_id"], "waiting")
+
+        base = snapshot()
+        class Host:
+            def view(self, at):
+                return {**base["host"], "observed_at": at}
+        class Sessions:
+            def fleet_records(self, limit):
+                return [{"host_id": "host-1", "source": "claude", "session_id": f"s{index}",
+                         "status": "idle", "started_at": 1, "last_event_at": 1} for index in range(limit)], 0
+            def tasks(self, limit): return []
+        class Native:
+            def fleet_records(self, limit): return [], 0
+        class Capacity:
+            def view(self, thresholds, **counts):
+                return {**base["capacity"], "observed_at": 100, "sample_age_ms": 0, "partial": False, **counts}
+        controller = type("Controller", (), {"host": Host(), "sessions": Sessions(), "native": Native(),
+                                             "capacity": Capacity()})()
+        with patch("router.fleet_snapshot.now_ms", return_value=100):
+            result = compose(controller, history_limit=1)
+        self.assertTrue(result["partial"])
+        self.assertIn("incomplete", result["errors"]["alerts"])
 
     def test_zero_and_future_alert_times_are_normalized_and_round_trip(self):
         base = snapshot()
@@ -2118,8 +2222,9 @@ required = false
             try:
                 with patch("router.fleet.subprocess.Popen", side_effect=fork_launch), \
                         self.assertRaisesRegex(ValueError, "timed out"):
-                    ssh_snapshot(host, .05)
-                self.assertLess(time.monotonic() - started, 1.2)
+                    # Long enough for the descendant to start and report its PID.
+                    ssh_snapshot(host, 1)
+                self.assertLess(time.monotonic() - started, 2.2)
                 self.assertTrue(descendant_pid_file.exists(), "forked descendant never reported its PID")
                 descendant_pid = int(descendant_pid_file.read_text())
                 deadline = time.monotonic() + 2
@@ -2212,6 +2317,17 @@ required = false
                 ("ANTHROPIC_API_KEY=sk-ant-abcdefghijklmnop", "sk-ant-abcdefghijklmnop"),
                 ("credential ghp_abcdefghijklmnop", "ghp_abcdefghijklmnop"),
                 ("credential github_pat_abcdefghijklmnop", "github_pat_abcdefghijklmnop"),
+                ("credential gho_abcdefghijklmnop", "gho_abcdefghijklmnop"),
+                ("credential ghs_abcdefghijklmnop", "ghs_abcdefghijklmnop"),
+                ("credential ghu_abcdefghijklmnop", "ghu_abcdefghijklmnop"),
+                ("credential ghr_abcdefghijklmnop", "ghr_abcdefghijklmnop"),
+                ('{"Authorization": "Basic c3dvcmRmaXNo"}', "c3dvcmRmaXNo"),
+                ('headers = {"Cookie": "session=swordfish"}', "swordfish"),
+                ('Payload was "{\\"password\\": \\"swordfish\\"}".', "swordfish"),
+                (json.dumps({"cmd": json.dumps({"password": 'sword"fish', "user": "bob"})}), "fish"),
+                ("API_\x1b[0mKEY=swordfish", "swordfish"),
+                ("pass\x1b]8;;http://x\x07word=swordfish", "swordfish"),
+                (json.dumps({"cmd": json.dumps({"password": "swordfish\\", "user": "bob"})}), "swordfish"),
                 ("credential sk-abcdefghijklmnop", "sk-abcdefghijklmnop"),
                 ("credential AKIAABCDEFGHIJKLMNOP", "AKIAABCDEFGHIJKLMNOP"),
                 ("credential glpat-abcdefghijklmnop", "glpat-abcdefghijklmnop"),

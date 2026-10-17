@@ -21,6 +21,15 @@ class HookTests(TransportHarness, unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         return json.loads(result.stdout)
 
+    def eventually(self, read, accept):
+        # Hooks acknowledge within 50 ms; the daemon may persist slightly later.
+        deadline = time.monotonic() + 5
+        value = read()
+        while not accept(value) and time.monotonic() < deadline:
+            time.sleep(.02)
+            value = read()
+        return value
+
     def test_offline_submission_and_nonliteral_dispatch(self):
         event = {"session_id": "host", "prompt_id": "turn", "cwd": str(self.repo), "prompt": "never persist this body"}
         unconfigured = {**event, "session_id": "unconfigured", "cwd": str(self.root / "other-project")}
@@ -49,7 +58,7 @@ class HookTests(TransportHarness, unittest.TestCase):
                   "tool_response": {"agentId": "nested-child", "resolvedModel": "claude-haiku-5-5", "isAsync": True}}
         self.assertEqual(self.hook(launch, "observe"), {})
 
-        rows = request("status", {}, self.endpoint)
+        rows = self.eventually(lambda: request("status", {}, self.endpoint), lambda rows: len(rows) == 1)
         self.assertEqual(len(rows), 1)
         native = rows[0]
         self.assertEqual(native["parent_agent_id"], "parent-native")
@@ -68,7 +77,9 @@ class HookTests(TransportHarness, unittest.TestCase):
         self.assertEqual(controlled["parent_agent_id"], "parent-native")
         self.assertEqual(controlled["control_mode"], "control")
         self.assertEqual(self.hook({**event, "agent_id": "nested-child", "hook_event_name": "SubagentStop"}, "observe"), {})
-        self.assertEqual(request("status", {"task_id": native["task_id"]}, self.endpoint)["status"], "stopped")
+        stopped = self.eventually(lambda: request("status", {"task_id": native["task_id"]}, self.endpoint),
+                                  lambda row: row["status"] == "stopped")
+        self.assertEqual(stopped["status"], "stopped")
         request("daemon_stop", {}, self.endpoint)
         self.daemons[-1].wait(timeout=15)
         self.assertEqual(self.hook(launch, "observe"), {})
@@ -98,12 +109,14 @@ class HookTests(TransportHarness, unittest.TestCase):
         ]
         for event in events:
             self.assertEqual(self.hook({**base, **event}, "observe"), {})
-        local = request("snapshot", {}, self.endpoint)
+        local = self.eventually(lambda: request("snapshot", {}, self.endpoint),
+                                lambda local: local["sessions"] and local["sessions"][0]["visibility_reason"])
         self.assertEqual(local["tasks"][0]["status"], "completed")
         session = local["sessions"][0]
         self.assertEqual(session["status"], "idle")
         self.assertIn("turn failed", session["visibility_reason"])
-        native = request("status", {}, self.endpoint)[0]
+        native = self.eventually(lambda: request("status", {}, self.endpoint)[0],
+                                 lambda native: native["status"] == "failed")
         self.assertEqual(native["status"], "failed")
         self.assertNotIn("SECRET", json.dumps({"session": session, "native": native}))
 
@@ -157,6 +170,39 @@ class HookTests(TransportHarness, unittest.TestCase):
         self.assertEqual(requests[0][1]["session"]["task_subject"].count("[REDACTED]"), 1)
         self.assertEqual(requests[1][1]["native"]["task"].count("[REDACTED]"), 1)
         self.assertNotIn("swordfish", requests[2][1]["native"]["summary"])
+
+    def test_observer_redacts_activity_and_file_path_before_bounding(self):
+        requests = []
+        credential = " https://user:swordfish@example.com"
+        # Truncating at 240/2000 before redaction would drop the trailing "@".
+        tool, file_path = "x" * 217 + credential, "x" * 1977 + credential
+
+        def send(operation, payload, timeout):
+            requests.append(payload)
+            return {"accepted": True}
+
+        with patch("router.observer_hook.request", side_effect=send):
+            observe({"hook_event_name": "PreToolUse", "session_id": "S", "agent_id": "A",
+                     "tool_name": tool, "tool_input": {"file_path": file_path}})
+
+        self.assertNotIn("swordfish", json.dumps(requests))
+        self.assertIn("[REDACTED]", requests[0]["session"]["activity"])
+        self.assertIn("[REDACTED]", requests[0]["native"]["activity"])
+        self.assertIn("[REDACTED]", requests[0]["native"]["file_path"])
+
+    def test_observer_strips_terminal_sequences_before_redaction(self):
+        requests = []
+
+        def send(operation, payload, timeout):
+            requests.append(payload)
+            return {"accepted": True}
+
+        with patch("router.observer_hook.request", side_effect=send):
+            observe({"hook_event_name": "TaskCreated", "session_id": "S", "task_id": "T",
+                     "task_subject": "API_\x1b[0mKEY=swordfish"})
+            observe({"hook_event_name": "SubagentStop", "session_id": "S", "agent_id": "A",
+                     "last_assistant_message": "tok\x1b[31men=swordfish"})
+        self.assertNotIn("swordfish", json.dumps(requests))
 
     def test_observer_reports_only_terminal_lifecycle_failures(self):
         cases = {

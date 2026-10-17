@@ -4,12 +4,12 @@ import re
 import unicodedata
 
 _ASSIGNMENT_HEADER = re.compile(
-    r"(?i)(?<![a-z0-9_])(?P<key_quote>[\"']?)"
+    r"(?i)(?<![a-z0-9_])(?P<key_quote>\\?[\"']?)"
     r"(?P<key>[$a-z0-9][$a-z0-9_.-]{0,239})(?P=key_quote)"
     r"\s*(?::|=|\bis\b)\s*"
 )
 _SPACED_ASSIGNMENT_HEADER = re.compile(
-    r"(?i)(?<![a-z0-9_])(?P<key_quote>[\"']?)"
+    r"(?i)(?<![a-z0-9_])(?P<key_quote>\\?[\"']?)"
     r"(?P<key>(?:[$a-z0-9_.-]{1,64}\s+){0,8}(?:"
     r"api\s+key|access\s+(?:key|token)|pass\s+(?:word|phrase)|"
     r"secret(?:\s+(?:access\s+key|key|token))?|private\s+key"
@@ -26,6 +26,7 @@ _VALUE_BOUNDARY = re.compile(
 )
 _SENSITIVE_COMPONENTS = frozenset({
     "token", "password", "passwd", "passphrase", "pwd", "credential", "secret",
+    "authorization", "cookie",
 })
 _SENSITIVE_COMPOUNDS = frozenset({
     "apikey", "accesskey", "accesstoken", "secretaccesskey", "secretkey",
@@ -51,6 +52,17 @@ def _credential_name(value: str) -> bool:
 def _value_end(value: str, start: int) -> int:
     if start >= len(value):
         return start
+    if value.startswith(("\\\"", "\\'"), start):
+        # In once-escaped text the closing quote follows a run of escaped
+        # backslash pairs, so the run before the delimiter is a multiple of 4.
+        delimiter = value[start:start + 2]
+        search = start + 2
+        while (end := value.find(delimiter, search)) >= 0:
+            backslashes = len(value[start + 2:end]) - len(value[start + 2:end].rstrip("\\"))
+            if backslashes % 4 == 0:
+                return end + 2
+            search = end + 1
+        return len(value)
     quote = value[start]
     if quote in {"\"", "'"}:
         escaped = False
@@ -85,10 +97,21 @@ def _redact_credential_values(value: str) -> str:
     return value
 
 
+# Whole ANSI/VT escape sequences (CSI, OSC, and two-byte escapes). Dropping
+# only the ESC control would leave "[0m" inside a credential name.
+_TERMINAL_SEQUENCE = re.compile(
+    r"(?:\x1b\[|\x9b)[0-?]*[ -/]*[@-~]|(?:\x1b\]|\x9d)[^\x07\x1b\x9c]*(?:\x07|\x1b\\|\x9c)?|\x1b[@-Z\\-_]"
+)
+
+
+def strip_terminal_sequences(value: str) -> str:
+    return _TERMINAL_SEQUENCE.sub("", value) if "\x1b" in value or "\x9b" in value or "\x9d" in value else value
+
+
 def sanitize_output_text(value: str) -> str:
     """Return single-line, UTF-8-encodable text safe for terminal output."""
     result = []
-    for character in value:
+    for character in strip_terminal_sequences(value):
         category = unicodedata.category(character)
         if character in "\r\n" or category in {"Zl", "Zp"}:
             result.append(" ")
@@ -121,11 +144,11 @@ def redact_secrets(value: str, limit: int = 1000) -> str:
     if "bearer" in lowered:
         value = re.sub(r"(?i)bearer\s+[^\s]+", "Bearer [REDACTED]", value)
     if any(marker in value for marker in (
-            "sk-", "ghp_", "github_pat_", "glpat-", "xoxb-", "xoxa-", "xoxp-", "xoxr-", "xoxs-",
+            "sk-", "ghp_", "gho_", "ghu_", "ghs_", "ghr_", "github_pat_", "glpat-", "xoxb-", "xoxa-", "xoxp-", "xoxr-", "xoxs-",
             "AKIA", "ASIA", "A3T", "AGPA", "AIDA", "AIPA", "ANPA", "ANVA", "APKA", "AROA")):
         value = re.sub(
             r"(?<![A-Za-z0-9])(?:"
-            r"sk-[A-Za-z0-9_-]{12,}|(?:ghp|github_pat)_[A-Za-z0-9_]{12,}|"
+            r"sk-[A-Za-z0-9_-]{12,}|(?:gh[pousr]|github_pat)_[A-Za-z0-9_]{12,}|"
             r"glpat-[A-Za-z0-9_-]{12,}|xox[baprs]-[A-Za-z0-9-]{10,}|"
             r"(?:AKIA|ASIA|A3T[A-Z0-9]|AGPA|AIDA|AIPA|ANPA|ANVA|APKA|AROA)[A-Z0-9]{16}"
             r")(?![A-Za-z0-9])",

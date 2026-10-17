@@ -138,6 +138,10 @@ class SessionObserver:
             if (at == record["last_event_at"] and record.get("last_event") == "session_end"
                     and kind != "session_end"):
                 return self.view(record, max(now_ms(), at))
+            if (at == record["last_event_at"] and record.get("last_event") in {"stop", "stop_failure"}
+                    and kind in {"task_created", "task_completed", "subagent_start", "subagent_stop"}):
+                # A same-time tie must not reopen a turn that already ended.
+                return self.view(record, max(now_ms(), at))
             record["last_event_at"] = at
             record["last_event"] = kind
             for key, limit in (("cwd", 2000), ("model", 240)):
@@ -365,7 +369,8 @@ class SessionObserver:
                               else len(record.get("inflight_tools", [])))
         correlation_partial = bool(record.get("tool_correlation_partial")
                                    or record.get("tool_overflow_active"))
-        active_tool = (not clock_rollback and record["status"] == "running"
+        # A waiting notification sets "idle" but cannot complete a running tool.
+        active_tool = (not clock_rollback and record["status"] in {"running", "idle"}
                        and SessionObserver._has_active_tool(record, at))
         result["inflight_tool_count"] = exact_active_count
         result["tool_visibility_partial"] = bool(
@@ -397,7 +402,9 @@ class SessionObserver:
                 """SELECT data FROM sessions WHERE host_id=? AND
                     (json_extract(data,'$.status') IN ('running','idle','unknown') OR
                      json_extract(data,'$.needs_input')=1 OR json_extract(data,'$.last_event_at')>=?)
-                    ORDER BY json_extract(data,'$.last_event_at') DESC LIMIT ?""",
+                    ORDER BY CASE WHEN json_extract(data,'$.needs_input')=1 THEN 0
+                        WHEN json_extract(data,'$.status')='unknown' THEN 1 ELSE 2 END,
+                        json_extract(data,'$.last_event_at') DESC LIMIT ?""",
                 (self.host_id, cutoff, limit))]
             future_or_partial = db.execute("""SELECT COUNT(*) FROM sessions WHERE host_id=? AND (
                     json_extract(data,'$.last_event_at')>? OR
@@ -410,7 +417,7 @@ class SessionObserver:
                     json_extract(data,'$.last_event_at') BETWEEN ? AND ?""",
                                       (self.host_id, at - STALE_AFTER_MS, at)).fetchone()[0]
             active_tools = db.execute("""SELECT COUNT(*) FROM sessions WHERE host_id=? AND
-                    json_extract(data,'$.status')='running' AND
+                    json_extract(data,'$.status') IN ('running','idle') AND
                     json_extract(data,'$.last_event_at')<? AND
                     json_extract(data,'$.tool_active_until')>=?""",
                                       (self.host_id, at - STALE_AFTER_MS, at)).fetchone()[0]

@@ -38,18 +38,19 @@ class AlertHistory:
 
     def __init__(self):
         self._lock = threading.Lock()
-        self._first_seen: dict[str, int] = {}
+        self._first_seen: dict[tuple[str | None, str], int] = {}
 
-    def track(self, current: list[dict]) -> list[dict]:
-        active = {alert["alert_id"] for alert in current}
+    def track(self, current: list[dict], scopes: list[str] | None = None) -> list[dict]:
+        keys = [(scopes[index] if scopes else None, alert["alert_id"]) for index, alert in enumerate(current)]
+        active = set(keys)
         with self._lock:
-            for alert in current:
-                first = self._first_seen.setdefault(alert["alert_id"], alert["first_seen_at"])
+            for key, alert in zip(keys, current, strict=True):
+                first = self._first_seen.setdefault(key, alert["first_seen_at"])
                 last_seen = alert.get("last_seen_at", alert["first_seen_at"])
                 if last_seen < first:
                     # A wall-clock rollback begins a new representable alert epoch.
                     first = last_seen
-                    self._first_seen[alert["alert_id"]] = first
+                    self._first_seen[key] = first
                 alert["first_seen_at"] = first
             self._first_seen = {key: value for key, value in self._first_seen.items() if key in active}
         return current
@@ -234,6 +235,11 @@ def compose(controller, thresholds: CapacityThresholds | None = None, history_li
         interval_seconds = getattr(controller.capacity, "interval_seconds", 5)
         state, reasons = classify(capacity, thresholds, interval_seconds * 3000)
         capacity.update(capacity_state=state, capacity_reasons=reasons)
+    if any(key in snapshot.get("errors", {}) for key in ("sessions", "agents")):
+        # Alert-worthy records sort first, but a truncated or failed page can
+        # still omit some; say so rather than implying the alert list is whole.
+        snapshot["partial"] = True
+        snapshot["errors"]["alerts"] = "Alerts derived from incomplete session or agent records"
     _collection(snapshot, "alerts", lambda limit: alerts(
         snapshot["host"], snapshot["capacity"], sessions, agents, thresholds, limit,
         generated_at), MAX_ALERTS, "alert_limit")

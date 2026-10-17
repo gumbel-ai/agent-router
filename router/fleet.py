@@ -925,10 +925,18 @@ def query_fleet(config: FleetConfig, local_snapshot=None, only: str | None = Non
             "reserved_by", "reserved_until", "reserved_cpu_slots", "reserved_memory_bytes", "reservation_source")]
         if all(value is not None for value in reservation_values):
             # The producer's consistency was checked against its own generated_at
-            # during wire validation. Recompute against the later fleet timestamp so
-            # a reservation that legitimately expired in transit becomes inactive.
-            capacity["reservation_active"] = capacity["reserved_until"] > generated_at
-        state, reasons = classify(capacity, configured_hosts[record["name"]].thresholds)
+            # during wire validation. The local host shares the viewer's clock; a
+            # remote's clock is advanced by monotonic collection time instead, so
+            # viewer clock skew cannot expire (or extend) a remote reservation.
+            if configured_hosts[record["name"]].transport == "local":
+                source_now = generated_at
+            else:
+                source_now = snapshot["generated_at"] + max(0, (collection_finished - started_at) * 1000)
+            capacity["reservation_active"] = capacity["reserved_until"] > source_now
+        # One threshold for classification and alerting, so a stale sample is
+        # never "unknown" without also marking the snapshot partial.
+        stale_after_ms = max(15_000, config.refresh_seconds * 3000)
+        state, reasons = classify(capacity, configured_hosts[record["name"]].thresholds, stale_after_ms)
         capacity.update(capacity_state=state, capacity_reasons=reasons)
         snapshot["alerts"] = [
             alert for alert in snapshot["alerts"] if alert.get("kind") not in CAPACITY_ALERT_KINDS
@@ -938,7 +946,7 @@ def query_fleet(config: FleetConfig, local_snapshot=None, only: str | None = Non
                 snapshot["host"], capacity, configured_hosts[record["name"]].thresholds,
                 generated_at,
             ))
-        if isinstance(sample_age, (int, float)) and sample_age > max(15_000, config.refresh_seconds * 3000):
+        if isinstance(sample_age, (int, float)) and sample_age > stale_after_ms:
             record["alerts"].append(_fleet_alert(record, "host_snapshot_stale",
                                                    "Host capacity sample is stale", generated_at))
             snapshot["partial"] = True
@@ -957,11 +965,13 @@ def query_fleet(config: FleetConfig, local_snapshot=None, only: str | None = Non
               "version_mismatch": version_mismatch, "hosts": hosts}
     _bound_fleet_result(result)
     if alert_history is not None:
-        alert_history.track([
-            alert
+        # Scope by the trusted configured name; a remote chooses its own alert_id.
+        tracked = [
+            (record["name"], alert)
             for record in result["hosts"]
             for alert in record["alerts"] + (record.get("snapshot", {}).get("alerts", []) if record["ok"] else [])
-        ])
+        ]
+        alert_history.track([alert for _, alert in tracked], [name for name, _ in tracked])
     return result
 
 

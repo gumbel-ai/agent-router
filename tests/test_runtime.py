@@ -96,6 +96,8 @@ class RuntimeTests(RuntimeHarness, unittest.TestCase):
         self.control.store.save_attempt(first)
         return current
 
+    # Durable outcomes are under test, not the 40 ms acknowledgement latency.
+    @patch("router.daemon.LIFECYCLE_ACK_TIMEOUT_SECONDS", 5)
     def test_lifecycle_failure_reports_not_persisted_and_writer_continues(self):
         at = int(time.time() * 1000)
         failed = self.control.handle("lifecycle_observe", {
@@ -130,6 +132,20 @@ class RuntimeTests(RuntimeHarness, unittest.TestCase):
             session["session_id"] for session in self.control.handle("snapshot", {})["sessions"]
         })
 
+    @patch("router.daemon.LIFECYCLE_ACK_TIMEOUT_SECONDS", 5)
+    def test_one_lost_lifecycle_write_does_not_keep_snapshots_partial_forever(self):
+        at = int(time.time() * 1000)
+        rejected = self.control.handle("lifecycle_observe", {"native": {
+            "source": "claude", "session_id": "S", "agent_id": "child", "kind": "bogus", "observed_at": at}})
+        self.assertFalse(rejected["accepted"])
+        self.assertIn("1 write failures", self.control.lifecycle_health())
+        with patch("router.daemon.now_ms", return_value=at + 60_000):
+            self.assertIsNotNone(self.control.lifecycle_health())
+        with patch("router.daemon.now_ms", return_value=at + 61_000):
+            self.assertIsNone(self.control.lifecycle_health())
+
+    # Durable outcomes are under test, not the 40 ms acknowledgement latency.
+    @patch("router.daemon.LIFECYCLE_ACK_TIMEOUT_SECONDS", 5)
     def test_lifecycle_failure_identifies_component_when_nothing_persists(self):
         failed = self.control.handle("lifecycle_observe", {"native": {
             "source": "claude", "session_id": "S", "agent_id": "token=unsafe-identity",
@@ -144,6 +160,8 @@ class RuntimeTests(RuntimeHarness, unittest.TestCase):
             "reason": "Lifecycle observation could not be persisted; failed components: native",
         })
 
+    # Durable outcomes are under test, not the 40 ms acknowledgement latency.
+    @patch("router.daemon.LIFECYCLE_ACK_TIMEOUT_SECONDS", 5)
     def test_unexpected_lifecycle_observer_failure_isolated_from_paired_write(self):
         at = int(time.time() * 1000)
         payload = {
@@ -372,6 +390,8 @@ class RuntimeTests(RuntimeHarness, unittest.TestCase):
         self.assertIsNone(self.control.lifecycle_thread)
         self.assertIn("write failures", self.control.lifecycle_health())
 
+    # Ack must fire while native is held (up to 1 s) but after the session write.
+    @patch("router.daemon.LIFECYCLE_ACK_TIMEOUT_SECONDS", .5)
     def test_snapshot_marks_paired_lifecycle_midpoint_partial(self):
         native_entered = threading.Event()
         release_native = threading.Event()
@@ -557,6 +577,15 @@ class RuntimeTests(RuntimeHarness, unittest.TestCase):
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             with self.assertRaisesRegex(ValueError, "already running"):
                 serve(self.config, os.environ.copy(), directory, self.root / "blocked.sock")
+
+    def test_unsafe_state_directory_is_rejected_before_any_change(self):
+        directory = self.repo / "router-state"
+        directory.mkdir()
+        directory.chmod(0o755)
+        with self.assertRaisesRegex(ValueError, "outside every configured"):
+            serve(self.config, os.environ.copy(), directory, self.root / "unsafe.sock")
+        self.assertEqual(directory.stat().st_mode & 0o777, 0o755)
+        self.assertFalse((directory / "daemon.lock").exists())
 
     def enable_codex(self, model="openai/gpt-5.3-codex"):
         self.config.codex_command = self.config.opencode_command

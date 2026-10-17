@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+import logging
 import math
 import os
 import uuid
@@ -10,13 +11,16 @@ from pathlib import Path
 from router.db import Store, now_ms
 from router.dispatch import canonical
 from router.pricing import DEFAULT_PRICES, PRICE_DATE, PRICE_SOURCE, estimate
-from router.redaction import redact_secrets, redact_structure
+from router.redaction import redact_secrets, redact_structure, strip_terminal_sequences
 from router.validation import MAX_WIRE_INTEGER, is_wire_integer
+
+LOGGER = logging.getLogger(__name__)
 
 STALE_AFTER_MS = 60_000
 TOKEN_KEYS = ("input_tokens", "output_tokens", "cache_read_input_tokens", "cache_creation_input_tokens")
 MAX_USAGE_INTEGER = MAX_WIRE_INTEGER
 MAX_TRANSCRIPT_MESSAGES = 10_000
+PREFIX_DIGEST_TAG = "sha256-prefix:"
 MAX_MODELS = 64
 MAX_COST = 1e12
 MAX_EVENT_FUTURE_SKEW_MS = 60_000
@@ -26,7 +30,8 @@ def text(value: object, limit: int | None = 240) -> str | None:
     if not isinstance(value, str):
         return None
     cleaned = " ".join("".join(
-        character for character in value if character.isprintable() or character.isspace()
+        character for character in strip_terminal_sequences(value)
+        if character.isprintable() or character.isspace()
     ).split())
     return (cleaned[:limit] if limit is not None else cleaned) or None
 
@@ -200,7 +205,13 @@ class NativeObserver:
                 if value is not None and (metadata_can_replace or record.get(key) is None):
                     record[key] = value
             if event.get("transcript") is not None and (metadata_can_replace or record.get("transcript") is None):
-                transcript = _private_path(event["transcript"], "transcript")
+                try:
+                    transcript = _private_path(event["transcript"], "transcript")
+                except ValueError:
+                    # A token-like path segment must not discard lifecycle
+                    # evidence; only usage from that transcript is lost.
+                    self._mark_usage_incomplete(record, "Transcript path unusable; usage is incomplete")
+                    transcript = record.get("transcript")
                 if transcript != record.get("transcript"):
                     record.update(
                         transcript=transcript,
@@ -266,9 +277,13 @@ class NativeObserver:
             if kind == "stop":
                 # The final API response may have arrived after the last poll.
                 record["transcript_eof"] = False
+            if terminal_metadata_only and kind == "result":
+                # A terminal record keeps its state, but its result watermark
+                # must still block older or tied delayed starts.
+                record["result_at"] = max(record.get("result_at", -1), at)
             result_at = record.get("result_at", -1)
             session_ended_at = record.get("session_ended_at", -1)
-            result_blocks = kind in {"start", "launch", "activity", "idle", "needs_input", "failed"} and at <= result_at
+            result_blocks = kind in {"start", "launch", "activity", "idle", "needs_input"} and at <= result_at
             session_end_blocks = kind in {"start", "launch", "activity", "idle", "needs_input"} and at <= session_ended_at
             terminal_at_same_time = (record["status"] in {"stopped", "failed"}
                                      and kind in {"start", "launch", "activity", "idle", "needs_input"}
@@ -276,7 +291,7 @@ class NativeObserver:
             session_end_prior_state_at = record.get("session_end_prior_state_at")
             if not isinstance(session_end_prior_state_at, int) or isinstance(session_end_prior_state_at, bool):
                 session_end_prior_state_at = -1
-            delayed_session_stop = (kind == "stop" and record.get("session_end_uncertain", False)
+            delayed_session_stop = (kind in {"stop", "failed"} and record.get("session_end_uncertain", False)
                                     and session_end_prior_state_at <= at <= session_ended_at)
             if (not terminal_metadata_only and not result_blocks and not session_end_blocks
                     and not terminal_at_same_time
@@ -310,7 +325,9 @@ class NativeObserver:
                     record["transcript_eof"] = False
                     if record["started_at"] is None:
                         record["started_at"] = at
-                elif kind == "stop":
+                elif kind in {"stop", "failed"}:
+                    # Delayed terminal evidence of either kind closes the
+                    # segment left open by a result or session end.
                     session_segment_start = record.get("session_end_segment_started_at")
                     result_segment_start = record.get("result_segment_started_at")
                     if delayed_session_stop and session_segment_start is not None:
@@ -322,8 +339,11 @@ class NativeObserver:
                     elif record["status"] != "stopped" and record["run_started_at"] is not None:
                         record["duration_ms"] = ((record["duration_ms"] or 0)
                                                  + max(0, at - record["run_started_at"]))
-                    record.update(status="stopped", last_observed_status="stopped", finished_at=at, run_started_at=None,
-                                  continuity_uncertain=False, visibility_reason=None,
+                    terminal = "stopped" if kind == "stop" else "failed"
+                    reason = None if kind == "stop" else (
+                        safe_text(event.get("failure_reason"), 500) or "Agent turn failed")
+                    record.update(status=terminal, last_observed_status=terminal, finished_at=at, run_started_at=None,
+                                  continuity_uncertain=False, visibility_reason=reason,
                                   result_segment_started_at=None, result_segment_base_duration=None,
                                   session_end_uncertain=False,
                                   session_end_segment_started_at=None,
@@ -338,11 +358,6 @@ class NativeObserver:
                         record["duration_ms"] = (record["duration_ms"] or 0) + max(0, at - record["run_started_at"])
                     record.update(status="needs_input", last_observed_status="needs_input", run_started_at=None,
                                   visibility_reason="Claude reported that the agent needs input")
-                else:
-                    if record.get("run_started_at") is not None:
-                        record["duration_ms"] = (record["duration_ms"] or 0) + max(0, at - record["run_started_at"])
-                    record.update(status="failed", last_observed_status="failed", finished_at=at, run_started_at=None,
-                                  visibility_reason=safe_text(event.get("failure_reason"), 500) or "Agent turn failed")
                 if kind in {"start", "activity", "stop", "idle", "needs_input", "failed"}:
                     record["state_at"] = max(record.get("state_at", -1), at)
             record["last_event_at"] = max(record["last_event_at"] or 0, at)
@@ -382,7 +397,7 @@ class NativeObserver:
                 "Transcript unavailable; usage is incomplete",
             )
         path_file_id = self._file_id(path_info)
-        if (record["status"] == "stopped" and record.get("transcript_eof")
+        if (record.get("transcript_eof")
                 and not record.get("transcript_transient_error")
                 and stored_file_id == path_file_id
                 and path_info.st_size == offset
@@ -390,7 +405,7 @@ class NativeObserver:
                 and record.get("transcript_file_mtime_ns") == path_info.st_mtime_ns):
             # EOF is provisional: use a bounded metadata check on every refresh
             # so a late append or atomic replacement becomes visible without
-            # repeatedly reopening a quiescent stopped transcript.
+            # re-hashing the consumed prefix of an unchanged transcript.
             return record
         # File I/O stays outside SQLite's write transaction. A revision/cursor
         # check below prevents concurrent readers or a path switch from applying
@@ -401,24 +416,39 @@ class NativeObserver:
                 opened_file_id = self._file_id(opened_info)
                 reset_reason = None
                 read_offset = offset
+                prefix = None
                 if stored_file_id is not None and opened_file_id != stored_file_id:
                     reset_reason = "Transcript replaced; prior usage continuity is unavailable"
                     read_offset = 0
                 elif opened_info.st_size < offset:
                     reset_reason = "Transcript truncated; usage is unavailable"
                     read_offset = 0
-                elif (offset and record.get("transcript_boundary") is not None
-                      and self._transcript_boundary(stream, offset)
-                      != record["transcript_boundary"]):
-                    reset_reason = "Transcript rewritten; prior usage continuity is unavailable"
-                    read_offset = 0
+                elif offset and record.get("transcript_boundary") is not None:
+                    # Same inode and size or growth do not prove the consumed
+                    # prefix is unchanged; compare its full digest.
+                    stored = record["transcript_boundary"]
+                    if stored.startswith(PREFIX_DIGEST_TAG):
+                        prefix = self._prefix_hash(stream, offset)
+                        unchanged = PREFIX_DIGEST_TAG + prefix.hexdigest() == stored
+                    else:
+                        # Records from before the full-prefix digest hold a
+                        # 64-byte suffix digest; verify that once, then upgrade.
+                        start = max(0, offset - 64)
+                        stream.seek(start)
+                        unchanged = hashlib.sha256(stream.read(offset - start)).hexdigest() == stored
+                    if not unchanged:
+                        reset_reason = "Transcript rewritten; prior usage continuity is unavailable"
+                        read_offset = 0
                 stream.seek(read_offset)
                 batch = stream.read(1_048_576)
                 final_info = os.fstat(stream.fileno())
                 end = batch.rfind(b"\n") + 1
                 boundary_advance = len(batch) if not end and len(batch) >= 1_048_576 else end
                 cursor = read_offset + boundary_advance
-                boundary = self._transcript_boundary(stream, cursor)
+                if prefix is None or read_offset == 0:
+                    prefix = self._prefix_hash(stream, read_offset)
+                prefix.update(batch[:boundary_advance])
+                boundary = PREFIX_DIGEST_TAG + prefix.hexdigest()
         except OSError:
             return self._record_transcript_failure(
                 task_id, path, offset, revision,
@@ -582,13 +612,20 @@ class NativeObserver:
         return [int(info.st_dev), int(info.st_ino)]
 
     @staticmethod
-    def _transcript_boundary(stream, offset: int) -> str:
-        start = max(0, offset - 64)
+    def _prefix_hash(stream, offset: int):
+        """Digest of the consumed prefix; the stream position is preserved."""
+        digest = hashlib.sha256()
         position = stream.tell()
-        stream.seek(start)
-        boundary = stream.read(offset - start)
+        stream.seek(0)
+        remaining = offset
+        while remaining:
+            chunk = stream.read(min(remaining, 1_048_576))
+            if not chunk:
+                break
+            digest.update(chunk)
+            remaining -= len(chunk)
         stream.seek(position)
-        return hashlib.sha256(boundary).hexdigest()
+        return digest
 
     @staticmethod
     def _refresh_is_current(current: dict, path: str, offset: int, revision: int) -> bool:
@@ -740,11 +777,16 @@ class NativeObserver:
         age = max(0, at - record["last_event_at"]) if record["last_event_at"] is not None else None
         result["observation_age_ms"] = age
         result["elapsed_ms"] = None
-        if record["status"] in {"running", "idle", "needs_input"} and age is not None and age > STALE_AFTER_MS:
+        clock_rollback = record["last_event_at"] is not None and record["last_event_at"] > at
+        if record["status"] in {"running", "idle", "needs_input"} and clock_rollback:
+            # Mirrors sessions: a future timestamp is not fresh evidence.
+            result.update(status="unknown",
+                          visibility_reason="Native clock moved backwards; lifecycle freshness is unavailable")
+        elif record["status"] in {"running", "idle", "needs_input"} and age is not None and age > STALE_AFTER_MS:
             result.update(status="unknown", visibility_reason="No recent native lifecycle evidence; last observed nonterminal state")
         elif record["status"] == "running" and record["run_started_at"] is not None:
             result["elapsed_ms"] = (record["duration_ms"] or 0) + max(0, at - record["run_started_at"])
-        elif record["status"] == "stopped":
+        elif record["status"] in {"stopped", "failed"}:
             result["elapsed_ms"] = record["duration_ms"]
         return result
 
@@ -755,14 +797,24 @@ class NativeObserver:
             identities = [row[0] for row in db.execute("""SELECT task_id FROM observations
                 ORDER BY CASE json_extract(data,'$.status') WHEN 'running' THEN 0 WHEN 'unknown' THEN 1 ELSE 2 END,
                 json_extract(data,'$.last_event_at') DESC LIMIT 100 OFFSET ?""", (offset,))]
-        return [{key: value for key, value in self.view(self.refresh(identity)).items() if key not in {
-            "files_touched", "summary", "transcript", "price_sources"}} for identity in identities]
+        rows = []
+        for identity in identities:
+            try:
+                view = self.view(self.refresh(identity))
+            except ValueError:
+                # A legacy row that fails today's identity rules must not hide
+                # every other agent.
+                LOGGER.warning("Skipping native observation with an invalid identity")
+                continue
+            rows.append({key: value for key, value in view.items() if key not in {
+                "files_touched", "summary", "transcript", "price_sources"}})
+        return rows
 
     def snapshot(self, limit: int = 100) -> list[dict]:
         """Bounded status view without transcript I/O on the snapshot hot path."""
         return self.fleet_records(limit)[0]
 
-    def fleet_records(self, limit: int = 100) -> tuple[list[dict], int]:
+    def fleet_records(self, limit: int = 100) -> tuple[list[dict], int | None]:
         """Return the bounded fleet page and active total from one read snapshot."""
         at = now_ms()
         cutoff = at - 300_000
@@ -773,16 +825,33 @@ class NativeObserver:
                     (json_extract(data,'$.status') IN ('running','idle','needs_input','unknown') OR
                      json_extract(data,'$.last_event_at')>=?)
                 ORDER BY CASE json_extract(data,'$.status')
-                    WHEN 'running' THEN 0 WHEN 'needs_input' THEN 1 WHEN 'unknown' THEN 2 ELSE 3 END,
+                    WHEN 'needs_input' THEN 0 WHEN 'unknown' THEN 1 WHEN 'running' THEN 2 ELSE 3 END,
                     json_extract(data,'$.last_event_at') DESC LIMIT ?""", (self.host_id, cutoff, limit))]
             active = db.execute("""SELECT COUNT(*) FROM observations
                 WHERE json_extract(data,'$.host_id')=?
                   AND json_extract(data,'$.status') IN ('running','needs_input')
                   AND json_extract(data,'$.last_event_at')>=?""",
                                 (self.host_id, at - STALE_AFTER_MS)).fetchone()[0]
-        visible = [{key: value for key, value in self.view(record, at).items() if key not in {
-            "files_touched", "summary", "transcript", "price_sources", "messages"}} for record in records]
+            future = db.execute("""SELECT COUNT(*) FROM observations
+                WHERE json_extract(data,'$.host_id')=?
+                  AND json_extract(data,'$.status') IN ('running','idle','needs_input')
+                  AND json_extract(data,'$.last_event_at')>?""", (self.host_id, at)).fetchone()[0]
+        if future:
+            # Clock rollback: an exact active total cannot be established, even off-page.
+            active = None
+        visible = []
+        for record in records:
+            try:
+                view = self.view(record, at)
+            except ValueError:
+                LOGGER.warning("Skipping native observation with an invalid identity")
+                # The omitted row may be active; report the total as unknown so
+                # the snapshot is visibly partial.
+                active = None
+                continue
+            visible.append({key: value for key, value in view.items() if key not in {
+                "files_touched", "summary", "transcript", "price_sources", "messages"}})
         return visible, active
 
-    def active_count(self) -> int:
+    def active_count(self) -> int | None:
         return self.fleet_records(0)[1]

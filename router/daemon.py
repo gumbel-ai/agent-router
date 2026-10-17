@@ -41,6 +41,8 @@ DECISIONS = {"awaiting_review", "blocked", "failed", "interrupted"}
 LOGGER = logging.getLogger(__name__)
 LIFECYCLE_STOP_TIMEOUT_SECONDS = 2.5
 LIFECYCLE_ACK_TIMEOUT_SECONDS = .04
+# Lost lifecycle evidence keeps snapshots partial for this long, not forever.
+LIFECYCLE_PROBLEM_WINDOW_MS = 60_000
 
 
 def _lifecycle_result(queued: bool, persistence: dict[str, str],
@@ -121,15 +123,20 @@ def visibility(task: dict, history: list[dict]) -> dict:
             "activity": task.get("executor_activity", task.get("phase")), "visibility_reason": None, "runtime_partial": False}
 
 
+def require_state_directory(settings: Settings, directory: Path) -> Path:
+    resolved = directory.resolve()
+    if resolved in {Path.home().resolve(), Path("/")}:
+        raise ValueError("Router state requires a dedicated directory, not home or filesystem root")
+    if any(resolved.is_relative_to(Path(root)) for root in settings.repositories):
+        raise ValueError("Router state must be outside every configured parent worktree")
+    return resolved
+
+
 class Controller:
     def __init__(self, settings: Settings, environment: dict[str, str], directory: Path):
         self.settings = settings
         self.environment = environment
-        self.directory = directory.resolve()
-        if self.directory in {Path.home().resolve(), Path("/")}:
-            raise ValueError("Router state requires a dedicated directory, not home or filesystem root")
-        if any(self.directory.is_relative_to(Path(root)) for root in settings.repositories):
-            raise ValueError("Router state must be outside every configured parent worktree")
+        self.directory = require_state_directory(settings, directory)
         self.directory.mkdir(parents=True, exist_ok=True, mode=0o700)
         self.directory.chmod(0o700)
         self.host = HostIdentity(self.directory)
@@ -147,6 +154,7 @@ class Controller:
         self.lifecycle_stop_deadline: float | None = None
         self.lifecycle_failures = 0
         self.lifecycle_dropped = 0
+        self.lifecycle_problem_at: int | None = None
         self.lifecycle_pending = 0
         self.lifecycle_direct_active = 0
         self.lifecycle_health_lock = threading.Lock()
@@ -185,12 +193,14 @@ class Controller:
                         LOGGER.warning("Lifecycle %s observation could not be persisted: %s", key, error)
                         with self.lifecycle_health_lock:
                             self.lifecycle_failures += 1
+                            self.lifecycle_problem_at = now_ms()
                     # Protect the long-lived writer from unexpected observer bugs.
                     except Exception:
                         outcome["persistence"][key] = "failed"
                         LOGGER.exception("Unexpected lifecycle %s observation failure", key)
                         with self.lifecycle_health_lock:
                             self.lifecycle_failures += 1
+                            self.lifecycle_problem_at = now_ms()
                     else:
                         outcome["persistence"][key] = "persisted"
             # One malformed work item must not kill the writer.
@@ -198,6 +208,7 @@ class Controller:
                 LOGGER.exception("Unexpected lifecycle work item failure")
                 with self.lifecycle_health_lock:
                     self.lifecycle_failures += 1
+                    self.lifecycle_problem_at = now_ms()
             finally:
                 if work is not None:
                     for key, state in outcome["persistence"].items():
@@ -270,7 +281,9 @@ class Controller:
     def lifecycle_health(self) -> str | None:
         with self.lifecycle_health_lock:
             failures, dropped, pending = self.lifecycle_failures, self.lifecycle_dropped, self.lifecycle_pending
-        if not failures and not dropped and not pending:
+            problem_at = self.lifecycle_problem_at
+        recent = problem_at is not None and now_ms() - problem_at <= LIFECYCLE_PROBLEM_WINDOW_MS
+        if not pending and not recent:
             return None
         return ("Lifecycle observations not persisted: "
                 f"{failures} write failures, {dropped} queue overflows, {pending} queued writes pending")
@@ -347,6 +360,7 @@ class Controller:
                         self.lifecycle_pending -= 1
                         self._lifecycle_generation += 1
                         self.lifecycle_dropped += 1
+                        self.lifecycle_problem_at = now_ms()
                     return _lifecycle_result(
                         False, dict.fromkeys(requested, "rejected"),
                         "Lifecycle observation queue is full",
@@ -1040,6 +1054,8 @@ class Server(socketserver.ThreadingUnixStreamServer):
 
 
 def serve(settings: Settings, environment: dict[str, str], directory: Path, endpoint: Path) -> None:
+    # Reject unsafe state roots before changing permissions or creating the lock.
+    require_state_directory(settings, directory)
     directory.mkdir(parents=True, exist_ok=True, mode=0o700)
     directory.chmod(0o700)
     endpoint.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
