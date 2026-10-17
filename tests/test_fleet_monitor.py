@@ -2870,7 +2870,7 @@ class RouterTaskFleetTests(unittest.TestCase):
         projected = _validate_snapshot(json.dumps(local).encode())
         self.assertEqual(len(projected["router_tasks"]), 1)
         self.assertTrue(projected["partial"])
-        self.assertIn("1 invalid Router task record(s) omitted", projected["errors"]["router_tasks"])
+        self.assertIn("1 invalid record(s) omitted", projected["errors"]["router_tasks"])
         self.assertTrue(projected["sessions"] == local["sessions"] and "capacity" in projected)
 
 
