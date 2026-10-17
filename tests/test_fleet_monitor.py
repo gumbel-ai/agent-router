@@ -1130,10 +1130,17 @@ class SnapshotAndFleetTests(unittest.TestCase):
         # projected without them and is not marked partial for that reason.
         older_peer = snapshot()
         older_peer["agents"][0].update(usage={"input_tokens": 1}, cost=.5, cost_source="transcript",
-                                       models=["claude-opus"], usage_partial=False)
+                                       models=["claude-opus"], usage_partial=False, worktree="/w",
+                                       resolved_model="from-transcript", model_source="transcript")
         projected = _validate_snapshot(json.dumps(older_peer).encode())
-        self.assertFalse({"usage", "cost", "cost_source", "models", "usage_partial"} & projected["agents"][0].keys())
+        agent = projected["agents"][0]
+        self.assertFalse({"usage", "cost", "cost_source", "models", "usage_partial", "worktree"} & agent.keys())
+        self.assertIsNone(agent["resolved_model"])
         self.assertFalse(projected["partial"])
+        host_reported = snapshot()
+        host_reported["agents"][0].update(resolved_model="claude-opus", model_source="host_result")
+        self.assertEqual(_validate_snapshot(json.dumps(host_reported).encode())["agents"][0]["resolved_model"],
+                         "claude-opus")
         unknown = snapshot()
         unknown["agents"][0]["future_field"] = 1
         self.assertTrue(_validate_snapshot(json.dumps(unknown).encode())["partial"])

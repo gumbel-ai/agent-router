@@ -74,8 +74,11 @@ def main() -> None:
             record = rows[0]
             assert record["status"] == "stopped", record
             assert record["parent_agent_id"] == "main" and record["task"] == "Native visibility smoke", record
-            assert record["resolved_model"] and record["usage"] and record["elapsed_ms"] > 0, record
-            assert record["cost_source"] == "api_token_estimate" and record["cost"] > 0, record
+            assert record["elapsed_ms"] > 0, record
+            # Native records are lifecycle only; content, usage, and cost belong to Langfuse.
+            retired = {"usage", "cost", "cost_source", "summary", "files_touched", "transcript", "worktree"}
+            assert not retired & record.keys(), record
+            assert record.get("resolved_model") is None or record["model_source"] == "host_result", record
             (directory / "observed.json").write_text(json.dumps(record, indent=2))
             print(table(rows))
             print("Native visibility smoke passed. Scratch:", directory)

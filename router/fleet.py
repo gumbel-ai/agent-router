@@ -242,6 +242,7 @@ def _wire_identity(value: object, name: str, limit: int = MAX_IDENTITY_LENGTH,
 RETIRED_AGENT_FIELDS = frozenset({
     "models", "cost", "cost_source", "cost_note", "usage", "usage_source", "price_date",
     "price_source", "price_overrides_used", "usage_partial", "transcript_pending", "transcript_error",
+    "worktree",
 })
 
 
@@ -251,6 +252,9 @@ def _project_record(record: dict, allowed: frozenset[str], required: tuple[str, 
     changed = 0
     retired = RETIRED_AGENT_FIELDS if collection == "agents" else frozenset()
     omitted = len(set(record) - allowed - retired)
+    if collection == "agents" and record.get("model_source") == "transcript":
+        # Older peers may report transcript-derived models; keep only host-reported ones.
+        record = {**record, "resolved_model": None, "model_source": None}
     identity_fields = {
         "host_id", "source", "session_id", "parent_session_id", "agent_id",
         "parent_agent_id", "task_id", "managed_id",
@@ -474,7 +478,7 @@ def _validate_snapshot(payload: bytes) -> dict:
                              "task_id", "executor", "owner", "control_mode", "task", "agent_type",
                              "requested_model", "resolved_model", "model_source", "status",
                              "last_observed_status", "started_at", "finished_at", "duration_ms", "last_event_at",
-                             "runtime_partial", "cwd", "worktree", "activity", "visibility_reason",
+                             "runtime_partial", "cwd", "activity", "visibility_reason",
                              "observation_age_ms", "elapsed_ms"}),
         "tasks": frozenset({"host_id", "source", "session_id", "task_id", "status", "created_at",
                             "last_event_at", "completed_at", "subject", "teammate_name", "agent_id"}),

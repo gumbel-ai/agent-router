@@ -19,7 +19,7 @@ VIEW_FIELDS = (
     "host_id", "source", "task_id", "agent_id", "executor", "owner", "control_mode",
     "parent_session_id", "parent_agent_id", "task", "agent_type", "requested_model",
     "resolved_model", "model_source", "status", "last_observed_status", "started_at",
-    "finished_at", "duration_ms", "last_event_at", "runtime_partial", "cwd", "worktree",
+    "finished_at", "duration_ms", "last_event_at", "runtime_partial", "cwd",
     "activity", "visibility_reason",
 )
 # Collected by older versions; stripped from stored rows so content does not linger.
@@ -30,6 +30,8 @@ RETIRED_FIELDS = frozenset({
     "transcript_eof", "transcript_error", "transcript_error_irreversible", "transcript_transient_error",
     "transcript_file_id", "transcript_file_size", "transcript_file_mtime_ns", "transcript_boundary",
     "transcript_revision", "skip_line",
+    # Only ever discovered from transcripts; hooks report the agent's cwd instead.
+    "worktree",
 })
 
 
@@ -71,7 +73,7 @@ class NativeObserver:
                     WHERE json_extract(data,'$.host_id')=? AND json_extract(data,'$.source')='claude'""",
                     (self.host_id,)).fetchall():
                 record = json.loads(row[0])
-                if RETIRED_FIELDS & record.keys():
+                if RETIRED_FIELDS & record.keys() or record.get("model_source") == "transcript":
                     self.put(db, record)  # One-time cleanup of older rows; put() strips.
                 record.setdefault("session_ended_at", -1)
                 record.setdefault("session_end_uncertain", False)
@@ -95,6 +97,9 @@ class NativeObserver:
     def put(self, db, record: dict) -> None:
         for key in RETIRED_FIELDS & record.keys():
             del record[key]
+        if record.get("model_source") == "transcript":
+            # Transcript-derived models are Langfuse's role; keep only host-reported ones.
+            record.update(resolved_model=None, model_source=None)
         db.execute("""INSERT INTO observations(task_id,session_id,data) VALUES(?,?,?)
             ON CONFLICT(task_id) DO UPDATE SET data=excluded.data""",
                    (record["task_id"], record["parent_session_id"], canonical(record)))
@@ -170,7 +175,7 @@ class NativeObserver:
                 "session_ended_at": -1, "session_end_uncertain": False,
                 "session_end_segment_started_at": None, "session_end_segment_base_duration": None,
                 "session_end_prior_state_at": None,
-                "cwd": None, "worktree": None, "activity": None, "visibility_reason": None}
+                "cwd": None, "activity": None, "visibility_reason": None}
             if not row and session_ended_at >= 0:
                 record.update(
                     state_at=session_ended_at,
@@ -192,10 +197,9 @@ class NativeObserver:
                 value = safe_text(event.get(key), limit)
                 if value is not None and (metadata_can_replace or record.get(key) is None):
                     record[key] = value
-            if isinstance(event.get("worktree"), str) and (metadata_can_replace or record.get("worktree") is None):
-                record["worktree"] = safe_text(event["worktree"], 2000)
             model = safe_text(event.get("resolved_model"), 240)
-            if model and (metadata_can_replace or record.get("resolved_model") is None):
+            if model and (metadata_can_replace or record.get("resolved_model") is None
+                          or record.get("model_source") == "transcript"):
                 record.update(resolved_model=model, model_source="host_result")
             if terminal_metadata_only and kind == "result":
                 # A terminal record keeps its state, but its result watermark

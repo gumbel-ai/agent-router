@@ -82,7 +82,8 @@ For each new or changed field, state, route, or relation, inspect all applicable
 8. tests at both component and production-path levels.
 
 A lower layer being correct is insufficient if an earlier layer transforms its input or
-a later layer overwrites its result.
+a later layer overwrites its result. When a field is removed or renamed, search every consumer across the whole
+repository, including `scripts/` live smoke checks, not only `router/` and `tests/`.
 
 ### 3. Build an adversarial boundary matrix
 

@@ -266,7 +266,8 @@ class NativeTests(unittest.TestCase):
                             transcript="/tmp/agent.jsonl", file_path="/tmp/notes.md")
         retired = {"summary", "cost", "cost_source", "cost_note", "usage", "usage_source", "usage_partial",
                    "models", "files_touched", "transcript", "transcript_error", "transcript_pending",
-                   "messages", "price_sources", "price_overrides_used", "price_date", "price_source"}
+                   "messages", "price_sources", "price_overrides_used", "price_date", "price_source",
+                   "worktree"}
         stored = self.control.native.get(record["task_id"])
         self.assertFalse(retired & stored.keys(), retired & stored.keys())
         self.assertEqual((stored["task"], stored["resolved_model"]), ("Fix parser", "claude-opus"))
@@ -284,7 +285,12 @@ class NativeTests(unittest.TestCase):
             self.assertIsNone(view["resolved_model"])
         # Daemon start removes the retired content from disk.
         self.control.native.reconcile_restart()
-        self.assertFalse(retired & self.control.native.get(record["task_id"]).keys())
+        swept = self.control.native.get(record["task_id"])
+        self.assertFalse(retired & swept.keys())
+        self.assertIsNone(swept["resolved_model"])
+        # A delayed host report may fill the model a transcript once supplied.
+        delayed = self.event("launch", agent="boundary", at=500, resolved_model="claude-sonnet")
+        self.assertEqual((delayed["resolved_model"], delayed["model_source"]), ("claude-sonnet", "host_result"))
 
     def test_restart_preserves_a_valid_zero_timestamp_without_inflating_duration(self):
         record = self.event("start", agent="epoch", at=0)
