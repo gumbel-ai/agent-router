@@ -1,3 +1,4 @@
+import io
 import json
 import sqlite3
 import subprocess
@@ -43,6 +44,7 @@ class HookTests(TransportHarness, unittest.TestCase):
         event = {"session_id": "native-host", "prompt_id": "turn", "cwd": str(self.repo),
                  "transcript_path": str(self.repo / "host.jsonl"), "agent_id": "parent-native"}
         launch = {**event, "hook_event_name": "PostToolUse", "tool_name": "Agent",
+                  "tool_use_id": "launch-tool",
                   "tool_input": {"description": "Fix a parser", "prompt": "PRIVATE DELEGATED PROMPT", "model": "haiku"},
                   "tool_response": {"agentId": "nested-child", "resolvedModel": "claude-haiku-5-5", "isAsync": True}}
         self.assertEqual(self.hook(launch, "observe"), {})
@@ -147,11 +149,42 @@ class HookTests(TransportHarness, unittest.TestCase):
             observe({"hook_event_name": "PostToolUse", "session_id": "S", "tool_name": "Agent",
                      "tool_input": {"description": secret},
                      "tool_response": {"agentId": "A", "isAsync": True}})
+            observe({"hook_event_name": "SubagentStop", "session_id": "S", "agent_id": "A",
+                     "last_assistant_message": "status=failed\nclientSecret=swordfish"})
 
         serialized = json.dumps(requests)
         self.assertNotIn("swordfish", serialized)
         self.assertEqual(requests[0][1]["session"]["task_subject"].count("[REDACTED]"), 1)
         self.assertEqual(requests[1][1]["native"]["task"].count("[REDACTED]"), 1)
+        self.assertNotIn("swordfish", requests[2][1]["native"]["summary"])
+
+    def test_observer_reports_only_terminal_lifecycle_failures(self):
+        cases = {
+            "rejected": ({"accepted": False, "queued": False, "persisted": False,
+                          "reason": "writer is stopping"}, "writer is stopping"),
+            "current pending": ({"accepted": False, "queued": True, "persisted": False,
+                                 "reason": "not durably persisted before timeout"},
+                                "not durably persisted before timeout"),
+            "current failed": ({"accepted": False, "queued": False, "persisted": False,
+                                "reason": "write failed"}, "write failed"),
+            "current partial without reason": ({
+                "accepted": False, "queued": False, "persisted": False, "partial": True,
+                "persistence": {"session": "persisted", "native": "failed"},
+            }, "Lifecycle observation failed for: native"),
+            "durable": ({"accepted": True, "queued": False, "persisted": True}, None),
+            "legacy accepted nonpersisted": ({"accepted": True, "persisted": False,
+                                               "reason": "legacy write failed"}, "legacy write failed"),
+        }
+        for name, (response, expected_error) in cases.items():
+            with self.subTest(name=name):
+                error = io.StringIO()
+                with patch("router.observer_hook.request", return_value=response), \
+                        patch("router.observer_hook.sys.stderr", error):
+                    observe({"hook_event_name": "Stop", "session_id": "S", "background_tasks": []})
+                if expected_error is None:
+                    self.assertEqual(error.getvalue(), "")
+                else:
+                    self.assertIn(expected_error, error.getvalue())
 
 
 if __name__ == '__main__':

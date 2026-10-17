@@ -1,5 +1,6 @@
 """Stable, non-secret host and reboot identity."""
 
+import fcntl
 import hashlib
 import os
 import platform
@@ -10,6 +11,9 @@ import uuid
 from functools import lru_cache
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
+
+from router.redaction import redact_secrets
+from router.validation import HOST_STRING_LIMITS
 
 
 def _digest(value: bytes) -> str:
@@ -39,33 +43,41 @@ def _private_uuid(path: Path) -> str:
             raise ValueError(f"Invalid generated host identity in {path}") from error
         path.chmod(0o600)
         return value
-    value = existing()
-    if value is not None:
-        return value
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    value = str(uuid.uuid4())
-    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
-    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    lock_path = path.with_name(f".{path.name}.lock")
+    lock_flags = os.O_RDWR | os.O_CREAT
+    lock_flags |= getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    lock_descriptor = os.open(lock_path, lock_flags, 0o600)
     try:
-        with os.fdopen(descriptor, "w") as stream:
-            stream.write(value + "\n")
-            stream.flush()
-            os.fsync(stream.fileno())
-        try:
-            os.link(temporary, path)
-        except FileExistsError:
+        os.fchmod(lock_descriptor, 0o600)
+        fcntl.flock(lock_descriptor, fcntl.LOCK_EX)
+        while True:
             winner = existing()
-            if winner is None:
-                return _private_uuid(path)
-            return winner
-        directory = os.open(path.parent, os.O_RDONLY)
-        try:
-            os.fsync(directory)
-        finally:
-            os.close(directory)
-        return value
+            if winner is not None:
+                return winner
+
+            value = str(uuid.uuid4())
+            temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+            descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            try:
+                with os.fdopen(descriptor, "w") as stream:
+                    stream.write(value + "\n")
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                try:
+                    os.link(temporary, path)
+                except FileExistsError:
+                    continue
+                directory = os.open(path.parent, os.O_RDONLY)
+                try:
+                    os.fsync(directory)
+                finally:
+                    os.close(directory)
+                return value
+            finally:
+                temporary.unlink(missing_ok=True)
     finally:
-        temporary.unlink(missing_ok=True)
+        os.close(lock_descriptor)
 
 
 def stable_host_id(directory: Path, system: str | None = None) -> str:
@@ -138,4 +150,20 @@ class HostIdentity:
         }
 
     def view(self, observed_at: int) -> dict:
-        return {**self._static, "observed_at": observed_at}
+        if (self._static.get("host_id") != self.host_id
+                or len(self.host_id) > HOST_STRING_LIMITS["host_id"]
+                or redact_secrets(self.host_id, len(self.host_id) + 16) != self.host_id):
+            raise ValueError("Generated host identity is unsafe to serialize")
+        result = {"host_id": self.host_id}
+        for key, limit in HOST_STRING_LIMITS.items():
+            if key == "host_id":
+                continue
+            value = self._static.get(key)
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"Host identity has invalid {key}")
+            projected = redact_secrets(value, len(value) + 16)
+            if not projected.strip() or len(projected) > limit:
+                raise ValueError(f"Host identity has invalid {key}")
+            result[key] = projected
+        result["observed_at"] = observed_at
+        return result

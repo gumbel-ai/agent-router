@@ -57,7 +57,7 @@ def observe(event: dict) -> dict:
     elif name in {"SubagentStart", "SubagentStop"}:
         payload["kind"] = "start" if name == "SubagentStart" else "stop"
         if name == "SubagentStop":
-            payload["summary"] = text(event.get("last_assistant_message"), 800)
+            payload["summary"] = redacted_text(event.get("last_assistant_message"), 800)
             payload["transcript"] = event.get("agent_transcript_path")
     elif name == "PostToolUse" and tool in {"Agent", "Task"} and isinstance(response, dict) and response.get("agentId"):
         asynchronous = response.get("isAsync") is True or response.get("status") == "async_launched"
@@ -85,8 +85,17 @@ def observe(event: dict) -> dict:
         payload["transcript"] = str(parent.parent / parent.stem / "subagents" / f"agent-{payload['agent_id']}.jsonl")
     try:
         result = request("lifecycle_observe", {"session": session_payload, "native": payload}, timeout=.05)
-        if result.get("accepted") is False:
-            reason = text(result.get("reason"), 500) or "Lifecycle observation was not accepted"
+        rejected = result.get("accepted") is False
+        terminal_failure = result.get("persisted") is False and result.get("queued") is not True
+        if rejected or terminal_failure:
+            persistence = result.get("persistence")
+            failed = [
+                key for key, state in persistence.items() if state == "failed"
+            ] if isinstance(persistence, dict) else []
+            reason = text(result.get("reason"), 500)
+            if reason is None and failed:
+                reason = "Lifecycle observation failed for: " + ", ".join(sorted(failed))
+            reason = reason or "Lifecycle observation was not accepted"
             print(f"Agent Router observation unavailable: {reason}", file=sys.stderr)
     except ValueError as error:
         if str(error) == "Unknown operation" and payload is not None:

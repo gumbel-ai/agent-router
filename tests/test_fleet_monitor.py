@@ -1,6 +1,8 @@
+import fcntl
 import io
 import json
 import os
+import signal
 import sqlite3
 import subprocess
 import sys
@@ -10,8 +12,7 @@ import time
 import unittest
 import uuid
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import contextmanager
-from contextlib import redirect_stdout
+from contextlib import contextmanager, redirect_stdout
 from pathlib import Path
 from unittest.mock import mock_open, patch
 
@@ -32,6 +33,7 @@ from router.fleet import (
     MAX_COLLECTION_RECORDS,
     FleetConfig,
     FleetHost,
+    _prefix_identities,
     _redact_error,
     _validate_snapshot,
     capacity_projection,
@@ -41,9 +43,10 @@ from router.fleet import (
     ssh_snapshot,
 )
 from router.fleet_snapshot import MAX_SNAPSHOT_BYTES, AlertHistory, bound, compose
-from router.host import current_boot_id, stable_host_id
+from router.host import HostIdentity, current_boot_id, stable_host_id
 from router.native import NativeObserver
-from router.sessions import SessionObserver
+from router.sessions import MAX_EXACT_INFLIGHT_TOOLS, SessionObserver
+from router.validation import HOST_STRING_LIMITS
 
 
 def snapshot(host_id="host-1"):
@@ -53,15 +56,59 @@ def snapshot(host_id="host-1"):
                      "router_version": "0.4.0", "claude_version": "2.1.300",
                      "observed_at": 1},
             "capacity": {"logical_cpus": 8, "load_1m": 1, "load_5m": 1, "cpu_busy_pct": 20,
+                         "memory_total_bytes": 32 * 1024**3,
                          "memory_available_bytes": 16 * 1024**3, "disk_available_bytes": 20 * 1024**3,
-                         "sample_age_ms": 1},
-            "sessions": [{"host_id": host_id, "source": "claude", "session_id": "same", "status": "running"}],
+                         "swap_used_bytes": 0, "observed_at": 1, "sample_age_ms": 1,
+                         "active_claude_sessions": 1,
+                         "active_agents": 1, "active_managed_processes": 0},
+            "sessions": [{"host_id": host_id, "source": "claude", "session_id": "same",
+                          "status": "running", "started_at": 0, "last_event_at": 1}],
             "agents": [{"host_id": host_id, "source": "claude", "parent_session_id": "same",
-                        "agent_id": "child", "status": "running"}],
+                        "agent_id": "child", "status": "running", "started_at": 0,
+                        "last_event_at": 1}],
             "tasks": [], "managed_processes": [], "inferred_processes": [], "alerts": []}
 
 
 class HostAndMigrationTests(unittest.TestCase):
+    def test_host_view_redacts_every_display_field_and_rejects_unsafe_identity(self):
+        host = HostIdentity.__new__(HostIdentity)
+        host.host_id = "host"
+        host._static = {
+            "host_id": "host", "hostname": "password is correct horse battery staple",
+            "boot_id": "token=secret-value", "platform": "secret=platform value",
+            "architecture": "api key is architecture value", "router_version": "pwd=router value",
+            "claude_version": "access key is claude value",
+        }
+        serialized = json.dumps(host.view(1))
+        for leaked in ("correct horse", "secret-value", "platform value", "architecture value",
+                       "router value", "claude value"):
+            self.assertNotIn(leaked, serialized)
+        host.host_id = "token=secret-value"
+        with self.assertRaisesRegex(ValueError, "host identity"):
+            host.view(1)
+
+    def test_host_display_bounds_match_the_snapshot_wire_schema(self):
+        base = {
+            "host_id": "host", "hostname": "host", "boot_id": "boot",
+            "platform": "linux", "architecture": "x86_64",
+            "router_version": "0.4.0", "claude_version": "2.1.300",
+        }
+        for field, limit in HOST_STRING_LIMITS.items():
+            if field == "host_id":
+                continue
+            with self.subTest(field=field, boundary="at"):
+                host = HostIdentity.__new__(HostIdentity)
+                host.host_id = "host"
+                host._static = {**base, field: "x" * limit}
+                value = snapshot("host")
+                value["host"] = host.view(1)
+                self.assertEqual(len(value["host"][field]), limit)
+                self.assertEqual(_validate_snapshot(json.dumps(value).encode())["host"][field], "x" * limit)
+            with self.subTest(field=field, boundary="beyond"):
+                host._static = {**base, field: "x" * (limit + 1)}
+                with self.assertRaisesRegex(ValueError, field):
+                    host.view(1)
+
     def test_generated_host_identity_is_stable_private_and_boot_id_changes(self):
         with tempfile.TemporaryDirectory() as temp:
             directory = Path(temp)
@@ -81,6 +128,48 @@ class HostAndMigrationTests(unittest.TestCase):
             self.assertEqual(len(set(identities)), 1)
             uuid.UUID(identities[0])
             self.assertEqual((directory / "host-id").stat().st_mode & 0o777, 0o600)
+
+    def test_empty_host_identity_recovery_is_serialized_across_processes(self):
+        with tempfile.TemporaryDirectory() as temp:
+            directory = Path(temp)
+            (directory / "host-id").touch()
+            lock_descriptor = os.open(directory / ".host-id.lock", os.O_RDWR | os.O_CREAT, 0o600)
+            fcntl.flock(lock_descriptor, fcntl.LOCK_EX)
+            script = (
+                "import sys\n"
+                "from pathlib import Path\n"
+                "import router.host as host\n"
+                "real_flock = host.fcntl.flock\n"
+                "def traced_flock(descriptor, operation):\n"
+                "    print('locking', flush=True)\n"
+                "    return real_flock(descriptor, operation)\n"
+                "host.fcntl.flock = traced_flock\n"
+                "print(host.stable_host_id(Path(sys.argv[1]), 'darwin'), flush=True)\n"
+            )
+            processes = [
+                subprocess.Popen(
+                    [sys.executable, "-c", script, str(directory)],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                )
+                for _ in range(2)
+            ]
+            try:
+                locking = [process.stdout.readline().strip() for process in processes]
+                blocked = [process.poll() is None for process in processes]
+            finally:
+                fcntl.flock(lock_descriptor, fcntl.LOCK_UN)
+                os.close(lock_descriptor)
+
+            completed = [process.communicate(timeout=5) for process in processes]
+            self.assertEqual(locking, ["locking", "locking"])
+            self.assertEqual(blocked, [True, True])
+            self.assertEqual([process.returncode for process in processes], [0, 0])
+            self.assertEqual([stderr for _, stderr in completed], ["", ""])
+            identities = [stdout.strip() for stdout, _ in completed]
+            self.assertEqual(len(set(identities)), 1)
+            self.assertEqual((directory / "host-id").read_text().strip(), identities[0])
 
     def test_additive_observation_migration_preserves_history_and_adds_host_scope(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -149,6 +238,26 @@ class HostAndMigrationTests(unittest.TestCase):
             with sqlite3.connect(path) as db:
                 self.assertEqual(db.execute("PRAGMA schema_version").fetchone()[0], schema_version)
 
+    def test_active_tool_deadline_index_persists_and_serves_the_count_query(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "router.sqlite3"
+            Store(path, "host")
+            Store(path, "host")
+
+            with sqlite3.connect(path) as db:
+                index = db.execute(
+                    "SELECT sql FROM sqlite_master WHERE type='index' AND name=?",
+                    ("sessions_active_tool_deadline",),
+                ).fetchone()
+                plan = db.execute("""EXPLAIN QUERY PLAN SELECT COUNT(*) FROM sessions
+                    WHERE host_id=? AND json_extract(data,'$.status')='running'
+                      AND json_extract(data,'$.last_event_at')<?
+                      AND json_extract(data,'$.tool_active_until')>=?""",
+                                  ("host", 1, 1)).fetchall()
+
+        self.assertIsNotNone(index)
+        self.assertIn("sessions_active_tool_deadline", " ".join(str(item) for row in plan for item in row))
+
 
 class SessionAndCapacityTests(unittest.TestCase):
     def setUp(self):
@@ -203,19 +312,22 @@ class SessionAndCapacityTests(unittest.TestCase):
 
     def test_operator_visible_task_metadata_redacts_credentials(self):
         self.event("session_start")
-        self.event("task_created", task_id="T", task_subject="rotate password=swordfish")
+        self.event("task_created", task_id="T", task_subject="status=failed\napiKey=swordfish")
         task = self.observer.tasks()[0]
         self.assertNotIn("swordfish", task["subject"])
         self.assertIn("[REDACTED]", task["subject"])
+        self.assertIn("status=failed", task["subject"])
 
         native = NativeObserver(self.store, host_id="host")
         record = native.observe({
             "source": "claude", "session_id": "S", "agent_id": "A",
             "kind": "launch", "observed_at": self.now,
-            "task": "use api_key=sk-ant-abcdefghijklmnop",
+            "task": "status=failed accessToken=sk-ant-abcdefghijklmnop next=ok",
         })
         self.assertNotIn("sk-ant-abcdefghijklmnop", record["task"])
         self.assertIn("[REDACTED]", record["task"])
+        self.assertIn("status=failed", record["task"])
+        self.assertIn("next=ok", record["task"])
 
         session_boundary_secret = "x" * 477 + " https://user:swordfish@example.com"
         self.event("task_created", task_id="boundary", task_subject=session_boundary_secret)
@@ -236,6 +348,40 @@ class SessionAndCapacityTests(unittest.TestCase):
         visible = native.snapshot()[0]
         self.assertNotIn("swordfish", visible["task"])
         self.assertIn("[REDACTED]", visible["task"])
+
+    def test_session_and_task_serialization_redacts_displays_and_rejects_identities(self):
+        secret = "password is correct horse battery staple"
+        visible = self.event("session_start", cwd=f"/tmp/{secret}", model=secret,
+                             start_source=secret)
+        self.assertNotIn("correct horse", json.dumps(visible))
+        self.event("task_created", task_id="safe-task", task_subject=secret,
+                   teammate_name=secret)
+        self.assertNotIn("correct horse", json.dumps(self.observer.tasks()))
+
+        for field, value in (("session_id", "token=secret-value"),
+                             ("parent_session_id", "password=secret-value")):
+            event = {"source": "claude", "session_id": "safe", "kind": "session_start",
+                     "observed_at": self.now, field: value}
+            with self.subTest(field=field), self.assertRaises((TypeError, ValueError)):
+                self.observer.observe(event)
+        with self.assertRaisesRegex(ValueError, "invalid task_id"):
+            self.event("task_created", task_id="token=secret-value")
+        with self.assertRaisesRegex(ValueError, "invalid tool_use_id"):
+            self.event("tool_start", tool_use_id="token=secret-value")
+
+        with self.store.transaction() as db:
+            record = self.observer._session(db, "claude", "S", self.now)
+            record["activity"] = secret
+            self.observer._put_session(db, record)
+        self.assertNotIn("correct horse", json.dumps(self.observer.sessions()))
+        with self.store.transaction() as db:
+            record = self.observer._session(db, "claude", "S", self.now)
+            record["session_id"] = "token=secret-value"
+            db.execute("DELETE FROM sessions WHERE host_id=? AND source=? AND session_id=?",
+                       ("host", "claude", "S"))
+            self.observer._put_session(db, record)
+        with self.assertRaisesRegex(ValueError, "invalid session_id"):
+            self.observer.sessions()
 
     def test_capacity_classification_checks_all_dimensions_and_staleness(self):
         sample = {"logical_cpus": 8, "load_1m": 7, "cpu_busy_pct": 70,
@@ -374,6 +520,130 @@ class SessionAndCapacityTests(unittest.TestCase):
         tied_start = self.event("tool_start", observed_at=self.now + 4, tool_use_id="B", activity="Bash")
         self.assertEqual(tied_start["inflight_tool_count"], 0)
 
+    def test_evicted_tool_completion_retains_conservative_terminal_floor(self):
+        self.event("session_start", observed_at=self.now)
+        for number in range(129):
+            completed = self.event(
+                "tool_end", observed_at=self.now + 100 + number,
+                tool_use_id=f"tool-{number}", activity="Bash",
+            )
+        self.assertTrue(completed["tool_visibility_partial"])
+
+        delayed = self.event(
+            "tool_start", observed_at=self.now + 50,
+            tool_use_id="tool-0", activity="Bash",
+        )
+        self.assertTrue(delayed["tool_visibility_partial"])
+        self.assertEqual(delayed["inflight_tool_count"], 0)
+        self.assertEqual(delayed["status"], "unknown")
+        self.assertIn("bound", delayed["visibility_reason"])
+
+        reset = self.event("prompt", observed_at=self.now + 300)
+        self.assertFalse(reset["tool_visibility_partial"])
+        self.assertEqual(reset["inflight_tool_count"], 0)
+
+    def test_tool_reset_watermark_and_agent_completion_preserve_live_work(self):
+        self.event("session_start", observed_at=self.now)
+        self.event("prompt", observed_at=self.now + 10)
+        delayed = self.event("tool_start", observed_at=self.now + 10,
+                             tool_use_id="old", activity="stale")
+        self.assertEqual(delayed["inflight_tool_count"], 0)
+        self.event("tool_start", observed_at=self.now + 11,
+                   tool_use_id="live", activity="Bash")
+        self.event("notification", observed_at=self.now + 12,
+                   notification_type="agent_needs_input", agent_id="A")
+        completed = self.event("notification", observed_at=self.now + 13,
+                               notification_type="agent_completed", agent_id="B")
+        self.assertEqual((completed["status"], completed["needs_input"]), ("running", True))
+        self.event("session_end", observed_at=self.now + 20)
+        tied = self.event("session_start", observed_at=self.now + 20)
+        self.assertEqual(tied["status"], "stopped")
+
+    def test_completion_after_stop_updates_only_the_tool_watermark(self):
+        self.event("session_start", observed_at=self.now)
+        self.event("tool_start", observed_at=self.now + 1,
+                   tool_use_id="old", activity="Bash")
+        stopped = self.event("stop", observed_at=self.now + 2)
+        delayed = self.event("tool_end", observed_at=self.now + 3,
+                             tool_use_id="old", activity="Bash")
+
+        self.assertEqual((stopped["status"], delayed["status"]), ("idle", "idle"))
+        self.assertEqual(delayed["last_event_at"], stopped["last_event_at"])
+        self.assertEqual(delayed["inflight_tool_count"], 0)
+        replay = self.event("tool_start", observed_at=self.now + 3,
+                            tool_use_id="old", activity="Bash")
+        self.assertEqual((replay["status"], replay["inflight_tool_count"]), ("idle", 0))
+
+    def test_uncorrelated_tool_start_cannot_reopen_idle_after_stop(self):
+        self.event("session_start", observed_at=self.now)
+        stopped = self.event("stop", observed_at=self.now + 1)
+        replay = self.event("tool_start", observed_at=self.now + 2, activity="Bash")
+        self.assertEqual((stopped["status"], replay["status"]), ("idle", "idle"))
+        self.assertEqual(replay["last_event_at"], stopped["last_event_at"])
+
+    def test_display_tool_bound_does_not_destroy_exact_correlation(self):
+        self.event("session_start", observed_at=self.now)
+        for number in range(65):
+            overflow = self.event("tool_start", observed_at=self.now + number + 1,
+                                  tool_use_id=f"tool-{number}")
+        self.assertEqual(overflow["inflight_tool_count"], 65)
+        self.assertTrue(overflow["tool_visibility_partial"])
+        for number in range(65):
+            overflow = self.event("tool_end", observed_at=self.now + 100 + number,
+                                  tool_use_id=f"tool-{number}")
+        self.assertEqual(overflow["status"], "running")
+        self.assertEqual(overflow["inflight_tool_count"], 0)
+        self.assertFalse(overflow["tool_visibility_partial"])
+        with patch("router.sessions.now_ms", return_value=self.now + 100 + 65 + 300_001):
+            rows, active = self.observer.fleet_records(100)
+        self.assertEqual((rows[0]["status"], active), ("unknown", 0))
+
+    def test_exact_tool_bound_degrades_to_unknown_instead_of_synthetic_activity(self):
+        self.event("session_start", observed_at=self.now)
+        for number in range(MAX_EXACT_INFLIGHT_TOOLS + 1):
+            result = self.event(
+                "tool_start", observed_at=self.now + number + 1,
+                tool_use_id=f"tool-{number}",
+            )
+        self.assertEqual(result["status"], "unknown")
+        self.assertTrue(result["tool_visibility_partial"])
+        self.assertEqual(result["inflight_tool_count"], MAX_EXACT_INFLIGHT_TOOLS)
+        with patch("router.sessions.now_ms", return_value=self.now + MAX_EXACT_INFLIGHT_TOOLS + 1):
+            self.assertIsNone(self.observer.active_count())
+
+    def test_active_tool_total_uses_indexed_deadline_without_decoding_candidates(self):
+        old = self.now - 600_000
+        self.event("session_start", observed_at=old)
+        self.event("tool_start", observed_at=old + 1,
+                   tool_use_id="long-running", activity="Bash")
+
+        expired = []
+        for number in range(2000):
+            session_id = f"expired-{number}"
+            expired.append(("host", "claude", session_id, json.dumps({
+                "host_id": "host", "source": "claude", "session_id": session_id,
+                "status": "running", "last_event_at": old,
+                "tool_active_until": self.now - 1,
+            }, separators=(",", ":"))))
+        with self.store.transaction() as db:
+            db.executemany("INSERT INTO sessions(host_id,source,session_id,data) VALUES(?,?,?,?)", expired)
+
+        with patch("router.sessions.now_ms", return_value=self.now), \
+                patch.object(self.observer, "view", side_effect=AssertionError("decoded candidate")):
+            self.assertEqual(self.observer.active_count(), 1)
+
+    def test_fresh_activity_is_busy_but_unavailable_totals_are_unknown(self):
+        base = {"logical_cpus": 8, "load_1m": 1, "cpu_busy_pct": 20,
+                "memory_available_bytes": 8 * 1024**3, "disk_available_bytes": 20 * 1024**3,
+                "sample_age_ms": 1, "active_claude_sessions": 1,
+                "active_agents": 0, "active_managed_processes": 0}
+        state, reasons = classify(base, CapacityThresholds())
+        self.assertEqual(state, "busy")
+        self.assertIn("active Claude sessions", reasons[0])
+        unknown, unknown_reasons = classify({**base, "active_agents": None}, CapacityThresholds())
+        self.assertEqual(unknown, "unknown")
+        self.assertIn("active_agents", unknown_reasons[0])
+
     def test_first_cpu_sample_is_unknown_until_a_delta_exists(self):
         with patch("router.capacity._raw_cpu_ticks", side_effect=[(100, 50), (120, 55)]), \
                 patch("router.capacity._raw_memory", return_value=(16, 8, 0)), \
@@ -383,6 +653,70 @@ class SessionAndCapacityTests(unittest.TestCase):
             sampler = CapacitySampler(Path(self.temp.name))
             self.assertIsNone(sampler.view(CapacityThresholds())["cpu_busy_pct"])
             self.assertEqual(sampler.sample()["cpu_busy_pct"], 75.0)
+
+    def test_each_raw_capacity_failure_is_partial_and_the_sampler_recovers(self):
+        with patch("router.capacity._raw_cpu_ticks", return_value=(100, 50)), \
+                patch("router.capacity._raw_memory", return_value=(16, 8, 0)), \
+                patch("router.capacity.shutil.disk_usage", return_value=type("Usage", (), {"free": 20})()), \
+                patch("router.capacity.os.getloadavg", return_value=(0, 0, 0)), \
+                patch("router.capacity.os.cpu_count", return_value=2):
+            sampler = CapacitySampler(Path(self.temp.name))
+            for target in (
+                "router.capacity._raw_cpu_ticks",
+                "router.capacity._raw_memory",
+                "router.capacity.shutil.disk_usage",
+                "router.capacity.os.getloadavg",
+                "router.capacity.os.cpu_count",
+            ):
+                with self.subTest(target=target), patch(target, side_effect=OSError("raw sample failed")):
+                    failed = sampler.sample()
+                    self.assertTrue(failed["partial"])
+                    self.assertIn("raw sample failed", failed["error"])
+                recovered = sampler.sample()
+                self.assertFalse(recovered["partial"])
+
+    def test_capacity_freshness_uses_monotonic_time_and_wall_rollback_is_unknown(self):
+        with patch("router.capacity._raw_cpu_ticks", return_value=(100, 50)), \
+                patch("router.capacity._raw_memory", return_value=(16, 8, 0)), \
+                patch("router.capacity.shutil.disk_usage", return_value=type("Usage", (), {"free": 20})()), \
+                patch("router.capacity.os.getloadavg", return_value=(0, 0, 0)), \
+                patch("router.capacity.os.cpu_count", return_value=2), \
+                patch("router.capacity.time.time", return_value=1000), \
+                patch("router.capacity.time.monotonic", side_effect=[10, 12]):
+            sampler = CapacitySampler(Path(self.temp.name))
+            monotonic = sampler.view(CapacityThresholds())
+        self.assertEqual(monotonic["sample_age_ms"], 2000)
+
+        sampler._latest = {
+            "logical_cpus": 2, "load_1m": 0, "load_5m": 0, "cpu_busy_pct": 1,
+            "memory_total_bytes": 16, "memory_available_bytes": 8,
+            "swap_used_bytes": 0, "disk_available_bytes": 20,
+            "observed_at": 1_000_000, "partial": False,
+        }
+        sampler._latest_observed_at = None
+        with patch("router.capacity.time.time", return_value=500):
+            rolled_back = sampler.view(CapacityThresholds())
+        self.assertTrue(rolled_back["partial"])
+        self.assertEqual(rolled_back["capacity_state"], "unknown")
+        self.assertIn("clock moved backwards", rolled_back["capacity_reasons"][0])
+
+    def test_session_wall_clock_rollback_makes_exact_active_total_unavailable(self):
+        self.event("session_start", observed_at=self.now)
+        with self.store.connect() as db:
+            record = json.loads(db.execute("SELECT data FROM sessions").fetchone()[0])
+        rolled_back = self.observer.view(record, self.now - 1)
+        self.assertEqual(rolled_back["status"], "unknown")
+        self.assertIn("clock moved backwards", rolled_back["visibility_reason"])
+        with patch("router.sessions.now_ms", return_value=self.now - 1):
+            self.assertIsNone(self.observer.active_count())
+
+    def test_persisted_session_activity_redacts_notification_secrets(self):
+        self.event("session_start")
+        self.event("notification", notification_type="status API_KEY=swordfish")
+        with self.store.connect() as db:
+            raw = db.execute("SELECT data FROM sessions").fetchone()[0]
+        self.assertNotIn("swordfish", raw)
+        self.assertIn("[REDACTED]", raw)
 
     def test_active_reservation_prevents_available_capacity_and_malformed_record_is_partial(self):
         reservation = Path(self.temp.name) / "reservation.json"
@@ -410,10 +744,52 @@ class SessionAndCapacityTests(unittest.TestCase):
             view = sampler.view(CapacityThresholds())
             self.assertTrue(view["reservation_active"])
             self.assertEqual(view["capacity_state"], "saturated")
+            with patch("router.capacity.time.time", return_value=(self.now + 120_000) / 1000):
+                as_of_snapshot = sampler.view(CapacityThresholds(), as_of_ms=self.now)
+            self.assertTrue(as_of_snapshot["reservation_active"])
             reservation.write_text("not-json")
             partial = sampler.view(CapacityThresholds())
             self.assertTrue(partial["partial"])
             self.assertEqual(partial["capacity_state"], "unknown")
+            with patch.object(
+                    sampler.reservations, "read",
+                    side_effect=ValueError("reservation password=swordfish")):
+                reservation_error = sampler.view(CapacityThresholds())
+            self.assertNotIn("swordfish", reservation_error["error"])
+            reservation.unlink()
+            sampler._latest = {
+                "observed_at": self.now, "partial": True,
+                "error": "sampler MY_SERVICE_API_KEY=swordfish",
+            }
+            sample_error = sampler.view(CapacityThresholds())
+            self.assertNotIn("swordfish", sample_error["error"])
+
+    def test_snapshot_reservation_state_uses_one_generated_at_boundary(self):
+        observed = {}
+
+        class Host:
+            def view(self, at): return {"host_id": "host", "observed_at": at}
+        class Sessions:
+            def fleet_records(self, limit): return [], 0
+            def tasks(self, limit): return []
+        class Native:
+            def fleet_records(self, limit): return [], 0
+        class Capacity:
+            def view(self, thresholds, as_of_ms=None, **counts):
+                observed["as_of_ms"] = as_of_ms
+                return {"reserved_by": "scheduler", "reserved_until": 1001,
+                        "reserved_cpu_slots": 1, "reserved_memory_bytes": 0,
+                        "reservation_source": "test", "reservation_active": False,
+                        **counts}
+
+        controller = type("Controller", (), {
+            "host": Host(), "sessions": Sessions(), "native": Native(), "capacity": Capacity(),
+        })()
+        with patch("router.fleet_snapshot.now_ms", return_value=1000):
+            result = compose(controller)
+        self.assertIsNone(observed["as_of_ms"])
+        self.assertEqual(result["generated_at"], 1000)
+        self.assertTrue(result["capacity"]["reservation_active"])
 
     def test_memory_reservation_threshold_expiry_and_read_bound(self):
         raw_sample = {"logical_cpus": 8, "load_1m": 1, "cpu_busy_pct": 20,
@@ -445,8 +821,139 @@ class SessionAndCapacityTests(unittest.TestCase):
             reader.read(self.now)
         opened().read.assert_called_once_with(MAX_RESERVATION_BYTES + 1)
 
+    def test_persisted_monitoring_integers_match_the_wire_bound(self):
+        with self.assertRaisesRegex(ValueError, "timestamp"):
+            self.event("session_start", observed_at=2**63)
+        with self.assertRaisesRegex(ValueError, "timestamp"):
+            self.event("session_start", observed_at=self.now + 120_000)
+
+        with self.assertRaisesRegex(ValueError, "invalid session_id"):
+            self.event("session_start", session_id="abc\u202edef")
+        with self.assertRaisesRegex(ValueError, "invalid task_id"):
+            self.event("task_created", task_id="task\u202eid")
+        with self.assertRaisesRegex(ValueError, "invalid tool_use_id"):
+            self.event("tool_start", tool_use_id="tool\u202eid", activity="Bash")
+
+        reservation = Path(self.temp.name) / "reservation.json"
+        reservation.write_text(json.dumps({
+            "schema_version": 1, "reserved_by": "coordinator",
+            "reserved_until": 2**63, "reserved_cpu_slots": 0,
+            "reserved_memory_bytes": 0, "reservation_source": "scheduler",
+        }))
+        with self.assertRaisesRegex(ValueError, "64-bit integer"):
+            ReservationReader(reservation).read(self.now)
+        sampler = CapacitySampler(Path(self.temp.name), reservation_path=reservation)
+        projected = sampler.view(CapacityThresholds())
+        self.assertTrue(projected["partial"])
+        self.assertEqual(projected["capacity_state"], "unknown")
+
+    def test_reservation_schema_version_requires_the_integer_one(self):
+        reservation = Path(self.temp.name) / "reservation.json"
+        base = {
+            "reserved_by": "coordinator", "reserved_until": self.now + 1,
+            "reserved_cpu_slots": 0, "reserved_memory_bytes": 0,
+            "reservation_source": "scheduler",
+        }
+        for schema_version in (True, 1.0, "1", 2, None):
+            reservation.write_text(json.dumps({"schema_version": schema_version, **base}))
+            with self.subTest(schema_version=schema_version), self.assertRaisesRegex(
+                    ValueError, "schema_version 1"):
+                ReservationReader(reservation).read(self.now)
+
 
 class SnapshotAndFleetTests(unittest.TestCase):
+    def test_capacity_semantics_reject_every_incomplete_or_contradictory_variant(self):
+        for field in ("load_5m", "memory_total_bytes", "swap_used_bytes", "observed_at"):
+            value = snapshot()
+            value["capacity"].pop(field)
+            with self.subTest(missing=field):
+                projected = _validate_snapshot(json.dumps(value).encode())
+                self.assertTrue(projected["partial"])
+                self.assertEqual(projected["capacity"]["capacity_state"], "unknown")
+
+        contradictory_age = snapshot()
+        contradictory_age["generated_at"] = 100_000
+        contradictory_age["host"]["observed_at"] = 100_000
+        contradictory_age["capacity"].update(observed_at=1, sample_age_ms=1)
+        projected = _validate_snapshot(json.dumps(contradictory_age).encode())
+        self.assertEqual(projected["capacity"]["capacity_state"], "unknown")
+        self.assertIn("contradicts", " ".join(projected["capacity"]["capacity_reasons"]))
+
+        contradictory_memory = snapshot()
+        contradictory_memory["capacity"]["memory_total_bytes"] = 1
+        projected = _validate_snapshot(json.dumps(contradictory_memory).encode())
+        self.assertEqual(projected["capacity"]["capacity_state"], "unknown")
+        self.assertIn("exceeds total", " ".join(projected["capacity"]["capacity_reasons"]))
+
+        source_unknown = snapshot()
+        source_unknown["sessions"] = []
+        source_unknown["agents"] = []
+        source_unknown["capacity"].update(
+            active_claude_sessions=0, active_agents=0,
+            capacity_state="unknown", capacity_reasons=["sensor uncertainty"],
+        )
+        result = query_fleet(
+            FleetConfig((FleetHost("local", "local"),)),
+            local_snapshot=lambda thresholds: source_unknown,
+        )
+        self.assertTrue(result["partial"])
+        self.assertEqual(result["hosts"][0]["snapshot"]["capacity"]["capacity_state"], "unknown")
+        self.assertEqual(
+            result["hosts"][0]["snapshot"]["capacity"]["capacity_reasons"],
+            ["sensor uncertainty"],
+        )
+
+        for section in ("sessions", "agents", "managed_processes"):
+            value = snapshot()
+            value.update(partial=True, errors={section: "collection failed"})
+            with self.subTest(failed_section=section):
+                result = query_fleet(
+                    FleetConfig((FleetHost("local", "local"),)),
+                    local_snapshot=lambda thresholds, value=value: value,
+                )
+                capacity = result["hosts"][0]["snapshot"]["capacity"]
+                self.assertEqual(capacity["capacity_state"], "busy")
+                self.assertNotIn("partial", capacity)
+
+        for section in (
+            "session_active_count", "agent_active_count", "managed_process_active_count",
+            "lifecycle", "lifecycle_consistency",
+        ):
+            value = snapshot()
+            value.update(partial=True, errors={section: "active count unavailable"})
+            with self.subTest(failed_exact_count=section):
+                projected = _validate_snapshot(json.dumps(value).encode())
+                self.assertEqual(projected["capacity"]["capacity_state"], "unknown")
+                self.assertTrue(projected["capacity"]["partial"])
+
+        for field, mutate in (
+            ("active_claude_sessions", lambda value: value["capacity"].update(active_claude_sessions=0)),
+            ("active_agents", lambda value: value["capacity"].update(active_agents=0)),
+            ("active_managed_processes", lambda value: (
+                value["managed_processes"].append({
+                    "host_id": "host-1", "managed_id": "managed", "status": "running",
+                }),
+                value["capacity"].update(active_managed_processes=0),
+            )),
+        ):
+            value = snapshot()
+            mutate(value)
+            with self.subTest(contradicted_total=field):
+                projected = _validate_snapshot(json.dumps(value).encode())
+                self.assertEqual(projected["capacity"]["capacity_state"], "unknown")
+                self.assertIn(field, " ".join(projected["capacity"]["capacity_reasons"]))
+
+    def test_fleet_latency_preserves_integer_capacity_schema(self):
+        result = query_fleet(
+            FleetConfig((FleetHost("local", "local"),)),
+            local_snapshot=lambda thresholds: snapshot(),
+        )
+        nested = result["hosts"][0]["snapshot"]
+        self.assertIsInstance(nested["capacity"]["sample_age_ms"], int)
+        self.assertIsInstance(
+            _validate_snapshot(json.dumps(nested).encode())["capacity"]["sample_age_ms"], int,
+        )
+
     def test_remote_snapshot_validator_rejects_malformed_wire_shapes(self):
         cases = []
 
@@ -461,6 +968,15 @@ class SnapshotAndFleetTests(unittest.TestCase):
             encoded(lambda value: value.update(generated_at="now")),
             encoded(lambda value: value.update(sessions={})),
             encoded(lambda value: value["sessions"][0].pop("source")),
+            encoded(lambda value: value["sessions"][0].pop("status")),
+            encoded(lambda value: value["sessions"][0].update(status="banana")),
+            encoded(lambda value: value["agents"][0].pop("last_event_at")),
+            encoded(lambda value: value["agents"][0].update(status="banana")),
+            encoded(lambda value: value.update(tasks=[{
+                "host_id": "host-1", "source": "claude", "session_id": "same",
+                "task_id": "task", "status": "banana", "created_at": 0,
+                "last_event_at": 0,
+            }])),
             encoded(lambda value: value["host"].pop("boot_id")),
             encoded(lambda value: value.update(sessions=[{}] * (MAX_COLLECTION_RECORDS + 1))),
             encoded(lambda value: value["capacity"].update(reserved_until=True)),
@@ -469,6 +985,247 @@ class SnapshotAndFleetTests(unittest.TestCase):
         for payload in cases:
             with self.subTest(payload=payload[:80]), self.assertRaises(ValueError):
                 _validate_snapshot(payload)
+
+    def test_remote_projection_rejects_nonfinite_json_and_drops_hostile_unknown_fields(self):
+        with self.assertRaisesRegex(ValueError, "invalid snapshot JSON"):
+            _validate_snapshot(json.dumps({**snapshot(), "generated_at": float("nan")}).encode())
+        hostile = snapshot()
+        hostile.update(prompt="PRIVATE", transcript="PRIVATE", environment={"TOKEN": "PRIVATE"},
+                       messages=["PRIVATE"], future_schema_field="drop-me",
+                       errors={"capacity": "status=failed apiKey=swordfish next=ok",
+                               "unknown": "PRIVATE"})
+        hostile["sessions"][0].update(prompt="PRIVATE", messages=["PRIVATE"], unknown="drop-me")
+        hostile["agents"][0].update(transcript="PRIVATE", environment={"TOKEN": "PRIVATE"})
+        hostile["capacity"]["future"] = "drop-me"
+        projected = _validate_snapshot(json.dumps(hostile).encode())
+        serialized = json.dumps(projected)
+        self.assertNotIn("PRIVATE", serialized)
+        self.assertNotIn("drop-me", serialized)
+        self.assertNotIn("swordfish", serialized)
+        self.assertIn("[REDACTED]", projected["errors"]["capacity"])
+        self.assertIn("status=failed", projected["errors"]["capacity"])
+        self.assertIn("next=ok", projected["errors"]["capacity"])
+        self.assertTrue(projected["partial"])
+        self.assertIn("unsupported field", projected["errors"]["projection"])
+        self.assertIn("unsupported field", projected["errors"]["sessions"])
+        self.assertIn("unsupported field", projected["errors"]["agents"])
+        self.assertEqual(projected["capacity"]["capacity_state"], "unknown")
+
+        display_only = snapshot()
+        display_only["sessions"][0]["unknown_display_field"] = "omitted"
+        display_projection = _validate_snapshot(json.dumps(display_only).encode())
+        self.assertTrue(display_projection["partial"])
+        self.assertFalse(display_projection["capacity"].get("partial", False))
+        fleet_projection = query_fleet(
+            FleetConfig((FleetHost("local", "local"),)),
+            local_snapshot=lambda thresholds: display_only,
+        )
+        self.assertEqual(
+            fleet_projection["hosts"][0]["snapshot"]["capacity"]["capacity_state"],
+            "busy",
+        )
+        unsafe_identity = snapshot()
+        unsafe_identity["sessions"][0]["session_id"] = "token=secret-value"
+        with self.assertRaisesRegex(ValueError, "unsafe sessions session_id"):
+            _validate_snapshot(json.dumps(unsafe_identity).encode())
+
+    def test_remote_projection_redacts_known_displays_rejects_all_identities_and_bounds_usage(self):
+        secret = "password is correct horse battery staple"
+        value = snapshot()
+        for key in ("hostname", "boot_id", "platform", "architecture", "router_version", "claude_version"):
+            value["host"][key] = secret
+        value["sessions"][0].update(cwd=secret, model=secret, activity=secret,
+                                    visibility_reason=secret)
+        value["agents"][0].update(task=secret, agent_type=secret, requested_model=secret,
+                                  resolved_model=secret, models=[secret], activity=secret,
+                                  cwd=secret, worktree=secret, cost_note=secret,
+                                  visibility_reason=secret)
+        value["tasks"] = [{"host_id": "host-1", "source": "claude", "session_id": "same",
+                           "task_id": "safe", "status": "created", "subject": secret,
+                           "teammate_name": secret, "created_at": 0, "last_event_at": 0}]
+        value["capacity"].update(capacity_reasons=[secret], error=secret)
+        projected = _validate_snapshot(json.dumps(value).encode())
+        self.assertNotIn("correct horse", json.dumps(projected))
+
+        identity_cases = {
+            "host host_id": lambda item: (
+                item["host"].update(host_id="token=secret-value"),
+                [record.update(host_id="token=secret-value")
+                 for collection in ("sessions", "agents", "tasks", "managed_processes", "inferred_processes")
+                 for record in item[collection]],
+            ),
+            "sessions parent_session_id": lambda item: item["sessions"][0].update(
+                parent_session_id="token=secret-value"),
+            "sessions line-separated session_id": lambda item: item["sessions"][0].update(
+                session_id="safe\u2028spoofed"),
+            "sessions surrogate session_id": lambda item: item["sessions"][0].update(
+                session_id="safe\ud800spoofed"),
+            "agents parent_agent_id": lambda item: item["agents"][0].update(
+                parent_agent_id="token=secret-value"),
+            "tasks task_id": lambda item: item.update(tasks=[{
+                "host_id": "host-1", "source": "claude", "session_id": "same",
+                "task_id": "token=secret-value", "status": "created",
+                "created_at": 0, "last_event_at": 0,
+            }]),
+        }
+        for name, mutate in identity_cases.items():
+            unsafe = snapshot()
+            mutate(unsafe)
+            with self.subTest(name=name), self.assertRaisesRegex(ValueError, "unsafe"):
+                _validate_snapshot(json.dumps(unsafe).encode())
+
+        for usage in ({"input_tokens": 2**63},
+                      {"input_tokens": 2**62, "output_tokens": 2**62}):
+            malformed = snapshot()
+            malformed["agents"][0].update(usage=usage, usage_source="transcript",
+                                           usage_partial=False)
+            projected = _validate_snapshot(json.dumps(malformed).encode())
+            agent = projected["agents"][0]
+            self.assertTrue(projected["partial"])
+            self.assertTrue(agent["usage_partial"])
+            self.assertIsNone(agent["usage"])
+            self.assertEqual(agent["usage_source"], "unavailable")
+
+        malformed = snapshot()
+        malformed["agents"][0]["usage"] = ["not", "a", "mapping"]
+        with self.assertRaisesRegex(ValueError, "invalid agents usage"):
+            _validate_snapshot(json.dumps(malformed).encode())
+
+    def test_projection_preserves_producer_fields_and_reports_safe_transformations(self):
+        value = snapshot()
+        value["tasks"] = [{
+            "host_id": "host-1", "source": "claude", "session_id": "same",
+            "task_id": "task", "status": "created", "subject": "x" * 501,
+            "created_at": 0, "last_event_at": 0,
+        }]
+        value["agents"][0].update(
+            price_overrides_used=["MODEL_RATE"],
+            transcript_error="Cookie: session=swordfish",
+        )
+        projected = _validate_snapshot(json.dumps(value).encode())
+        self.assertEqual(len(projected["tasks"][0]["subject"]), 500)
+        self.assertEqual(projected["agents"][0]["price_overrides_used"], ["MODEL_RATE"])
+        self.assertNotIn("swordfish", projected["agents"][0]["transcript_error"])
+        self.assertTrue(projected["partial"])
+        self.assertIn("changed for output safety", projected["errors"]["tasks"])
+        self.assertIn("changed for output safety", projected["errors"]["agents"])
+
+    def test_wire_numeric_and_identity_domains_are_field_specific(self):
+        cases = {
+            "negative timestamp": lambda value: value["sessions"][0].update(started_at=-1),
+            "boolean duration": lambda value: value["agents"][0].update(duration_ms=True),
+            "zero pid": lambda value: value.update(managed_processes=[{
+                "host_id": "host-1", "managed_id": "managed", "pid": 0,
+            }]),
+            "negative pgid": lambda value: value.update(inferred_processes=[{
+                "host_id": "host-1", "pid": 1, "pgid": -1,
+            }]),
+            "negative count": lambda value: value["sessions"][0].update(inflight_tool_count=-1),
+        }
+        for name, mutate in cases.items():
+            value = snapshot()
+            mutate(value)
+            with self.subTest(name=name), self.assertRaisesRegex(ValueError, "invalid"):
+                _validate_snapshot(json.dumps(value).encode())
+
+        signed_exit = snapshot()
+        signed_exit["managed_processes"] = [{
+            "host_id": "host-1", "managed_id": "managed", "pid": 1, "exit_code": -9,
+        }]
+        self.assertEqual(
+            _validate_snapshot(json.dumps(signed_exit).encode())["managed_processes"][0]["exit_code"],
+            -9,
+        )
+
+        for identity in ("unsafe\nidentity", "unsafe\x85identity", "unsafe\u202eidentity", "[REDACTED]"):
+            value = snapshot()
+            value["sessions"][0]["session_id"] = identity
+            with self.subTest(identity=identity), self.assertRaisesRegex(ValueError, "unsafe"):
+                _validate_snapshot(json.dumps(value).encode())
+
+    def test_capacity_and_process_errors_remain_partial_and_unknown(self):
+        value = snapshot()
+        value["capacity"].update(future_metric=1, capacity_state="available")
+        value["errors"] = {
+            "capacity": "sampler failed",
+            "managed_processes": "manager unavailable",
+            "inferred_processes": "process scan unavailable",
+        }
+        projected = _validate_snapshot(json.dumps(value).encode())
+        self.assertTrue(projected["partial"])
+        self.assertTrue(projected["capacity"]["partial"])
+        self.assertEqual(projected["capacity"]["capacity_state"], "unknown")
+        self.assertIn("unsupported field", projected["errors"]["capacity"])
+        self.assertIn("managed_processes", projected["errors"])
+        self.assertIn("inferred_processes", projected["errors"])
+
+        result = query_fleet(
+            FleetConfig((FleetHost("local", "local"),)),
+            local_snapshot=lambda thresholds: value,
+        )
+        self.assertEqual(
+            result["hosts"][0]["snapshot"]["capacity"]["capacity_state"],
+            "unknown",
+        )
+
+    def test_unknown_error_sections_are_visible_and_oversized_lists_are_rejected(self):
+        value = snapshot()
+        value["errors"] = {"future-secret-section": "password=swordfish"}
+        projected = _validate_snapshot(json.dumps(value).encode())
+        self.assertTrue(projected["partial"])
+        self.assertEqual(projected["errors"]["other"],
+                         "1 unrecognized error section(s) omitted")
+        self.assertNotIn("swordfish", json.dumps(projected))
+
+        too_many_models = snapshot()
+        too_many_models["agents"][0]["models"] = [f"model-{index}" for index in range(65)]
+        with self.assertRaisesRegex(ValueError, "too many agents models"):
+            _validate_snapshot(json.dumps(too_many_models).encode())
+        too_many_reasons = snapshot()
+        too_many_reasons["capacity"]["capacity_reasons"] = ["reason"] * 33
+        with self.assertRaisesRegex(ValueError, "capacity_reasons"):
+            _validate_snapshot(json.dumps(too_many_reasons).encode())
+
+    def test_fleet_identity_encoding_is_unambiguous_for_delimiters_and_unicode(self):
+        first = snapshot("host:a")
+        first["sessions"][0].update(source="b", session_id="c:雪")
+        second = snapshot("host")
+        second["sessions"][0].update(source="a:b", session_id="c:雪")
+        first_id = _prefix_identities(first)["sessions"][0]["fleet_id"]
+        second_id = _prefix_identities(second)["sessions"][0]["fleet_id"]
+        self.assertNotEqual(first_id, second_id)
+        self.assertEqual(json.loads(first_id), ["host:a", "b", "c:雪"])
+
+    def test_local_composed_snapshot_round_trips_through_wire_projection(self):
+        value = snapshot()
+
+        class Host:
+            def view(self, at): return {**value["host"], "observed_at": at}
+        class Sessions:
+            def fleet_records(self, limit): return value["sessions"], 1
+            def tasks(self, limit): return []
+        class Native:
+            def fleet_records(self, limit): return value["agents"], 1
+        class Capacity:
+            def view(self, thresholds, **counts):
+                return {**value["capacity"], **counts, "partial": False,
+                        "capacity_state": "busy", "capacity_reasons": ["1 active Claude sessions"]}
+
+        local = compose(type("Controller", (), {"host": Host(), "sessions": Sessions(),
+                                                  "native": Native(), "capacity": Capacity()})())
+        projected = _validate_snapshot(json.dumps(local).encode())
+        self.assertEqual(projected["host"]["host_id"], "host-1")
+        self.assertEqual(projected["capacity"]["active_claude_sessions"], 1)
+
+    def test_duplicate_reported_host_identity_is_partial_without_fleet_ids(self):
+        config = FleetConfig((FleetHost("one", "local"), FleetHost("two", "ssh", target="two")))
+        with patch("router.fleet.ssh_snapshot", return_value=snapshot("duplicate")):
+            result = query_fleet(config, local_snapshot=lambda thresholds: snapshot("duplicate"))
+        self.assertTrue(result["partial"])
+        for record in result["hosts"]:
+            self.assertIn("host_identity", record["snapshot"]["errors"])
+            self.assertNotIn("fleet_id", record["snapshot"]["sessions"][0])
+            self.assertIn("duplicate_host_identity", {alert["kind"] for alert in record["alerts"]})
 
     def test_invalid_peer_snapshot_does_not_hide_healthy_peer(self):
         config = FleetConfig((FleetHost("invalid", "local"),
@@ -495,7 +1252,23 @@ class SnapshotAndFleetTests(unittest.TestCase):
         self.assertFalse(result["hosts"][0]["ok"])
         self.assertTrue(result["hosts"][1]["ok"])
         self.assertEqual(result["hosts"][1]["snapshot"]["capacity"]["capacity_state"],
-                         "available")
+                         "busy")
+
+    def test_oversized_logical_cpu_count_is_rejected_and_peer_isolated(self):
+        invalid = snapshot("invalid")
+        invalid["capacity"].update(logical_cpus=10**400, load_1m=1.0)
+        payload = json.dumps(invalid, separators=(",", ":")).encode()
+        with self.assertRaisesRegex(ValueError, "positive finite integer"):
+            _validate_snapshot(payload)
+
+        config = FleetConfig((FleetHost("invalid", "local"),
+                              FleetHost("healthy", "ssh", target="healthy")))
+        with patch("router.fleet.ssh_snapshot", return_value=snapshot("healthy")):
+            result = query_fleet(config, local_snapshot=lambda thresholds: invalid)
+        self.assertFalse(result["hosts"][0]["ok"])
+        self.assertTrue(result["hosts"][1]["ok"])
+        self.assertEqual(result["hosts"][1]["snapshot"]["capacity"]["capacity_state"],
+                         "busy")
 
     def test_malformed_remote_alert_isolated_from_healthy_peer(self):
         config = FleetConfig((FleetHost("local", "local"),
@@ -563,6 +1336,71 @@ class SnapshotAndFleetTests(unittest.TestCase):
         self.assertTrue(result["partial"])
         self.assertEqual(result["errors"]["capacity"], "sqlite read failed")
 
+    def test_collection_failure_cannot_be_reclassified_as_available(self):
+        class Host:
+            def view(self, at):
+                return {"host_id": "host", "observed_at": at}
+
+        class Sessions:
+            def fleet_records(self, limit):
+                return [], 0
+
+            def tasks(self, limit):
+                return []
+
+        class Native:
+            def fleet_records(self, limit):
+                raise OSError("native lifecycle unavailable")
+
+        with tempfile.TemporaryDirectory() as temp, \
+                patch("router.capacity._raw_cpu_ticks", side_effect=[(100, 50), (120, 55)]), \
+                patch("router.capacity._raw_memory", return_value=(16 * 1024**3, 8 * 1024**3, 0)), \
+                patch("router.capacity.shutil.disk_usage",
+                      return_value=type("Usage", (), {"free": 20 * 1024**3})()), \
+                patch("router.capacity.os.getloadavg", return_value=(1, 1, 1)), \
+                patch("router.capacity.os.cpu_count", return_value=8):
+            capacity = CapacitySampler(Path(temp))
+            capacity.sample()
+            result = compose(type("Controller", (), {
+                "host": Host(), "sessions": Sessions(), "native": Native(),
+                "capacity": capacity,
+            })())
+
+        self.assertTrue(result["partial"])
+        self.assertIn("native lifecycle unavailable", result["errors"]["agents"])
+        self.assertIsNone(result["capacity"]["active_agents"])
+        self.assertEqual(result["capacity"]["capacity_state"], "unknown")
+        self.assertIn("active_agents", result["capacity"]["capacity_reasons"][0])
+
+    def test_lifecycle_uncertainty_invalidates_local_capacity_before_transport(self):
+        value = snapshot()
+
+        class Host:
+            def view(self, at): return {**value["host"], "observed_at": at}
+        class Sessions:
+            def fleet_records(self, limit): return [], 0
+            def tasks(self, limit): return []
+        class Native:
+            def fleet_records(self, limit): return [], 0
+        class Capacity:
+            def view(self, thresholds, **counts):
+                return {**value["capacity"], **counts, "capacity_state": "available",
+                        "capacity_reasons": []}
+        class Controller:
+            host = Host()
+            sessions = Sessions()
+            native = Native()
+            capacity = Capacity()
+
+            @staticmethod
+            def lifecycle_health():
+                return "accepted writes pending"
+
+        result = compose(Controller())
+        self.assertTrue(result["partial"])
+        self.assertEqual(result["capacity"]["capacity_state"], "unknown")
+        self.assertIn("lifecycle", " ".join(result["capacity"]["capacity_reasons"]))
+
     def test_independent_active_counts_and_needs_input_alerts(self):
         class Host:
             def view(self, at): return {"host_id": "host", "router_version": "0.4.0", "observed_at": at}
@@ -588,6 +1426,47 @@ class SnapshotAndFleetTests(unittest.TestCase):
         self.assertEqual(result["capacity"]["active_agents"], 4)
         self.assertEqual(sum(alert["kind"] == "agent_needs_input" for alert in result["alerts"]), 2)
 
+    def test_alert_truncation_is_explicit_and_output_remains_bounded(self):
+        class Host:
+            def view(self, at): return {"host_id": "host", "observed_at": at}
+        class Sessions:
+            def fleet_records(self, limit):
+                records = [
+                    {"source": "claude", "session_id": f"S-{number}", "status": "idle",
+                     "needs_input": True, "last_event_at": number}
+                    for number in range(60)
+                ]
+                return records[:limit], len(records)
+            def tasks(self, limit): return []
+        class Native:
+            def fleet_records(self, limit):
+                records = [
+                    {"source": "claude", "parent_session_id": f"S-{number}",
+                     "agent_id": f"A-{number}", "status": "needs_input",
+                     "last_event_at": number}
+                    for number in range(60)
+                ]
+                return records[:limit], len(records)
+        class Capacity:
+            def view(self, thresholds, **counts):
+                return {"partial": False, "capacity_state": "available",
+                        "capacity_reasons": [], **counts}
+
+        result = compose(type("Controller", (), {
+            "host": Host(), "sessions": Sessions(), "native": Native(),
+            "capacity": Capacity(),
+        })())
+
+        self.assertEqual(len(result["alerts"]), 100)
+        self.assertEqual(len({alert["alert_id"] for alert in result["alerts"]}), 100)
+        self.assertTrue(result["partial"])
+        self.assertEqual(result["errors"]["alerts"],
+                         "Collection truncated to alert_limit=100")
+        self.assertLessEqual(
+            len(json.dumps(result, separators=(",", ":")).encode()),
+            MAX_SNAPSHOT_BYTES,
+        )
+
     def test_active_counts_ignore_display_limits_and_truncation_is_explicit(self):
         with tempfile.TemporaryDirectory() as temp:
             store = Store(Path(temp) / "router.sqlite3", "host")
@@ -609,18 +1488,29 @@ class SnapshotAndFleetTests(unittest.TestCase):
                 def view(self, at): return {"host_id": "host", "observed_at": at}
 
             class Capacity:
-                def view(self, thresholds, **counts): return counts
+                def view(self, thresholds, **counts):
+                    return {
+                        "logical_cpus": 8, "load_1m": 1, "load_5m": 1,
+                        "cpu_busy_pct": 20, "memory_total_bytes": 32 * 1024**3,
+                        "memory_available_bytes": 16 * 1024**3,
+                        "swap_used_bytes": 0, "disk_available_bytes": 20 * 1024**3,
+                        "observed_at": 1000, "sample_age_ms": 0, "partial": False,
+                        **counts,
+                    }
 
             controller = type("Controller", (), {
                 "host": Host(), "sessions": sessions, "native": native, "capacity": Capacity(),
             })()
-            result = compose(controller, history_limit=1)
+            with patch("router.fleet_snapshot.now_ms", return_value=1000):
+                result = compose(controller, history_limit=1)
 
         self.assertEqual(len(result["sessions"]), 1)
         self.assertEqual(len(result["agents"]), 1)
         self.assertEqual(len(result["tasks"]), 1)
         self.assertEqual(result["capacity"]["active_claude_sessions"], 2)
         self.assertEqual(result["capacity"]["active_agents"], 2)
+        self.assertEqual(result["capacity"]["capacity_state"], "busy")
+        self.assertFalse(result["capacity"]["partial"])
         self.assertTrue(result["partial"])
         self.assertIn("truncated", result["errors"]["sessions"])
         self.assertIn("truncated", result["errors"]["agents"])
@@ -712,7 +1602,7 @@ required = false
         self.assertTrue(result["hosts"][0]["ok"])
         self.assertFalse(result["hosts"][1]["ok"])
         session = result["hosts"][0]["snapshot"]["sessions"][0]
-        self.assertEqual(session["fleet_id"], "host-1:claude:same")
+        self.assertEqual(json.loads(session["fleet_id"]), ["host-1", "claude", "same"])
         self.assertEqual([alert["kind"] for alert in result["hosts"][1]["alerts"]], ["host_offline"])
         self.assertNotIn("alert", result["hosts"][1])
 
@@ -727,6 +1617,100 @@ required = false
                 path.write_text(contents)
                 with self.assertRaises(ValueError):
                     load_fleet_config(path)
+
+    def test_fleet_config_requires_strict_schema_and_bounded_intervals(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "fleet.toml"
+            host = '\n[[host]]\nname = "local"\ntransport = "local"\n'
+            for schema_version in ("true", "1.0", '"1"', "2"):
+                path.write_text(f"schema_version = {schema_version}{host}")
+                with self.subTest(schema_version=schema_version), self.assertRaisesRegex(
+                        ValueError, "schema_version"):
+                    load_fleet_config(path)
+            for field, value in (
+                ("ssh_timeout_seconds", 0.099), ("ssh_timeout_seconds", 60.001),
+                ("refresh_seconds", 0.099), ("refresh_seconds", 3600.001),
+            ):
+                path.write_text(f"schema_version = 1\n{field} = {value}{host}")
+                with self.subTest(field=field, value=value), self.assertRaisesRegex(
+                        ValueError, "between"):
+                    load_fleet_config(path)
+
+    def test_fleet_config_enforces_capacity_threshold_domains_and_strict_ordering(self):
+        thresholds = {
+            "minimum_available_memory_gib": 4,
+            "maximum_cpu_busy_for_available_pct": 99,
+            "maximum_load_per_logical_cpu_for_available": .75,
+            "minimum_disk_available_gib": 10,
+            "maximum_cpu_busy_for_saturated_pct": 100,
+            "maximum_load_per_logical_cpu_for_saturated": 1.25,
+            "minimum_available_memory_gib_for_saturated": 1,
+            "minimum_disk_available_gib_for_saturated": 2,
+        }
+
+        def config(values):
+            lines = ["schema_version = 1", "[capacity_defaults]"]
+            lines.extend(f"{key} = {value}" for key, value in values.items())
+            lines.extend(("[[host]]", 'name = "local"', 'transport = "local"'))
+            return "\n".join(lines) + "\n"
+
+        invalid = []
+        invalid.append({**thresholds, "maximum_cpu_busy_for_saturated_pct": 101})
+        for saturated, available in (
+            ("maximum_cpu_busy_for_saturated_pct", "maximum_cpu_busy_for_available_pct"),
+            ("maximum_load_per_logical_cpu_for_saturated", "maximum_load_per_logical_cpu_for_available"),
+            ("minimum_available_memory_gib_for_saturated", "minimum_available_memory_gib"),
+            ("minimum_disk_available_gib_for_saturated", "minimum_disk_available_gib"),
+        ):
+            invalid.append({**thresholds, saturated: thresholds[available]})
+        invalid.extend((
+            {**thresholds, "maximum_cpu_busy_for_saturated_pct": 98},
+            {**thresholds, "maximum_load_per_logical_cpu_for_saturated": .5},
+            {**thresholds, "minimum_available_memory_gib_for_saturated": 5},
+            {**thresholds, "minimum_disk_available_gib_for_saturated": 11},
+        ))
+
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "fleet.toml"
+            path.write_text(config(thresholds))
+            loaded = load_fleet_config(path)
+            self.assertEqual(loaded.hosts[0].thresholds.maximum_cpu_busy_for_saturated_pct, 100)
+            for values in invalid:
+                path.write_text(config(values))
+                with self.subTest(values=values), self.assertRaises(ValueError):
+                    load_fleet_config(path)
+
+    def test_fleet_config_and_aggregate_output_are_bounded(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "fleet.toml"
+            path.write_text(
+                'schema_version = 1\n[[host]]\nname = "local"\ntransport = "local"\n'
+                f'tags = ["{"x" * (64 * 1024)}"]\n'
+            )
+            with self.assertRaisesRegex(ValueError, "exceeds 64 KiB"):
+                load_fleet_config(path)
+
+            invalid_values = (
+                f'name = "{"n" * 121}"\ntransport = "local"\n',
+                f'name = "remote"\ntransport = "ssh"\ntarget = "{"t" * 513}"\n',
+                'name = "local"\ntransport = "local"\ntags = ['
+                + ",".join(f'"tag-{index}"' for index in range(33)) + "]\n",
+                f'name = "local"\ntransport = "local"\ntags = ["{"t" * 121}"]\n',
+            )
+            for host_config in invalid_values:
+                path.write_text("schema_version = 1\n[[host]]\n" + host_config)
+                with self.subTest(host_config=host_config[:40]), self.assertRaises(ValueError):
+                    load_fleet_config(path)
+
+        with patch("router.fleet.MAX_FLEET_OUTPUT_BYTES", 1_000):
+            result = query_fleet(
+                FleetConfig((FleetHost("local", "local"),)),
+                local_snapshot=lambda thresholds: snapshot(),
+            )
+        self.assertTrue(result["partial"])
+        self.assertFalse(result["hosts"][0]["ok"])
+        self.assertLessEqual(len(json.dumps(result, indent=2).encode()), 1_000)
+        self.assertIn("aggregate fleet output bound", result["hosts"][0]["error"])
 
     def test_malformed_host_isolated_capacity_override_and_capacity_projection(self):
         config = FleetConfig((
@@ -801,9 +1785,9 @@ required = false
         self.assertIn("host_snapshot_stale", {
             alert["kind"] for alert in result["hosts"][0]["alerts"]
         })
-        self.assertEqual(peer_capacity["sample_age_ms"], 1)
-        self.assertEqual(peer_capacity["capacity_state"], "available")
-        self.assertNotIn("host_snapshot_stale", {
+        self.assertEqual(peer_capacity["sample_age_ms"], 16_001)
+        self.assertEqual(peer_capacity["capacity_state"], "unknown")
+        self.assertIn("host_snapshot_stale", {
             alert["kind"] for alert in result["hosts"][1]["alerts"]
         })
 
@@ -855,6 +1839,7 @@ required = false
         self.assertIn("--", command)
         self.assertIn("-n", command)
         self.assertEqual(options[0]["stdin"], subprocess.DEVNULL)
+        self.assertTrue(options[0]["start_new_session"])
 
     def test_nullable_capacity_is_unknown_without_marking_host_offline(self):
         value = snapshot()
@@ -886,6 +1871,47 @@ required = false
         self.assertEqual(host["snapshot"]["capacity"]["capacity_reasons"],
                          ["reservation data unavailable"])
 
+    def test_reservation_expiry_is_recomputed_and_sensitive_labels_are_redacted(self):
+        now = int(time.time() * 1000)
+        for active, until in ((False, now + 60_000), (True, now - 1)):
+            value = snapshot()
+            value["generated_at"] = now
+            value["capacity"].update(
+                reserved_by="password=swordfish", reserved_until=until,
+                reserved_cpu_slots=1, reserved_memory_bytes=0,
+                reservation_source="token=secret-source", reservation_active=active,
+            )
+            result = query_fleet(FleetConfig((FleetHost("local", "local"),)),
+                                 local_snapshot=lambda thresholds, value=value: value)
+            capacity = result["hosts"][0]["snapshot"]["capacity"]
+            self.assertEqual(capacity["capacity_state"], "unknown")
+            self.assertTrue(result["partial"])
+            self.assertNotIn("swordfish", json.dumps(result))
+            self.assertNotIn("secret-source", json.dumps(result))
+
+    def test_reservation_can_legitimately_expire_after_source_snapshot(self):
+        value = snapshot()
+        value["generated_at"] = 1_000
+        value["host"]["observed_at"] = 1_000
+        value["sessions"] = []
+        value["agents"] = []
+        value["capacity"].update(
+            observed_at=1_000, sample_age_ms=0,
+            active_claude_sessions=0, active_agents=0,
+            reserved_by="coordinator", reserved_until=1_500,
+            reserved_cpu_slots=1, reserved_memory_bytes=0,
+            reservation_source="scheduler", reservation_active=True,
+        )
+        with patch("router.fleet.time.time", return_value=2.0):
+            result = query_fleet(
+                FleetConfig((FleetHost("local", "local"),)),
+                local_snapshot=lambda thresholds: value,
+            )
+        capacity = result["hosts"][0]["snapshot"]["capacity"]
+        self.assertFalse(capacity["reservation_active"])
+        self.assertEqual(capacity["capacity_state"], "available")
+        self.assertFalse(result["partial"])
+
     def test_incomplete_capacity_metadata_is_unknown_in_fleet_view(self):
         for field in ("sample_age_ms", "reservation_active"):
             with self.subTest(field=field):
@@ -907,13 +1933,94 @@ required = false
 
     def test_alert_history_preserves_first_seen_until_alert_clears(self):
         history = AlertHistory()
-        first = [{"alert_id": "same", "first_seen_at": 10}]
-        second = [{"alert_id": "same", "first_seen_at": 20}]
+        first = [{"alert_id": "same", "first_seen_at": 10, "last_seen_at": 10}]
+        second = [{"alert_id": "same", "first_seen_at": 20, "last_seen_at": 20}]
         self.assertEqual(history.track(first)[0]["first_seen_at"], 10)
         self.assertEqual(history.track(second)[0]["first_seen_at"], 10)
+        rollback = [{"alert_id": "same", "first_seen_at": 5, "last_seen_at": 5}]
+        self.assertEqual(history.track(rollback)[0]["first_seen_at"], 5)
         history.track([])
-        third = [{"alert_id": "same", "first_seen_at": 30}]
+        third = [{"alert_id": "same", "first_seen_at": 30, "last_seen_at": 30}]
         self.assertEqual(history.track(third)[0]["first_seen_at"], 30)
+
+    def test_zero_and_future_alert_times_are_normalized_and_round_trip(self):
+        base = snapshot()
+
+        class Host:
+            def view(self, at):
+                return {**base["host"], "observed_at": at}
+        class Sessions:
+            def fleet_records(self, limit):
+                return [
+                    {"host_id": "host-1", "source": "claude", "session_id": "zero",
+                     "status": "unknown", "started_at": 0, "last_event_at": 0},
+                    {"host_id": "host-1", "source": "claude", "session_id": "future",
+                     "status": "unknown", "started_at": 0, "last_event_at": 200},
+                ], 0
+            def tasks(self, limit): return []
+        class Native:
+            def fleet_records(self, limit): return [], 0
+        class Capacity:
+            def view(self, thresholds, **counts):
+                return {**base["capacity"], "observed_at": 100, "sample_age_ms": 0,
+                        "partial": False, **counts}
+
+        controller = type("Controller", (), {
+            "host": Host(), "sessions": Sessions(), "native": Native(),
+            "capacity": Capacity(),
+        })()
+        with patch("router.fleet_snapshot.now_ms", return_value=100):
+            result = compose(controller)
+        alerts_by_session = {alert["entity"]["session_id"]: alert for alert in result["alerts"]}
+        self.assertEqual(alerts_by_session["zero"]["first_seen_at"], 0)
+        self.assertEqual(alerts_by_session["zero"]["last_seen_at"], 100)
+        self.assertEqual(alerts_by_session["future"]["first_seen_at"], 100)
+        self.assertEqual(alerts_by_session["future"]["last_seen_at"], 100)
+        self.assertEqual(_validate_snapshot(json.dumps(result).encode())["alerts"], result["alerts"])
+
+        hostile = snapshot()
+        hostile["alerts"] = [{
+            "alert_id": "alert", "host_id": "host-1", "severity": "warning",
+            "kind": "future", "first_seen_at": 1, "last_seen_at": 2,
+            "entity": {}, "evidence": "future",
+        }]
+        with self.assertRaisesRegex(ValueError, "later than snapshot generation"):
+            _validate_snapshot(json.dumps(hostile).encode())
+
+    def test_snapshot_generated_at_is_finalized_after_capacity_observation(self):
+        base = snapshot()
+        class Host:
+            def view(self, at): return {**base["host"], "observed_at": at}
+        class Sessions:
+            def fleet_records(self, limit): return [], 0
+            def tasks(self, limit): return []
+        class Native:
+            def fleet_records(self, limit): return [], 0
+        class Capacity:
+            def view(self, thresholds, **counts):
+                return {**base["capacity"], "observed_at": 101, "sample_age_ms": 0,
+                        "partial": False, **counts}
+
+        with patch("router.fleet_snapshot.now_ms", return_value=102):
+            result = compose(type("Controller", (), {
+                "host": Host(), "sessions": Sessions(), "native": Native(),
+                "capacity": Capacity(),
+            })())
+        self.assertEqual(result["generated_at"], 102)
+        self.assertEqual(result["capacity"]["sample_age_ms"], 1)
+        self.assertEqual(result["capacity"]["capacity_state"], "available")
+        projected = _validate_snapshot(json.dumps(result).encode())
+        self.assertEqual(projected["capacity"]["capacity_state"], "available")
+
+    def test_capacity_projection_preserves_operator_visible_snapshot_errors(self):
+        value = snapshot()
+        value.update(partial=True, errors={"capacity": "password=swordfish"})
+        result = query_fleet(FleetConfig((FleetHost("local", "local"),)),
+                             local_snapshot=lambda thresholds: value)
+        projected = capacity_projection(result)
+        errors = projected["hosts"][0]["snapshot"]["errors"]
+        self.assertIn("capacity", errors)
+        self.assertNotIn("swordfish", json.dumps(errors))
 
     def test_watch_mode_keeps_refreshing_when_all_hosts_are_offline(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -973,17 +2080,103 @@ required = false
         self.assertNotIn("swordfish", error)
         self.assertIn("[REDACTED]", error)
 
+    def test_ssh_setup_failure_and_pipe_holding_descendant_are_group_cleaned(self):
+        host = FleetHost("remote", "ssh", target="remote")
+        actual_popen = subprocess.Popen
+        launched = []
+
+        def launch(command, **kwargs):
+            process = actual_popen([sys.executable, "-c", "import time;time.sleep(30)"], **kwargs)
+            launched.append(process)
+            return process
+
+        with patch("router.fleet.subprocess.Popen", side_effect=launch), \
+                patch("router.fleet.os.set_blocking", side_effect=OSError("setup failed")), \
+                self.assertRaisesRegex(ValueError, "setup failed"):
+            ssh_snapshot(host, .05)
+        self.assertIsNotNone(launched[0].poll())
+
+        with tempfile.TemporaryDirectory() as temp:
+            descendant_pid_file = Path(temp) / "descendant.pid"
+            descendant = (
+                "import os,time\n"
+                f"path={str(descendant_pid_file)!r}\n"
+                "pid=os.fork()\n"
+                "if pid:\n"
+                "    deadline=time.monotonic()+1\n"
+                "    while not os.path.exists(path) and time.monotonic()<deadline: time.sleep(.001)\n"
+                "    raise SystemExit(0)\n"
+                "with open(path,'w') as stream: stream.write(str(os.getpid()))\n"
+                "time.sleep(30)\n"
+            )
+            descendant_pid = None
+            started = time.monotonic()
+
+            def fork_launch(command, **kwargs):
+                return actual_popen([sys.executable, "-c", descendant], **kwargs)
+
+            try:
+                with patch("router.fleet.subprocess.Popen", side_effect=fork_launch), \
+                        self.assertRaisesRegex(ValueError, "timed out"):
+                    ssh_snapshot(host, .05)
+                self.assertLess(time.monotonic() - started, 1.2)
+                self.assertTrue(descendant_pid_file.exists(), "forked descendant never reported its PID")
+                descendant_pid = int(descendant_pid_file.read_text())
+                deadline = time.monotonic() + 2
+                while time.monotonic() < deadline:
+                    try:
+                        os.kill(descendant_pid, 0)
+                    except ProcessLookupError:
+                        break
+                    time.sleep(.01)
+                else:
+                    self.fail("ssh process-group cleanup left the pipe-holding descendant alive")
+            finally:
+                if descendant_pid is not None:
+                    try:
+                        os.kill(descendant_pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+
+    def test_ssh_unreapable_process_cleanup_remains_bounded(self):
+        host = FleetHost("remote", "ssh", target="remote")
+        read_stdout, write_stdout = os.pipe()
+        read_stderr, write_stderr = os.pipe()
+        os.close(write_stdout)
+        os.close(write_stderr)
+
+        class Unreapable:
+            pid = 999_999_999
+            returncode = None
+            stdout = os.fdopen(read_stdout, "rb", buffering=0)
+            stderr = os.fdopen(read_stderr, "rb", buffering=0)
+            def poll(self): return None
+            def wait(self, timeout=None): raise subprocess.TimeoutExpired("ssh", timeout)
+            def kill(self): pass
+
+        started = time.monotonic()
+        with patch("router.fleet.subprocess.Popen", return_value=Unreapable()), \
+                self.assertRaisesRegex(ValueError, "did not exit"):
+            ssh_snapshot(host, .05)
+        self.assertLess(time.monotonic() - started, 1.2)
+
     def test_snapshot_augmentation_stays_bounded_and_common_credentials_are_redacted(self):
         expanded = snapshot("h" * 128)
         expanded["agents"] = []
         expanded["sessions"] = [
-            {"source": "claude", "session_id": str(index), "status": "running", "activity": "x" * 850}
+            {"host_id": "h" * 128, "source": "claude", "session_id": str(index),
+             "status": "running", "started_at": 0, "last_event_at": 1,
+             "cwd": "x" * 650}
             for index in range(1000)
         ]
         self.assertLess(len(json.dumps(expanded, separators=(",", ":")).encode()), MAX_SNAPSHOT_BYTES)
         result = query_fleet(FleetConfig((FleetHost("local", "local"),)),
                              local_snapshot=lambda thresholds: expanded)
         self.assertFalse(result["hosts"][0]["ok"])
+        self.assertEqual(
+            result["hosts"][0]["error"],
+            "Host snapshot exceeds one MiB after fleet identity augmentation",
+        )
         for secret, leaked in (
                 ("Authorization: Basic dXNlcjpwYXNz", "dXNlcjpwYXNz"),
                 ('password: "orchid meadow"', "orchid meadow"),
@@ -993,15 +2186,36 @@ required = false
                 ('password: "orchid meadow', "meadow"),
                 ('password: "orchid\nmeadow"', "meadow"),
                 ('password: "orchid\nmeadow', "meadow"),
+                ("password is correct horse battery staple", "correct horse"),
+                ("API key is alpha beta gamma", "alpha beta"),
                 ("AWS_SECRET_ACCESS_KEY='abcd 1234", "1234"),
                 ("passphrase=hunter2", "hunter2"),
                 ("pwd=hunter2", "hunter2"),
+                ("SECRET_KEY=swordfish", "swordfish"),
+                ("PRIVATE_KEY_PEM=swordfish", "swordfish"),
+                ("MY_SERVICE_API_KEY=swordfish", "swordfish"),
+                ("MY-SERVICE-API-KEY=swordfish", "swordfish"),
+                ("status=failed api_key=swordfish next=ok", "swordfish"),
+                ("FOO=bar\nAPI_KEY=swordfish\nOTHER=ok", "swordfish"),
+                ('$env:API_KEY = "swordfish"', "swordfish"),
+                ('{"apiKey":"swordfish"}', "swordfish"),
+                ("accessToken = swordfish next=value", "swordfish"),
+                ("clientSecret: swordfish", "swordfish"),
+                ("secretAccessKey=swordfish", "swordfish"),
+                ("apikey=swordfish", "swordfish"),
+                ("--apiKey 'swordfish' --other value", "swordfish"),
+                ("Cookie: session=swordfish", "swordfish"),
+                ("Set-Cookie: session=swordfish; HttpOnly", "swordfish"),
+                ('{"secret_key": "swordfish"}', "swordfish"),
                 ("https://user:pass@example.com/path", "user:pass"),
                 ("AWS_SECRET_ACCESS_KEY=abcd1234secret", "abcd1234secret"),
                 ("ANTHROPIC_API_KEY=sk-ant-abcdefghijklmnop", "sk-ant-abcdefghijklmnop"),
                 ("credential ghp_abcdefghijklmnop", "ghp_abcdefghijklmnop"),
                 ("credential github_pat_abcdefghijklmnop", "github_pat_abcdefghijklmnop"),
                 ("credential sk-abcdefghijklmnop", "sk-abcdefghijklmnop"),
+                ("credential AKIAABCDEFGHIJKLMNOP", "AKIAABCDEFGHIJKLMNOP"),
+                ("credential glpat-abcdefghijklmnop", "glpat-abcdefghijklmnop"),
+                ("credential xoxb-1234567890-abcdefghijkl", "xoxb-1234567890-abcdefghijkl"),
                 ("-----BEGIN OPENSSH PRIVATE KEY-----\nprivate-body\n-----END OPENSSH PRIVATE KEY-----",
                  "private-body"),
         ):
@@ -1009,14 +2223,85 @@ required = false
             self.assertNotIn(leaked, redacted)
             self.assertIn("[REDACTED", redacted)
 
+    def test_local_snapshot_final_boundary_redacts_all_error_and_display_canaries(self):
+        secret = "MY_SERVICE_API_KEY=swordfish"
+
+        class Host:
+            def view(self, at):
+                return {"host_id": "host", "hostname": secret, "observed_at": at}
+        class Sessions:
+            def fleet_records(self, limit):
+                return [{"host_id": "host", "source": "claude", "session_id": "safe",
+                         "status": "running", "activity": secret}], 1
+            def tasks(self, limit):
+                raise OSError(f"Cookie: session=swordfish {secret}")
+        class Native:
+            def fleet_records(self, limit):
+                return [], 0
+        class Capacity:
+            def view(self, thresholds, **counts):
+                return {"partial": True, "error": f"Set-Cookie: token=swordfish {secret}",
+                        "capacity_state": "unknown", "capacity_reasons": [secret], **counts}
+
+        result = compose(type("Controller", (), {
+            "host": Host(), "sessions": Sessions(), "native": Native(), "capacity": Capacity(),
+        })())
+        serialized = json.dumps(result)
+        self.assertNotIn("swordfish", serialized)
+        self.assertTrue(result["partial"])
+        self.assertIn("[REDACTED", serialized)
+
+    def test_cli_credentials_and_unicode_controls_are_sanitized_through_fleet_output(self):
+        value = snapshot()
+        value["sessions"][0]["activity"] = "safe\u202eevil\u2066\u2028fake-row\u2029tail\ud800\udcff"
+        value.update(
+            partial=True,
+            errors={
+                "sessions": (
+                    "remote failed: --password swordfish "
+                    "--api-key \"orchid bloom\" --token='abcdef ghi'; "
+                    "--pass\u200bword correct horse battery; "
+                    "API\u2060_KEY=hidden-value; Bearer\u200b bearer-value"
+                ),
+            },
+        )
+        result = query_fleet(
+            FleetConfig((FleetHost("local", "local"),)),
+            local_snapshot=lambda thresholds: value,
+        )
+        serialized = json.dumps(result, ensure_ascii=False)
+        rendered = fleet_table(result)
+        for leaked in (
+            "swordfish", "orchid bloom", "abcdef ghi", "correct horse battery",
+            "hidden-value", "bearer-value", "\u202e", "\u2066", "\u2028", "\u2029",
+            "\ud800", "\udcff",
+        ):
+            self.assertNotIn(leaked, serialized)
+            self.assertNotIn(leaked, rendered)
+        serialized.encode("utf-8")
+        rendered.encode("utf-8")
+        self.assertIn("[REDACTED]", serialized)
+        host = result["hosts"][0]["snapshot"]
+        self.assertTrue(host["partial"])
+        self.assertIn("changed for output safety", host["errors"]["sessions"])
+        self.assertEqual(host["capacity"]["capacity_state"], "busy")
+
     def test_tables_strip_terminal_controls_and_agent_only_host_keeps_metrics(self):
         value = snapshot("host\x1b[31m")
         value["sessions"] = []
-        value["agents"][0]["activity"] = "build\n\x1b[2J"
-        result = {"hosts": [{"name": "bad\x1bname", "ok": True, "snapshot": value}]}
+        value["agents"][0]["activity"] = "build\n\x1b[2J\u202eevil\u2028fake-row\ud800"
+        result = {"hosts": [{"name": "bad\x1b\u2066name\u2029fake-host\udcff",
+                              "ok": True, "snapshot": value}]}
         rendered = fleet_table(result)
         self.assertNotIn("\x1b", rendered)
+        self.assertNotIn("\u202e", rendered)
+        self.assertNotIn("\u2066", rendered)
+        self.assertNotIn("\u2028", rendered)
+        self.assertNotIn("\u2029", rendered)
+        self.assertNotIn("\ud800", rendered)
+        self.assertNotIn("\udcff", rendered)
         self.assertNotIn("\n\x1b", rendered)
+        rendered.encode("utf-8")
         agent_row = rendered.splitlines()[1]
         self.assertIn("badname", agent_row)
         self.assertIn("20%", agent_row)
@@ -1048,6 +2333,27 @@ required = false
             self.assertNotIn("\x1b", output)
             self.assertIn("... 2 more section errors omitted", output)
             self.assertNotIn("section-5 error", output)
+
+    def test_table_renders_bounded_wrapper_and_snapshot_alerts(self):
+        value = snapshot()
+        value["sessions"] = []
+        value["agents"] = []
+        value["alerts"] = [{
+            "kind": f"snapshot-{number}", "severity": "warning",
+            "evidence": "uncertain\n\x1b[2J" + "x" * 300,
+        } for number in range(8)]
+        result = {"hosts": [{
+            "name": "local", "ok": True, "snapshot": value,
+            "alerts": [{"kind": "router_version_mismatch", "severity": "warning",
+                        "evidence": "versions differ"}],
+        }]}
+
+        rendered = fleet_table(result)
+        self.assertIn("alert [warning] router_version_mismatch: versions differ", rendered)
+        self.assertIn("snapshot-6", rendered)
+        self.assertNotIn("snapshot-7", rendered)
+        self.assertIn("... 1 more alerts omitted", rendered)
+        self.assertNotIn("\x1b", rendered)
 
     def test_two_isolated_daemons_with_colliding_session_ids_merge_as_distinct_hosts(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -1085,7 +2391,9 @@ required = false
                     result = query_fleet(config, local_snapshot=lambda thresholds: request("snapshot", {}, endpoints[0]))
                 identities = [host["snapshot"]["sessions"][0]["fleet_id"] for host in result["hosts"]]
                 self.assertEqual(len(set(identities)), 2)
-                self.assertFalse(result["partial"])
+                self.assertTrue(result["partial"])
+                self.assertTrue(all(host["snapshot"]["capacity"]["capacity_state"] == "unknown"
+                                    for host in result["hosts"]))
             finally:
                 for process, endpoint in zip(processes, endpoints, strict=False):
                     if process.poll() is None:

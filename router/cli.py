@@ -12,9 +12,12 @@ from pydantic import ValidationError
 from router.client import request
 from router.config import load_settings, socket_path, state_dir
 from router.dispatch import MUTATIONS
+from router.redaction import sanitize_output_text
 
 MAX_DISPLAYED_SNAPSHOT_ERRORS = 5
 MAX_DISPLAYED_SNAPSHOT_ERROR_LENGTH = 160
+MAX_DISPLAYED_FLEET_ALERTS = 8
+MAX_DISPLAYED_FLEET_ALERT_LENGTH = 160
 
 
 def table(rows: list[dict]) -> str:
@@ -68,8 +71,7 @@ def _size(value: int | None) -> str:
 
 
 def _cell(value: object, limit: int | None = None) -> str:
-    cleaned = "".join(character for character in str(value)
-                      if not (ord(character) < 32 or 127 <= ord(character) <= 159))
+    cleaned = sanitize_output_text(str(value))
     return cleaned[:limit] if limit is not None else cleaned
 
 
@@ -92,6 +94,26 @@ def _partial_snapshot_lines(snapshot: dict) -> list[str]:
     return lines
 
 
+def _fleet_alert_lines(record: dict, snapshot: dict | None = None) -> list[str]:
+    wrapper_alerts = record.get("alerts", [])
+    snapshot_alerts = snapshot.get("alerts", []) if isinstance(snapshot, dict) else []
+    values = [
+        alert for alert in [*wrapper_alerts, *snapshot_alerts]
+        if isinstance(alert, dict)
+    ]
+    lines = []
+    for alert in values[:MAX_DISPLAYED_FLEET_ALERTS]:
+        severity = _cell(alert.get("severity", "warning"), 16)
+        kind = _cell(alert.get("kind", "unknown"), 40)
+        evidence = _cell(alert.get("evidence", "No evidence supplied"),
+                         MAX_DISPLAYED_FLEET_ALERT_LENGTH)
+        lines.append(f"  alert [{severity}] {kind}: {evidence}")
+    omitted = len(values) - len(lines)
+    if omitted:
+        lines.append(f"  ... {omitted} more alerts omitted")
+    return lines
+
+
 def fleet_table(result: dict, capacity_only: bool = False) -> str:
     lines = ["HOST       CAPACITY   SESSION              AGENT                STATE        ACTIVITY                 CPU    LOAD   MEM FREE DISK FREE"]
     for record in result["hosts"]:
@@ -99,6 +121,7 @@ def fleet_table(result: dict, capacity_only: bool = False) -> str:
         if not record["ok"]:
             error = _cell("error: " + record["error"], 24)
             lines.append(f"{name:<10} {'offline':<10} {'—':<20} {'—':<20} {'—':<12} {error:<24} {'—':<6} {'—':<6} {'—':<8} {'—'}")
+            lines.extend(_fleet_alert_lines(record))
             continue
         snapshot = record["snapshot"]
         capacity = snapshot.get("capacity", {})
@@ -112,6 +135,7 @@ def fleet_table(result: dict, capacity_only: bool = False) -> str:
             reason = _cell("; ".join(capacity.get("capacity_reasons", [])) or "capacity thresholds satisfied", 24)
             lines.append(f"{name:<10} {state:<10} {'—':<20} {'—':<20} {'—':<12} {reason:<24} {cpu:<6} {load:<6} {memory:<8} {disk}")
             lines.extend(partial_lines)
+            lines.extend(_fleet_alert_lines(record, snapshot))
             continue
         sessions = snapshot.get("sessions", [])
         agents = snapshot.get("agents", [])
@@ -119,6 +143,7 @@ def fleet_table(result: dict, capacity_only: bool = False) -> str:
             activity = "partial snapshot" if partial_lines else "no active sessions"
             lines.append(f"{name:<10} {state:<10} {'—':<20} {'—':<20} {'—':<12} {activity:<24} {cpu:<6} {load:<6} {memory:<8} {disk}")
             lines.extend(partial_lines)
+            lines.extend(_fleet_alert_lines(record, snapshot))
             continue
         for index, session in enumerate(sessions):
             display_state = _cell("needs_input" if session.get("needs_input") else session.get("status", "unknown"), 12)
@@ -137,6 +162,7 @@ def fleet_table(result: dict, capacity_only: bool = False) -> str:
                          f"{cpu if first else '—':<6} {load if first else '—':<6} "
                          f"{memory if first else '—':<8} {disk if first else '—'}")
         lines.extend(partial_lines)
+        lines.extend(_fleet_alert_lines(record, snapshot))
     return "\n".join(lines)
 
 

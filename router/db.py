@@ -52,6 +52,13 @@ class Store:
                     host_id TEXT NOT NULL, source TEXT NOT NULL, session_id TEXT NOT NULL,
                     task_id TEXT NOT NULL, data TEXT NOT NULL,
                     PRIMARY KEY(host_id, source, session_id, task_id))""",
+                """CREATE TABLE IF NOT EXISTS native_session_watermarks (
+                    host_id TEXT NOT NULL, source TEXT NOT NULL, session_id TEXT NOT NULL,
+                    ended_at INTEGER NOT NULL,
+                    PRIMARY KEY(host_id, source, session_id))""",
+                """CREATE INDEX IF NOT EXISTS sessions_active_tool_deadline
+                    ON sessions(host_id, json_extract(data,'$.tool_active_until'))
+                    WHERE json_extract(data,'$.status')='running'""",
         )
         with self.transaction() as db:
             for statement in statements:
@@ -100,6 +107,16 @@ class Store:
                 db.rollback()
                 raise
 
+    @contextmanager
+    def snapshot(self) -> Iterator[sqlite3.Connection]:
+        """Hold one read snapshot across related queries."""
+        with self.connect() as db:
+            db.execute("BEGIN")
+            try:
+                yield db
+            finally:
+                db.rollback()
+
     def get(self, task_id: str, db: sqlite3.Connection | None = None) -> dict:
         if db is None:
             with self.connect() as connection:
@@ -114,27 +131,43 @@ class Store:
         db.execute("INSERT INTO tasks VALUES(?,?,?) ON CONFLICT(task_id) DO UPDATE SET data=excluded.data",
                    (task["task_id"], task["session_id"], canonical(task)))
 
-    def update(self, task_id: str, change: Callable[[dict], None]) -> dict:
-        with self.transaction() as db:
-            task = self.get(task_id, db)
-            change(task)
-            self.put(db, task)
-            return task
+    def update(self, task_id: str, change: Callable[[dict], None],
+               db: sqlite3.Connection | None = None) -> dict:
+        if db is None:
+            with self.transaction() as connection:
+                return self.update(task_id, change, connection)
+        task = self.get(task_id, db)
+        change(task)
+        self.put(db, task)
+        return task
 
-    def all(self) -> list[dict]:
-        with self.connect() as db:
-            return [json.loads(row[0]) for row in db.execute("SELECT data FROM tasks ORDER BY rowid")]
+    def all(self, db: sqlite3.Connection | None = None) -> list[dict]:
+        if db is None:
+            with self.connect() as connection:
+                return self.all(connection)
+        return [json.loads(row[0]) for row in db.execute("SELECT data FROM tasks ORDER BY rowid")]
 
-    def save_attempt(self, task: dict) -> None:
+    def save_attempt(self, task: dict, db: sqlite3.Connection | None = None) -> None:
         if "attempt_number" not in task:
             return
         evidence = {key: value for key, value in task.items() if key not in {
             "invocation", "review_history", "attempt_history", "session_id", "feedback", "setup_command", "permission_profile"}}
-        with self.transaction() as db:
-            db.execute("INSERT INTO attempts VALUES(?,?,?) ON CONFLICT(task_id,number) DO UPDATE SET data=excluded.data",
-                       (task["task_id"], task["attempt_number"], canonical(evidence)))
+        if db is None:
+            with self.transaction() as connection:
+                self.save_attempt(task, connection)
+            return
+        db.execute("INSERT INTO attempts VALUES(?,?,?) ON CONFLICT(task_id,number) DO UPDATE SET data=excluded.data",
+                   (task["task_id"], task["attempt_number"], canonical(evidence)))
 
-    def history(self, task_id: str) -> list[dict]:
-        with self.connect() as db:
-            return [json.loads(row[0]) for row in db.execute(
-                "SELECT data FROM attempts WHERE task_id=? ORDER BY number", (task_id,))]
+    def update_with_attempt(self, task_id: str, change: Callable[[dict], None]) -> dict:
+        with self.transaction() as db:
+            task = self.update(task_id, change, db)
+            self.save_attempt(task, db)
+            return task
+
+    def history(self, task_id: str, db: sqlite3.Connection | None = None) -> list[dict]:
+        if db is None:
+            with self.connect() as connection:
+                return self.history(task_id, connection)
+        return [json.loads(row[0]) for row in db.execute(
+            "SELECT data FROM attempts WHERE task_id=? ORDER BY number", (task_id,))]

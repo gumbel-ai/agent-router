@@ -11,6 +11,9 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
+from router.redaction import redact_secrets
+from router.validation import is_wire_integer
+
 GIB = 1024**3
 MAX_RESERVATION_BYTES = 16 * 1024
 RESERVATION_FIELDS = (
@@ -134,6 +137,12 @@ def classify(sample: dict, thresholds: CapacityThresholds, stale_after_ms: float
     missing = [key for key in required if sample.get(key) is None]
     if missing:
         return "unknown", ["capacity data unavailable: " + ", ".join(missing)]
+    activity_fields = ("active_claude_sessions", "active_agents", "active_managed_processes")
+    if any(field in sample for field in activity_fields):
+        invalid_activity = [field for field in activity_fields
+                            if not is_wire_integer(sample.get(field))]
+        if invalid_activity:
+            return "unknown", ["active workload totals unavailable: " + ", ".join(invalid_activity)]
     reservation_values = [sample.get(field) for field in RESERVATION_FIELDS]
     reservation_active = sample.get("reservation_active")
     if any(value is not None for value in reservation_values):
@@ -158,8 +167,15 @@ def classify(sample: dict, thresholds: CapacityThresholds, stale_after_ms: float
         available_reasons.append(f"available disk {disk_gib:.1f} GiB is below {thresholds.minimum_disk_available_gib:.1f} GiB")
     if sample.get("reservation_active"):
         available_reasons.append(
-            f"reserved by {sample['reserved_by']} until {sample['reserved_until']}"
+            f"reserved by {redact_secrets(sample['reserved_by'], 240)} until {sample['reserved_until']}"
         )
+    active_reasons = []
+    for field, label in (("active_claude_sessions", "Claude sessions"),
+                         ("active_agents", "native agents"),
+                         ("active_managed_processes", "managed processes")):
+        if sample.get(field, 0) > 0:
+            active_reasons.append(f"{sample[field]} active {label}")
+    available_reasons.extend(active_reasons)
     reserved_slots = sample.get("reserved_cpu_slots", 0) if sample.get("reservation_active") else 0
     saturated = (
         sample["cpu_busy_pct"] > thresholds.maximum_cpu_busy_for_saturated_pct
@@ -196,7 +212,10 @@ class ReservationReader:
         except (ValueError, UnicodeError) as error:
             raise ValueError("reservation.json is not valid JSON") from error
         allowed = {"schema_version", *RESERVATION_FIELDS}
-        if not isinstance(record, dict) or set(record) != allowed or record.get("schema_version") != 1:
+        schema_version = record.get("schema_version") if isinstance(record, dict) else None
+        if (not isinstance(record, dict) or set(record) != allowed
+                or not isinstance(schema_version, int) or isinstance(schema_version, bool)
+                or schema_version != 1):
             raise ValueError("reservation.json must use schema_version 1 and the documented fields")
         for field in ("reserved_by", "reservation_source"):
             value = record.get(field)
@@ -205,8 +224,10 @@ class ReservationReader:
             record[field] = value.strip()
         for field in ("reserved_until", "reserved_cpu_slots", "reserved_memory_bytes"):
             value = record.get(field)
-            if not isinstance(value, int) or isinstance(value, bool) or value < 0:
-                raise ValueError(f"reservation.json {field} must be a nonnegative integer")
+            if not is_wire_integer(value):
+                raise ValueError(
+                    f"reservation.json {field} must be a nonnegative 64-bit integer"
+                )
         return {field: record[field] for field in RESERVATION_FIELDS} | {
             "reservation_active": record["reserved_until"] > at,
         }
@@ -221,12 +242,15 @@ class CapacitySampler:
         self._lock = threading.Lock()
         self._previous_cpu: tuple[int, int] | None = None
         self._latest: dict = {}
+        self._latest_monotonic: float | None = None
+        self._latest_observed_at: int | None = None
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self.sample()
 
     def sample(self) -> dict:
         observed_at = int(time.time() * 1000)
+        observed_monotonic = time.monotonic()
         try:
             total_ticks, idle_ticks = _raw_cpu_ticks()
             previous = self._previous_cpu
@@ -248,19 +272,58 @@ class CapacitySampler:
             result = {"observed_at": observed_at, "partial": True, "error": str(error)}
         with self._lock:
             self._latest = result
+            self._latest_monotonic = observed_monotonic
+            self._latest_observed_at = observed_at
         return result
 
-    def view(self, thresholds: CapacityThresholds, **counts: int) -> dict:
+    def view(self, thresholds: CapacityThresholds, as_of_ms: int | None = None, **counts: int) -> dict:
         with self._lock:
             sample = dict(self._latest)
+            sampled_monotonic = self._latest_monotonic
+            sampled_observed_at = self._latest_observed_at
         at = int(time.time() * 1000)
-        sample["sample_age_ms"] = max(0, at - sample.get("observed_at", 0))
-        sample.update(counts)
+        reservation_at = at if as_of_ms is None else as_of_ms
+        observed_at = sample.get("observed_at")
+        if is_wire_integer(observed_at) and observed_at > at:
+            sample.update(
+                partial=True,
+                capacity_reasons=["capacity wall clock moved backwards; sample freshness unavailable"],
+            )
+            sample["sample_age_ms"] = 0
+        elif sampled_monotonic is not None and observed_at == sampled_observed_at:
+            elapsed = time.monotonic() - sampled_monotonic
+            if elapsed < 0:
+                sample.update(
+                    partial=True,
+                    capacity_reasons=["capacity monotonic clock moved backwards; sample freshness unavailable"],
+                )
+                sample["sample_age_ms"] = 0
+            else:
+                sample["sample_age_ms"] = math.ceil(elapsed * 1000)
+        elif is_wire_integer(observed_at) and at >= observed_at:
+            # Compatibility for injected/legacy samples that predate monotonic
+            # freshness metadata. Never mask a wall-clock rollback as age zero.
+            sample["sample_age_ms"] = at - observed_at
+        else:
+            sample.update(
+                partial=True,
+                capacity_reasons=["capacity wall clock moved backwards; sample freshness unavailable"],
+            )
+            sample["sample_age_ms"] = 0
+        sample.update({"active_claude_sessions": 0, "active_agents": 0,
+                       "active_managed_processes": 0}, **counts)
+        if sample.get("error") is not None:
+            sample["error"] = redact_secrets(str(sample["error"]), 500)
         try:
-            sample.update(self.reservations.read(at))
+            reservation = self.reservations.read(reservation_at)
+            for field in ("reserved_by", "reservation_source"):
+                if reservation.get(field) is not None:
+                    reservation[field] = redact_secrets(reservation[field], 240)
+            sample.update(reservation)
         except (OSError, ValueError) as error:
             sample.update({field: None for field in RESERVATION_FIELDS})
-            sample.update(reservation_active=False, partial=True, error=str(error),
+            sample.update(reservation_active=False, partial=True,
+                          error=redact_secrets(str(error), 500),
                           capacity_state="unknown",
                           capacity_reasons=["reservation data unavailable"])
             return sample

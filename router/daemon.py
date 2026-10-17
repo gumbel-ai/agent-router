@@ -40,6 +40,25 @@ ACTIVE = {"created", "validating", "preparing", "running", "retrying", "cancelli
 DECISIONS = {"awaiting_review", "blocked", "failed", "interrupted"}
 LOGGER = logging.getLogger(__name__)
 LIFECYCLE_STOP_TIMEOUT_SECONDS = 2.5
+LIFECYCLE_ACK_TIMEOUT_SECONDS = .04
+
+
+def _lifecycle_result(queued: bool, persistence: dict[str, str],
+                      reason: str | None = None) -> dict:
+    """Build the additive lifecycle acknowledgement contract."""
+    states = dict(persistence)
+    persisted = bool(states) and all(state == "persisted" for state in states.values())
+    partial = any(state == "persisted" for state in states.values()) and not persisted
+    result = {
+        "accepted": persisted,
+        "queued": queued,
+        "persisted": persisted,
+        "partial": partial,
+        "persistence": states,
+    }
+    if reason is not None:
+        result["reason"] = reason
+    return result
 
 
 def blocks_maintenance(task: dict) -> bool:
@@ -54,14 +73,14 @@ def required_text(payload: dict, key: str) -> str:
     return value
 
 
-def public(task: dict, store: Store | None = None) -> dict:
+def public(task: dict, store: Store | None = None, history: list[dict] | None = None) -> dict:
     result = {key: value for key, value in task.items() if key not in {
         "session_id", "invocation", "feedback", "permission_profile", "setup_command", "cleanup_requested", "token_prices",
         "codex_usage_baseline", "codex_usage_total", "codex_baseline_complete"}}
-    history = store.history(task["task_id"]) if store is not None else []
-    result.update(visibility(task, history))
-    if store is not None:
-        result["attempt_history"] = history
+    attempt_history = store.history(task["task_id"]) if history is None and store is not None else history or []
+    result.update(visibility(task, attempt_history))
+    if store is not None or history is not None:
+        result["attempt_history"] = attempt_history
     return result
 
 
@@ -125,9 +144,13 @@ class Controller:
         self.lifecycle_queue: queue.Queue[tuple[dict, threading.Event, dict] | None] = queue.Queue(maxsize=1024)
         self.lifecycle_thread: threading.Thread | None = None
         self.lifecycle_stopping = False
+        self.lifecycle_stop_deadline: float | None = None
         self.lifecycle_failures = 0
         self.lifecycle_dropped = 0
+        self.lifecycle_pending = 0
+        self.lifecycle_direct_active = 0
         self.lifecycle_health_lock = threading.Lock()
+        self._lifecycle_generation = 0
         self.changed = threading.Event()
         self.lifecycle_lock = threading.Lock()
         self.draining = False
@@ -137,6 +160,7 @@ class Controller:
             if self.lifecycle_thread is not None:
                 return
             self.lifecycle_stopping = False
+            self.lifecycle_stop_deadline = None
             self.lifecycle_thread = threading.Thread(
                 target=self._write_lifecycle, name="router-lifecycle", daemon=True,
             )
@@ -150,60 +174,93 @@ class Controller:
                 if work is None:
                     return
                 payload, completed, outcome = work
-                requested = 0
-                persisted = 0
                 for key, observer in (("session", self.sessions), ("native", self.native)):
                     event = payload.get(key)
                     if event is None:
                         continue
-                    requested += 1
                     try:
-                        observer.observe(event, timeout=0 if self.lifecycle_stopping else 1)
+                        observer.observe(event, timeout=self._lifecycle_write_timeout())
                     except (sqlite3.Error, ValueError, KeyError, TypeError, OSError, OverflowError) as error:
+                        outcome["persistence"][key] = "failed"
                         LOGGER.warning("Lifecycle %s observation could not be persisted: %s", key, error)
                         with self.lifecycle_health_lock:
                             self.lifecycle_failures += 1
                     # Protect the long-lived writer from unexpected observer bugs.
                     except Exception:
+                        outcome["persistence"][key] = "failed"
                         LOGGER.exception("Unexpected lifecycle %s observation failure", key)
                         with self.lifecycle_health_lock:
                             self.lifecycle_failures += 1
                     else:
-                        persisted += 1
-                outcome["persisted"] = requested > 0 and persisted == requested
+                        outcome["persistence"][key] = "persisted"
             # One malformed work item must not kill the writer.
             except Exception:
                 LOGGER.exception("Unexpected lifecycle work item failure")
                 with self.lifecycle_health_lock:
                     self.lifecycle_failures += 1
             finally:
+                if work is not None:
+                    for key, state in outcome["persistence"].items():
+                        if state == "pending":
+                            outcome["persistence"][key] = "failed"
+                    failed = [key for key, state in outcome["persistence"].items() if state == "failed"]
+                    reason = None
+                    if failed:
+                        prefix = ("Lifecycle observation partially persisted; failed components: "
+                                  if any(state == "persisted" for state in outcome["persistence"].values())
+                                  else "Lifecycle observation could not be persisted; failed components: ")
+                        reason = prefix + ", ".join(failed)
+                    terminal = _lifecycle_result(False, outcome["persistence"], reason)
+                    outcome.clear()
+                    outcome.update(terminal)
+                    with self.lifecycle_health_lock:
+                        self._lifecycle_generation += 1
+                        self.lifecycle_pending -= 1
                 if completed is not None:
                     completed.set()
                 self.lifecycle_queue.task_done()
+            if self.lifecycle_stopping and self.lifecycle_queue.empty():
+                return
+
+    def _lifecycle_write_timeout(self) -> float:
+        if not self.lifecycle_stopping:
+            return 1
+        with self.lifecycle_health_lock:
+            pending = max(1, self.lifecycle_pending)
+        deadline = self.lifecycle_stop_deadline
+        remaining = max(0.0, deadline - time.monotonic()) if deadline is not None else 0.0
+        # Share the remaining shutdown window across the queued work. Each
+        # item may contain two writes, so no single contended write consumes
+        # the entire hard stop budget. SQLite still gets a nonzero opportunity.
+        return max(.001, min(1.0, remaining / (pending * 2)))
 
     def stop_lifecycle_writer(self) -> None:
         with self.lifecycle_lock:
             thread = self.lifecycle_thread
             if thread is None:
                 return
+            signal_writer = not self.lifecycle_stopping
             self.lifecycle_stopping = True
-        # Admission is closed under lifecycle_lock, so the sentinel is ordered
-        # after every accepted observation. Graceful shutdown must not discard
-        # work that callers were already told was accepted.
-        deadline = time.monotonic() + LIFECYCLE_STOP_TIMEOUT_SECONDS
-        try:
-            self.lifecycle_queue.put(None, timeout=LIFECYCLE_STOP_TIMEOUT_SECONDS)
-        except queue.Full:
-            LOGGER.error(
-                "Lifecycle writer could not begin shutdown; %d accepted observations remain queued",
-                self.lifecycle_queue.qsize(),
-            )
-            return
+            if signal_writer:
+                self.lifecycle_stop_deadline = time.monotonic() + LIFECYCLE_STOP_TIMEOUT_SECONDS
+        # Admission is closed under lifecycle_lock. The writer also exits after
+        # draining an empty queue, so a full queue never requires a blocking put.
+        deadline = self.lifecycle_stop_deadline or time.monotonic()
+        if signal_writer:
+            try:
+                self.lifecycle_queue.put_nowait(None)
+            except queue.Full:
+                LOGGER.warning(
+                    "Lifecycle writer is still draining; %d observations remain queued",
+                    self.lifecycle_queue.qsize(),
+                )
         thread.join(timeout=max(0, deadline - time.monotonic()))
         if thread.is_alive():
-            LOGGER.error(
-                "Lifecycle writer did not stop within %.1f seconds; accepted observations remain pending",
-                LIFECYCLE_STOP_TIMEOUT_SECONDS,
+            with self.lifecycle_health_lock:
+                pending = self.lifecycle_pending
+            LOGGER.warning(
+                "Lifecycle writer did not stop within %.1f seconds; %d queued observations remain pending",
+                LIFECYCLE_STOP_TIMEOUT_SECONDS, pending,
             )
             return
         with self.lifecycle_lock:
@@ -212,10 +269,34 @@ class Controller:
 
     def lifecycle_health(self) -> str | None:
         with self.lifecycle_health_lock:
-            failures, dropped = self.lifecycle_failures, self.lifecycle_dropped
-        if not failures and not dropped:
+            failures, dropped, pending = self.lifecycle_failures, self.lifecycle_dropped, self.lifecycle_pending
+        if not failures and not dropped and not pending:
             return None
-        return f"Lifecycle observations not persisted: {failures} write failures, {dropped} queue overflows"
+        return ("Lifecycle observations not persisted: "
+                f"{failures} write failures, {dropped} queue overflows, {pending} queued writes pending")
+
+    def lifecycle_generation(self) -> int:
+        with self.lifecycle_health_lock:
+            return self._lifecycle_generation
+
+    def lifecycle_consistency(self) -> tuple[int, int]:
+        """Return a token and the number of lifecycle writes still in flight."""
+        with self.lifecycle_health_lock:
+            return (self._lifecycle_generation,
+                    self.lifecycle_pending + self.lifecycle_direct_active)
+
+    def _observe_lifecycle_direct(self, observer, payload: dict) -> dict:
+        # The compatibility endpoints remain synchronous, but must participate
+        # in the same snapshot consistency protocol as the queued hook path.
+        with self.lifecycle_health_lock:
+            self.lifecycle_direct_active += 1
+            self._lifecycle_generation += 1
+        try:
+            return observer.observe(payload)
+        finally:
+            with self.lifecycle_health_lock:
+                self.lifecycle_direct_active -= 1
+                self._lifecycle_generation += 1
 
     def busy(self) -> int:
         return sum(blocks_maintenance(task) for task in self.store.all())
@@ -235,28 +316,47 @@ class Controller:
                     "delegation_enabled": self.settings.delegation_enabled,
                     "active_tasks": self.busy()}
         if operation == "observe":
-            return self.native.observe(payload)
+            return self._observe_lifecycle_direct(self.native, payload)
         if operation == "session_observe":
-            return self.sessions.observe(payload)
+            return self._observe_lifecycle_direct(self.sessions, payload)
         if operation == "lifecycle_observe":
             if set(payload) - {"session", "native"}:
                 raise ValueError("Unknown lifecycle observation field")
             if not any(payload.get(key) is not None for key in ("session", "native")):
                 raise ValueError("Lifecycle observation is empty")
             completed = threading.Event()
-            outcome = {"persisted": False}
+            requested = {
+                key: "pending" for key in ("session", "native")
+                if payload.get(key) is not None
+            }
+            outcome = {"persistence": dict(requested)}
             with self.lifecycle_lock:
                 if (self.lifecycle_stopping or self.lifecycle_thread is None
                         or not self.lifecycle_thread.is_alive()):
-                    return {"accepted": False, "reason": "Lifecycle observation writer is stopping"}
+                    return _lifecycle_result(
+                        False, dict.fromkeys(requested, "rejected"),
+                        "Lifecycle observation writer is stopping",
+                    )
+                with self.lifecycle_health_lock:
+                    self.lifecycle_pending += 1
+                    self._lifecycle_generation += 1
                 try:
                     self.lifecycle_queue.put_nowait((dict(payload), completed, outcome))
                 except queue.Full:
                     with self.lifecycle_health_lock:
+                        self.lifecycle_pending -= 1
+                        self._lifecycle_generation += 1
                         self.lifecycle_dropped += 1
-                    return {"accepted": False, "reason": "Lifecycle observation queue is full"}
-            completed.wait(.04)
-            return {"accepted": True, "persisted": completed.is_set() and outcome["persisted"]}
+                    return _lifecycle_result(
+                        False, dict.fromkeys(requested, "rejected"),
+                        "Lifecycle observation queue is full",
+                    )
+            if not completed.wait(LIFECYCLE_ACK_TIMEOUT_SECONDS):
+                return _lifecycle_result(
+                    True, outcome["persistence"],
+                    "Lifecycle observation is queued but was not durably persisted before the acknowledgement timeout",
+                )
+            return dict(outcome)
         if operation == "snapshot":
             if set(payload) - {"history_limit"}:
                 raise ValueError("Unknown snapshot option")
@@ -451,10 +551,15 @@ class Controller:
         if payload.get("task_id"):
             if str(payload["task_id"]).startswith("native-"):
                 return self.native.status(payload["task_id"])
-            return public(self.store.get(payload["task_id"]), self.store)
+            with self.store.snapshot() as db:
+                task = self.store.get(payload["task_id"], db)
+                history = self.store.history(task["task_id"], db)
+            return public(task, history=history)
         if payload.get("filter") not in {None, "needs_decision"}:
             raise ValueError("Unknown status filter")
-        tasks = [task for task in self.store.all() if task["status"] != "closed" or task.get("cleanup_pending")]
+        with self.store.snapshot() as db:
+            tasks = [task for task in self.store.all(db) if task["status"] != "closed" or task.get("cleanup_pending")]
+            histories = {task["task_id"]: self.store.history(task["task_id"], db) for task in tasks}
         if payload.get("filter") == "needs_decision":
             tasks = [task for task in tasks if task["status"] in DECISIONS or task.get("cleanup_error") is not None or
                      (task["status"] == "awaiting_review" and task["attempts"] >= self.settings.max_attempts)]
@@ -463,7 +568,7 @@ class Controller:
         rows = []
         for task in tasks:
             row = {key: value for key, value in task.items() if key in keys}
-            row.update(visibility(task, self.store.history(task["task_id"])))
+            row.update(visibility(task, histories[task["task_id"]]))
             rows.append(row)
         if payload.get("filter") is None:
             rows.extend(self.native.status(offset=offset))
@@ -502,13 +607,14 @@ class Runtime:
                     self.spawn(task, recovered=True)
                 elif task.get("cancel_requested") and (not record or owned_state(record) == "stopped"):
                     if record and record.get("interrupt_first"):
-                        self.store.update(task["task_id"], lambda t: t.update(status="interrupted", execution_stopped=False,
+                        self.store.update_with_attempt(task["task_id"], lambda t: t.update(status="interrupted", execution_stopped=False,
                             shutdown_unconfirmed=True, failure_reason="Codex shutdown evidence missing after restart; operator inspection required"))
                     else:
                         self.store.update(task["task_id"], lambda t: t.update(status="cancelled", execution_stopped=True))
                 else:
-                    self.store.update(task["task_id"], lambda t: t.update(status="interrupted", execution_stopped=False,
-                                                                         failure_reason="Restart could not establish execution outcome"))
+                    self.store.update_with_attempt(task["task_id"], lambda t: t.update(
+                        status="interrupted", execution_stopped=False,
+                        failure_reason="Restart could not establish execution outcome"))
         self.scheduler = threading.Thread(target=self.schedule, name="router-admission", daemon=True)
         self.scheduler.start()
 
@@ -803,9 +909,9 @@ class Runtime:
         except UncertainProcess as error:
             message = str(error)
             unconfirmed = isinstance(error, UnconfirmedShutdown)
-            self.store.update(task_id, lambda t: t.update(status="interrupted", execution_stopped=False, failure_reason=message,
+            self.store.update_with_attempt(task_id, lambda t: t.update(
+                status="interrupted", execution_stopped=False, failure_reason=message,
                 shutdown_unconfirmed=unconfirmed or t.get("shutdown_unconfirmed", False)))
-            self.store.save_attempt(self.store.get(task_id))
             return
         except Exception as error:
             LOGGER.exception("Task phase failed: %s", task_id)
@@ -821,7 +927,7 @@ class Runtime:
                 except UncertainProcess as stopping_error:
                     message = str(stopping_error)
                     unconfirmed = isinstance(stopping_error, UnconfirmedShutdown)
-                    self.store.update(task_id, lambda t: t.update(status="interrupted", execution_stopped=False,
+                    self.store.update_with_attempt(task_id, lambda t: t.update(status="interrupted", execution_stopped=False,
                         failure_reason=message, shutdown_unconfirmed=unconfirmed or t.get("shutdown_unconfirmed", False)))
                     return
             outcome, reason = "failed", str(error)
@@ -840,7 +946,8 @@ class Runtime:
                 self.snapshot_phase(task_id, "capture")
             except UncertainProcess as error:
                 message = str(error)
-                self.store.update(task_id, lambda t: t.update(status="interrupted", execution_stopped=False, failure_reason=message))
+                self.store.update_with_attempt(task_id, lambda t: t.update(
+                    status="interrupted", execution_stopped=False, failure_reason=message))
                 return
             except PhaseStopped:
                 pass  # Explicit cancellation preserves the established child outcome.
@@ -859,8 +966,7 @@ class Runtime:
                 current["failure_reason"] = reason
             current.pop("pending_outcome", None)
             current.pop("pending_reason", None)
-        self.store.update(task_id, finalize)
-        self.store.save_attempt(self.store.get(task_id))
+        self.store.update_with_attempt(task_id, finalize)
 
     def clean(self, task_id: str) -> None:
         try:
