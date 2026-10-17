@@ -4,6 +4,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -46,8 +47,12 @@ class ManagedRunTests(unittest.TestCase):
         self.assertEqual(self.run_command("raise SystemExit(3)", label="failed", session="S"), 3)
         self.assertEqual(self.run_command("import os, signal; os.kill(os.getpid(), signal.SIGTERM)",
                                           label="signaled"), 128 + signal.SIGTERM)
+        # The descendant blocks on a FIFO until the test releases it: survival is not a timing guess.
+        fifo = self.state.parent / "hold"
+        os.mkfifo(fifo)
+        self.addCleanup(lambda: open(fifo, "w").close())  # Release the descendant.
         survivor = ("import subprocess, sys; "
-                    "subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(2)'])")
+                    f"subprocess.Popen([sys.executable, '-c', {f'open({str(fifo)!r}).read()'!r}])")
         self.assertEqual(self.run_command(survivor, label="survivor"), 0)
         records = self.managed()
         self.assertEqual({label: (record["status"], record["attribution"]) for label, record in records.items()},
@@ -185,6 +190,45 @@ class ManagedRunTests(unittest.TestCase):
         self.control.managed.records()
         with self.control.store.connect() as db:
             self.assertEqual(db.execute("SELECT COUNT(*) FROM managed_processes").fetchone()[0], 0)
+
+    def test_a_start_the_daemon_missed_is_recovered_while_the_command_runs(self):
+        fifo = self.state.parent / "running"
+        os.mkfifo(fifo)
+        seen = []
+
+        def daemon_returns_then_release():
+            deadline = time.monotonic() + 10
+            while not list(completion_directory(self.state).glob("start-*.json")) and time.monotonic() < deadline:
+                time.sleep(0.02)
+            self.daemon_up = True  # The daemon is back while the command still runs.
+            records, active = self.control.managed.records()
+            seen.append(([record["label"] for record in records], active))
+            with open(fifo, "w"):
+                pass  # Let the command finish.
+
+        self.daemon_up = False
+        helper = threading.Thread(target=daemon_returns_then_release)
+        helper.start()
+        with patch("router.managed.request", side_effect=self.request):
+            run([sys.executable, "-c", f"open({str(fifo)!r}).read()"], "missed", None, None, self.state)
+        helper.join(10)
+        self.assertEqual(seen, [(["missed"], 1)])
+        self.assertEqual(self.managed()["missed"]["status"], "exited")
+
+    def test_identities_are_refused_not_rewritten(self):
+        for session, agent in (("a\nb", None), ("s" * 241, None), (" padded", None), (None, "agent-only")):
+            with self.subTest(session=session, agent=agent), \
+                    patch("router.managed.subprocess.Popen") as launch, self.assertRaises(ValueError):
+                run(["true"], None, session, agent, self.state)
+            launch.assert_not_called()  # Refused before anything was launched.
+        with patch("router.managed.os.getcwd", side_effect=FileNotFoundError("removed")), \
+                patch("router.managed.subprocess.Popen") as launch, self.assertRaises(FileNotFoundError):
+            run(["true"], None, None, None, self.state)
+        launch.assert_not_called()  # Metadata failures happen before launch, never after.
+        for bad in ({"session_id": "s" * 241, "attribution": "session"},
+                    {"attribution": "exact"}, {"session_id": "S", "attribution": "host"}):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                self.control.handle("managed_start", {**self.start_payload("managed-bad"), **bad})
 
     def test_labels_follow_fleet_text_sharing(self):
         self.run_command("pass", label="rotate key XYZ")

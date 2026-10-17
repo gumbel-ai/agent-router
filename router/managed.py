@@ -45,7 +45,18 @@ def run(argv: list[str], label: str | None, session_id: str | None, agent_id: st
     """Run argv to completion and return its exit status (128 + signal when signalled)."""
     if not argv:
         raise ValueError("router run needs a command after --")
+    for name, value in (("session", session_id), ("agent", agent_id)):
+        if value is not None:
+            _identifier(value, name)
+    if agent_id is not None and session_id is None:
+        raise ValueError("--agent needs --session")
     managed_id = "managed-" + uuid.uuid4().hex
+    # Everything that can fail is gathered before launch, so a failure never leaves an
+    # untracked command behind.
+    metadata = {"managed_id": managed_id, "label": label, "session_id": session_id, "agent_id": agent_id,
+                "attribution": _attribution(session_id, agent_id), "wrapper_pid": os.getpid(),
+                "wrapper_identity": _identity(os.getpid()), "executable": Path(argv[0]).name,
+                "argument_count": len(argv) - 1, "cwd": os.getcwd()}
     started_at, started = _now(), time.monotonic()
     launched: list[int] = []  # The command's PID (its group), once it exists.
     pending: list[int] = []
@@ -68,12 +79,10 @@ def run(argv: list[str], label: str | None, session_id: str | None, agent_id: st
         launched.append(child.pid)
         for signum in pending:
             forward(signum, None)
-        start = {"managed_id": managed_id, "label": label, "session_id": session_id, "agent_id": agent_id,
-                 "attribution": _attribution(session_id, agent_id), "pid": child.pid, "pgid": child.pid,
-                 "wrapper_pid": os.getpid(), "wrapper_identity": _identity(os.getpid()),
-                 "executable": Path(argv[0]).name, "argument_count": len(argv) - 1,
-                 "cwd": os.getcwd(), "started_at": started_at}
-        _report("managed_start", start)
+        start = {**metadata, "pid": child.pid, "pgid": child.pid, "started_at": started_at}
+        if not _report("managed_start", start):
+            # The daemon may come back while the command runs; leave the start where it looks.
+            _write_evidence(state, f"start-{managed_id}.json", start)
         _, status, usage = os.wait4(child.pid, 0)
         child.returncode = code = os.waitstatus_to_exitcode(status)
         # Keep forwarding until the evidence is saved: an interrupt now must not lose it.
@@ -92,19 +101,31 @@ def run(argv: list[str], label: str | None, session_id: str | None, agent_id: st
                   "max_process_rss_bytes": usage.ru_maxrss * (1024 if sys.platform == "linux" else 1),
                   "group_outlived": survivors, "start": start}
         if not _report("managed_finish", finish):
-            try:
-                # Evidence must survive a daemon that is down; the daemon reads it later.
-                directory = completion_directory(Path(state))
-                directory.mkdir(mode=0o700, parents=True, exist_ok=True)
-                temporary = directory / f"{managed_id}.tmp"
-                temporary.write_text(json.dumps(finish))
-                temporary.replace(directory / f"{managed_id}.json")
-            except OSError as error:
-                print(f"Agent Router could not keep completion evidence: {error}", file=sys.stderr)
+            # Evidence must survive a daemon that is down; the daemon reads it later.
+            _write_evidence(state, f"{managed_id}.json", finish)
     finally:
         for signum, handler in previous.items():
             signal.signal(signum, handler)
     return code if code >= 0 else 128 - code
+
+
+def _write_evidence(state: Path, name: str, evidence: dict) -> None:
+    try:
+        directory = completion_directory(Path(state))
+        directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+        temporary = directory / f"{name}.tmp"
+        temporary.write_text(json.dumps(evidence))
+        temporary.replace(directory / name)
+    except OSError as error:
+        print(f"Agent Router could not keep managed evidence: {error}", file=sys.stderr)
+
+
+def _identifier(value: object, name: str) -> str:
+    # Session and agent IDs are matched exactly elsewhere; refuse rather than rewrite them.
+    if not isinstance(value, str) or not value or len(value) > 240 or value != value.strip() \
+            or any(not character.isprintable() for character in value):
+        raise ValueError(f"Invalid {name} ID")
+    return value
 
 
 def _identity(pid: int) -> str | None:
@@ -124,7 +145,7 @@ def _report(operation: str, payload: dict) -> bool:
 
 
 # Field -> kind. Text is bounded; integers must fit the wire; flags must be real booleans.
-START_FIELDS = {"managed_id": "id", "label": "text", "session_id": "text", "agent_id": "text",
+START_FIELDS = {"managed_id": "id", "label": "text", "session_id": "identifier", "agent_id": "identifier",
                 "attribution": "attribution", "pid": "pid", "pgid": "pid", "wrapper_pid": "pid",
                 "wrapper_identity": "text", "executable": "text", "argument_count": "count",
                 "cwd": "path", "started_at": "count"}
@@ -135,7 +156,8 @@ FINISH_FIELDS = {"managed_id": "id", "finished_at": "count", "elapsed_ms": "coun
 def _checked(payload: object, fields: dict[str, str]) -> dict:
     if not isinstance(payload, dict) or set(payload) - fields.keys():
         raise ValueError("Invalid managed process evidence")
-    required = {key for key, kind in fields.items() if kind not in {"text", "path", "start"}} - {"exit_code", "signal"}
+    required = {key for key, kind in fields.items()
+                if kind not in {"text", "path", "start", "identifier"}} - {"exit_code", "signal"}
     if required - payload.keys():
         raise ValueError("Incomplete managed process evidence")
     if fields is FINISH_FIELDS and (payload.get("exit_code") is None) == (payload.get("signal") is None):
@@ -152,6 +174,7 @@ def _checked(payload: object, fields: dict[str, str]) -> dict:
         valid = (
             kind == "id" and isinstance(value, str) and value.startswith("managed-") and len(value) <= 80
             or kind in {"text", "path"} and isinstance(value, str)
+            or kind == "identifier" and _valid_identifier(value)
             or kind == "attribution" and value in {"exact", "session", "host"}
             or kind == "count" and is_wire_integer(value)
             or kind == "pid" and is_wire_integer(value, minimum=1)
@@ -160,7 +183,18 @@ def _checked(payload: object, fields: dict[str, str]) -> dict:
         if not valid:
             raise ValueError(f"Invalid managed process {key}")
         checked[key] = bound_text(value, 2000 if kind == "path" else 240) if kind in {"text", "path"} else value
+    if fields is START_FIELDS and checked["attribution"] != _attribution(checked.get("session_id"),
+                                                                         checked.get("agent_id")):
+        raise ValueError("Managed process attribution does not match its session and agent")
     return checked
+
+
+def _valid_identifier(value: object) -> bool:
+    try:
+        _identifier(value, "identifier")
+        return True
+    except ValueError:
+        return False
 
 
 class ManagedProcesses:
@@ -208,14 +242,29 @@ class ManagedProcesses:
         """Apply completion files; mark running records whose wrapper vanished without evidence."""
         directory = completion_directory(self.state)
         files = sorted(directory.glob("managed-*.json")) if directory.exists() else []
+        starts = sorted(directory.glob("start-managed-*.json")) if directory.exists() else []
         with self.store.connect() as db:
             running = db.execute("""SELECT data FROM managed_processes
                     WHERE json_extract(data,'$.status')='running'""").fetchall()
         now = _now()
-        if not files and not running and now - self._pruned_at < PRUNE_INTERVAL_MS:
+        if not files and not starts and not running and now - self._pruned_at < PRUNE_INTERVAL_MS:
             return
         consumed, invalid = [], []
         with self.store.transaction() as db:
+            for path in starts:  # Starts the daemon missed: the command may still be running.
+                try:
+                    record = {**_checked(json.loads(path.read_text()), START_FIELDS),
+                              "host_id": self.host_id, "status": "running"}
+                except OSError:
+                    continue
+                except ValueError:
+                    invalid.append(path)
+                    continue
+                db.execute("INSERT OR IGNORE INTO managed_processes(managed_id,data) VALUES(?,?)",
+                           (record["managed_id"], canonical(record)))
+                consumed.append(path)
+            running = db.execute("""SELECT data FROM managed_processes
+                    WHERE json_extract(data,'$.status')='running'""").fetchall()
             for path in files:
                 try:
                     evidence = json.loads(path.read_text())
