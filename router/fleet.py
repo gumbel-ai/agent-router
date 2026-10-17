@@ -762,9 +762,11 @@ def ssh_snapshot(host: FleetHost, timeout: float) -> dict:
         for stream in (process.stdout, process.stderr):
             if stream is not None:
                 stream.close()
+        leader_reaped = True
         try:
             process.wait(timeout=.5)
         except subprocess.TimeoutExpired:
+            leader_reaped = False  # The group is SIGKILLed below already.
             try:
                 os.killpg(process.pid, signal.SIGKILL)
             except (OSError, AttributeError):
@@ -778,12 +780,34 @@ def ssh_snapshot(host: FleetHost, timeout: float) -> dict:
                 pass
             if failure is None:
                 failure = "ssh process did not exit after snapshot collection"
+        if failure and leader_reaped:
+            _kill_remaining_group(process.pid)
     if failure:
         raise ValueError(failure)
     if process.returncode:
         detail = stderr.decode(errors="replace").strip() or f"ssh exited {process.returncode}"
         raise ValueError(_redact_error(detail))
     return _validate_snapshot(bytes(stdout))
+
+
+def _kill_remaining_group(pgid: int, grace_seconds: float = .5) -> None:
+    """After a failed collection, SIGKILL group members that outlived SIGTERM.
+
+    The leader exiting proves nothing about descendants such as a ProxyCommand.
+    """
+    deadline = time.monotonic() + grace_seconds
+    while True:
+        try:
+            os.killpg(pgid, 0)
+        except (OSError, AttributeError):
+            return  # No members remain (or no process groups on this platform).
+        if time.monotonic() >= deadline:
+            break
+        time.sleep(.01)
+    try:
+        os.killpg(pgid, signal.SIGKILL)
+    except OSError:
+        pass
 
 
 def _prefix_identities(snapshot: dict) -> dict:
@@ -913,7 +937,7 @@ def query_fleet(config: FleetConfig, local_snapshot=None, only: str | None = Non
         snapshot = record["snapshot"]
         capacity = snapshot.get("capacity", {})
         sample_age = capacity.get("sample_age_ms")
-        record.pop("_received_at")
+        received_at = record.pop("_received_at")
         started_at = record.pop("_started_at")
         if isinstance(sample_age, (int, float)):
             sample_age = min(
@@ -926,12 +950,13 @@ def query_fleet(config: FleetConfig, local_snapshot=None, only: str | None = Non
         if all(value is not None for value in reservation_values):
             # The producer's consistency was checked against its own generated_at
             # during wire validation. The local host shares the viewer's clock; a
-            # remote's clock is advanced by monotonic collection time instead, so
-            # viewer clock skew cannot expire (or extend) a remote reservation.
+            # remote's clock is advanced only by time since receipt (SSH setup
+            # precedes generation), so neither viewer skew nor handshake time can
+            # expire a remote reservation early.
             if configured_hosts[record["name"]].transport == "local":
                 source_now = generated_at
             else:
-                source_now = snapshot["generated_at"] + max(0, (collection_finished - started_at) * 1000)
+                source_now = snapshot["generated_at"] + max(0, (collection_finished - received_at) * 1000)
             capacity["reservation_active"] = capacity["reserved_until"] > source_now
         # One threshold for classification and alerting, so a stale sample is
         # never "unknown" without also marking the snapshot partial.

@@ -283,6 +283,15 @@ class SessionAndCapacityTests(unittest.TestCase):
         self.assertNotEqual(records[0]["status"], "unknown")
         self.assertEqual(active, 1)
 
+    def test_delayed_tool_start_after_agent_completed_counts_once_as_active(self):
+        self.event("prompt", observed_at=self.now - 3000)
+        completed = self.event("notification", notification_type="agent_completed", observed_at=self.now - 1000)
+        self.assertEqual(completed["status"], "idle")
+        self.event("tool_start", tool_use_id="late-tool", activity="Bash", observed_at=self.now - 2000)
+        records, active = self.observer.fleet_records(10)
+        self.assertEqual(records[0]["inflight_tool_count"], 1)
+        self.assertEqual(active, 1)
+
     def test_same_time_task_or_subagent_event_does_not_reopen_stopped_turn(self):
         for kind in ("task_completed", "subagent_stop", "subagent_start", "task_created"):
             session = "tie-" + kind
@@ -870,6 +879,17 @@ class SessionAndCapacityTests(unittest.TestCase):
             ReservationReader(reservation).read(self.now)
         sampler = CapacitySampler(Path(self.temp.name), reservation_path=reservation)
         projected = sampler.view(CapacityThresholds())
+        self.assertTrue(projected["partial"])
+        self.assertEqual(projected["capacity_state"], "unknown")
+
+    def test_deeply_nested_reservation_reports_unknown_capacity(self):
+        reservation = Path(self.temp.name) / "reservation.json"
+        reservation.write_text("[[]]")
+        # CPython 3.14 parses 16 KiB of nesting, but a smaller stack may not.
+        with patch("router.capacity.json.loads", side_effect=RecursionError):
+            with self.assertRaisesRegex(ValueError, "not valid JSON"):
+                ReservationReader(reservation).read(self.now)
+            projected = CapacitySampler(Path(self.temp.name), reservation_path=reservation).view(CapacityThresholds())
         self.assertTrue(projected["partial"])
         self.assertEqual(projected["capacity_state"], "unknown")
 
@@ -1819,13 +1839,19 @@ required = false
 
     def test_remote_reservation_expiry_uses_source_clock_not_viewer_clock(self):
         # The viewer's wall clock (time.time) is decades past the remote's
-        # generated_at=1; only 16 s of monotonic collection time elapsed.
+        # generated_at=1. SSH setup takes 5 s before the remote generates its
+        # snapshot; merging happens 1 s after receipt.
         main_thread = threading.current_thread()
+        worker_calls = []
 
         def monotonic():
-            return 116 if threading.current_thread() is main_thread else 100
+            if threading.current_thread() is main_thread:
+                return 106
+            worker_calls.append(None)
+            return 100 if len(worker_calls) == 1 else 105
 
-        for reserved_until, active in ((60_001, True), (10_001, False)):
+        for reserved_until, active in ((3_001, True), (501, False)):
+            worker_calls.clear()
             remote = snapshot("peer")
             remote["capacity"].update(reserved_by="coordinator", reserved_until=reserved_until,
                                       reserved_cpu_slots=8, reserved_memory_bytes=0,
@@ -2240,6 +2266,46 @@ required = false
                 if descendant_pid is not None:
                     try:
                         os.kill(descendant_pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+
+    def test_ssh_failure_kills_sigterm_ignoring_member_after_leader_exits(self):
+        host = FleetHost("remote", "ssh", target="remote")
+        actual_popen = subprocess.Popen
+        with tempfile.TemporaryDirectory() as temp:
+            pid_file = Path(temp) / "member.pid"
+            script = (
+                "import os,signal,time\n"
+                f"path={str(pid_file)!r}\n"
+                "if os.fork() == 0:\n"
+                "    signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+                "    os.close(1); os.close(2)\n"
+                "    with open(path, 'w') as stream: stream.write(str(os.getpid()))\n"
+                "    time.sleep(30)\n"
+                "    os._exit(0)\n"
+                "time.sleep(30)\n"  # The leader dies on SIGTERM.
+            )
+            member = None
+            try:
+                with patch("router.fleet.subprocess.Popen",
+                           side_effect=lambda command, **kwargs: actual_popen([sys.executable, "-c", script], **kwargs)), \
+                        self.assertRaisesRegex(ValueError, "timed out"):
+                    ssh_snapshot(host, 1)
+                self.assertTrue(pid_file.exists(), "group member never reported its PID")
+                member = int(pid_file.read_text())
+                deadline = time.monotonic() + 2
+                while time.monotonic() < deadline:
+                    try:
+                        os.kill(member, 0)
+                    except ProcessLookupError:
+                        break
+                    time.sleep(.01)
+                else:
+                    self.fail("SIGTERM-ignoring group member survived failed collection")
+            finally:
+                if member is not None:
+                    try:
+                        os.kill(member, signal.SIGKILL)
                     except ProcessLookupError:
                         pass
 

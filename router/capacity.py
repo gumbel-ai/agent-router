@@ -209,7 +209,8 @@ class ReservationReader:
             raise ValueError("reservation.json exceeds 16 KiB")
         try:
             record = json.loads(payload)
-        except (ValueError, UnicodeError) as error:
+        except (ValueError, UnicodeError, RecursionError) as error:
+            # Deep nesting fits in 16 KiB; report unknown capacity, not a failed host.
             raise ValueError("reservation.json is not valid JSON") from error
         allowed = {"schema_version", *RESERVATION_FIELDS}
         schema_version = record.get("schema_version") if isinstance(record, dict) else None

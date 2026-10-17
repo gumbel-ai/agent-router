@@ -412,16 +412,17 @@ class SessionObserver:
                     (json_extract(data,'$.tool_correlation_partial')=1 AND
                      COALESCE(json_extract(data,'$.tool_correlation_partial_until'),?)>=?))""",
                                            (self.host_id, at, at, at)).fetchone()[0]
-            fresh_active = db.execute("""SELECT COUNT(*) FROM sessions WHERE host_id=? AND
-                    (json_extract(data,'$.status')='running' OR json_extract(data,'$.needs_input')=1) AND
-                    json_extract(data,'$.last_event_at') BETWEEN ? AND ?""",
-                                      (self.host_id, at - STALE_AFTER_MS, at)).fetchone()[0]
-            active_tools = db.execute("""SELECT COUNT(*) FROM sessions WHERE host_id=? AND
-                    json_extract(data,'$.status') IN ('running','idle') AND
-                    json_extract(data,'$.last_event_at')<? AND
-                    json_extract(data,'$.tool_active_until')>=?""",
-                                      (self.host_id, at - STALE_AFTER_MS, at)).fetchone()[0]
-        active = None if future_or_partial else fresh_active + active_tools
+            # One predicate, so each session counts once: fresh running/waiting
+            # work, or any unexpired tool (a reordered tool_start can leave a
+            # live tool under a newer, fresh "idle" status).
+            active_sessions = db.execute("""SELECT COUNT(*) FROM sessions WHERE host_id=? AND (
+                    ((json_extract(data,'$.status')='running' OR json_extract(data,'$.needs_input')=1) AND
+                     json_extract(data,'$.last_event_at') BETWEEN ? AND ?) OR
+                    (json_extract(data,'$.status') IN ('running','idle') AND
+                     json_extract(data,'$.last_event_at')<=? AND
+                     json_extract(data,'$.tool_active_until')>=?))""",
+                                         (self.host_id, at - STALE_AFTER_MS, at, at, at)).fetchone()[0]
+        active = None if future_or_partial else active_sessions
         return [self.view(record, at) for record in records], active
 
     def active_count(self) -> int | None:

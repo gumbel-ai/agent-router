@@ -222,7 +222,8 @@ class Controller:
                                   else "Lifecycle observation could not be persisted; failed components: ")
                         reason = prefix + ", ".join(failed)
                     terminal = _lifecycle_result(False, outcome["persistence"], reason)
-                    outcome.clear()
+                    # No clear(): a request thread that timed out may be reading
+                    # outcome["persistence"] concurrently; update() swaps it whole.
                     outcome.update(terminal)
                     with self.lifecycle_health_lock:
                         self._lifecycle_generation += 1
