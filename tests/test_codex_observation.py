@@ -185,6 +185,8 @@ class CodexObservationTests(unittest.TestCase):
                 self.hook("PreToolUse", turn_id="t2", agent_id=CHILD, agent_type="default", tool_name="Bash",
                           tool_input={}, tool_use_id="exec-9b")
                 self.assertEqual(self.agent()["status"], "stopped")
+                self.clock = resumed + 20
+                self.hook("SessionStart", source="compact")  # Must not move the resume boundary.
                 self.clock = resumed
                 self.hook("PreToolUse", turn_id="t3", agent_id=CHILD, agent_type="default", tool_name="Bash",
                           tool_input={}, tool_use_id="exec-10")
