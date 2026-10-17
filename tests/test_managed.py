@@ -174,13 +174,15 @@ class ManagedRunTests(unittest.TestCase):
         good.write_text(json.dumps(finish))
         broken.write_text("{not json")
         outcome_less.write_text(json.dumps({**finish, "managed_id": "managed-none", "exit_code": None}))
+        (directory / "start-managed-odd.json").write_text(json.dumps({**self.start_payload("managed-odd"),
+                                                                       "attribution": []}))
         with patch("pathlib.Path.read_text", side_effect=OSError("busy")):
             self.control.managed.reconcile()
         self.assertTrue(good.exists())  # Unreadable for now: retried, not deleted.
         self.assertEqual(self.managed()["z"]["status"], "exited")
         self.assertFalse(good.exists())
         self.assertEqual(sorted(path.name for path in directory.iterdir()),
-                         ["managed-broken.invalid", "managed-none.invalid"])
+                         ["managed-broken.invalid", "managed-none.invalid", "start-managed-odd.invalid"])
 
     def test_finished_records_are_pruned_even_when_nothing_is_running(self):
         old = int(time.time() * 1000) - 8 * 86_400_000

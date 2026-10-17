@@ -175,7 +175,7 @@ def _checked(payload: object, fields: dict[str, str]) -> dict:
             kind == "id" and isinstance(value, str) and value.startswith("managed-") and len(value) <= 80
             or kind in {"text", "path"} and isinstance(value, str)
             or kind == "identifier" and _valid_identifier(value)
-            or kind == "attribution" and value in {"exact", "session", "host"}
+            or kind == "attribution" and isinstance(value, str) and value in {"exact", "session", "host"}
             or kind == "count" and is_wire_integer(value)
             or kind == "pid" and is_wire_integer(value, minimum=1)
             or kind == "flag" and isinstance(value, bool)
@@ -257,7 +257,7 @@ class ManagedProcesses:
                               "host_id": self.host_id, "status": "running"}
                 except OSError:
                     continue
-                except ValueError:
+                except (ValueError, TypeError):  # Malformed evidence is set aside, never fatal.
                     invalid.append(path)
                     continue
                 db.execute("INSERT OR IGNORE INTO managed_processes(managed_id,data) VALUES(?,?)",
@@ -275,7 +275,7 @@ class ManagedProcesses:
                     continue
                 try:
                     self._finish(db, _checked(evidence, FINISH_FIELDS))
-                except ValueError as error:
+                except (ValueError, TypeError) as error:
                     print(f"Agent Router set aside invalid completion evidence {path.name}: {error}",
                           file=sys.stderr)
                     invalid.append(path)
