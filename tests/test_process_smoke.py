@@ -106,6 +106,10 @@ class ProcessViewTests(unittest.TestCase):
                                         "rss_bytes": 1024}]}
         table = fleet_table({"hosts": [{"name": "here", "ok": True, "snapshot": only}]})
         self.assertIn("session processes: 1 in 1 session(s), CPU unknown, RSS 1.0K", table)
+        truncated = {**only, "errors": {"inferred_processes": "Collection truncated to history_limit=1"},
+                     "inferred_processes": [{**only["inferred_processes"][0], "rss_bytes": None}]}
+        self.assertIn("session processes (shown only): 1 in 1 session(s), CPU unknown, RSS unknown",
+                      fleet_table({"hosts": [{"name": "h", "ok": True, "snapshot": truncated}]}))
         measured_zero = {**only, "inferred_processes": [{**only["inferred_processes"][0], "cpu_pct": 0.0}]}
         self.assertIn("CPU 0%, RSS", fleet_table({"hosts": [{"name": "h", "ok": True, "snapshot": measured_zero}]}))
 

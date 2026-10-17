@@ -152,14 +152,20 @@ def _process_summary(snapshot: dict) -> list[str]:
     inferred = snapshot.get("inferred_processes", [])
     if not inferred:
         return []
-    measured = [process["cpu_pct"] for process in inferred if isinstance(process.get("cpu_pct"), (int, float))]
-    unmeasured = len(inferred) - len(measured)
-    # A process without a CPU baseline yet is unknown, not idle.
-    cpu = ("CPU unknown" if not measured else f"CPU {sum(measured):.0f}%"
-           + (f" + {unmeasured} unmeasured" if unmeasured else ""))
-    rss = _size(sum(process.get("rss_bytes") or 0 for process in inferred))
+    def total(key: str, label: str, render) -> str:
+        # A missing measurement is unknown, not zero; say how many are missing.
+        values = [process[key] for process in inferred if isinstance(process.get(key), (int, float))]
+        missing = len(inferred) - len(values)
+        if not values:
+            return f"{label} unknown"
+        return f"{label} {render(sum(values))}" + (f" + {missing} unmeasured" if missing else "")
+
     sessions = len({(process.get("source"), process.get("session_id")) for process in inferred})
-    return [f"{'':<10} session processes: {len(inferred)} in {sessions} session(s), {cpu}, RSS {rss}"]
+    # Totals cover the processes in this snapshot; a truncated page is flagged separately.
+    scope = " (shown only)" if "inferred_processes" in snapshot.get("errors", {}) else ""
+    cpu = total("cpu_pct", "CPU", lambda value: f"{value:.0f}%")
+    rss = total("rss_bytes", "RSS", _size)
+    return [f"{'':<10} session processes{scope}: {len(inferred)} in {sessions} session(s), {cpu}, {rss}"]
 
 
 def _managed_activity(process: dict) -> str:

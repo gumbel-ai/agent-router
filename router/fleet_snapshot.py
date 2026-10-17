@@ -301,9 +301,14 @@ def bound(snapshot: dict, maximum_bytes: int = MAX_SNAPSHOT_BYTES) -> dict:
     result["partial"] = True
     result.setdefault("errors", {})["output"] = "Snapshot truncated to configured one MiB bound"
     for key in ("tasks", "router_tasks", "inferred_processes", "managed_processes", "agents", "sessions", "alerts"):
-        values = list(result.get(key, []))
+        if key not in result:
+            continue
+        values = list(result[key])
         while values and len(canonical({**result, key: values}).encode()) > maximum_bytes:
             values = values[:len(values) // 2]
+        if len(values) < len(result[key]):
+            # Name the shortened section, so its totals are read as covering only what is shown.
+            result["errors"].setdefault(key, "Collection truncated to the one MiB snapshot bound")
         result[key] = values
     # Fixed metadata should remain far below the limit; guard malformed producers.
     if len(json.dumps(result, separators=(",", ":")).encode()) > maximum_bytes:
