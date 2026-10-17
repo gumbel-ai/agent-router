@@ -16,6 +16,8 @@ from contextlib import contextmanager, redirect_stdout
 from pathlib import Path
 from unittest.mock import mock_open, patch
 
+from test_control import settings
+
 from router.capacity import (
     MAX_RESERVATION_BYTES,
     CapacitySampler,
@@ -30,6 +32,7 @@ from router.cli import fleet_table
 from router.cli import main as cli_main
 from router.client import request
 from router.config import Settings
+from router.daemon import Controller
 from router.db import Store
 from router.fleet import (
     MAX_COLLECTION_RECORDS,
@@ -2771,6 +2774,91 @@ required = false
                             process.terminate()
                             process.wait(timeout=5)
                     process.communicate()
+
+
+class RouterTaskFleetTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix="ar-fleet-tasks-")
+        self.addCleanup(self.temp.cleanup)
+        root = Path(self.temp.name)
+        self.control = Controller(settings(root / "repo"), {}, root / "state")
+
+    def task(self, status, at=None, **fields):
+        task = {"task_id": "task-" + uuid.uuid4().hex, "session_id": "parent-session", "status": status,
+                "executor": "codex", "requested_model": "small", "attempts": 1, "created_at": 1,
+                "invocation": {"task": "PRIVATE TASK TEXT", "parent_worktree": "/work"},
+                "cost": 1.5, "usage": {"input": 9}, "worktree": "/secret", **fields}
+        with self.control.store.transaction() as db, \
+                patch("router.db.now_ms", return_value=at if at is not None else int(time.time() * 1000)):
+            self.control.store.put(db, task)
+        return task["task_id"]
+
+    def test_router_tasks_reach_fleet_status_as_lifecycle_only(self):
+        running = self.task("running", attempt_started_at=int(time.time() * 1000) - 1000)
+        self.task("closed", at=1)  # Long finished: outside the fleet window.
+        local = compose(self.control)
+        self.assertEqual([task["task_id"] for task in local["router_tasks"]], [running])
+        projected = _validate_snapshot(json.dumps(local).encode())
+        [record] = projected["router_tasks"]
+        self.assertEqual((record["status"], record["executor"], record["parent_session_id"]),
+                         ("running", "codex", "parent-session"))
+        self.assertEqual(record["task"], "PRIVATE TASK TEXT")
+        self.assertFalse({"cost", "usage", "worktree", "cwd"} & record.keys())
+        self.assertNotIn("router_tasks", projected.get("errors", {}))
+        # A peer on an older version sends no Router tasks; that is not a partial snapshot.
+        older = _validate_snapshot(json.dumps(snapshot("older-peer")).encode())
+        self.assertEqual((older["router_tasks"], older["partial"]), ([], False))
+        config = FleetConfig((FleetHost("here", "local"), FleetHost("there", "ssh", target="there")))
+        with patch("router.fleet.ssh_snapshot", return_value=older):
+            result = query_fleet(config, local_snapshot=lambda thresholds: local)
+        self.assertTrue(all(host["ok"] for host in result["hosts"]))
+        table = fleet_table(result)
+        self.assertIn("codex:" + running[:14], table)
+        self.assertIn("router:parent-sess", table)
+
+    def test_router_task_text_follows_fleet_text_sharing(self):
+        self.task("failed", failure_reason="[Errno 2] No such file: '/Users/me/worktree'")
+        self.control.settings = Settings(AGENT_ROUTER_FLEET_SHARE_TEXT="false")
+        [record] = compose(self.control)["router_tasks"]
+        self.assertEqual((record["task"], record["failure_reason"]), (None, None))
+
+    def test_one_odd_router_task_cannot_take_the_host_out_of_the_fleet(self):
+        self.assertNotIn("router_tasks", compose(self.control))  # Older viewers never see an empty section.
+        now = int(time.time() * 1000)
+        long_id = "p" * 241
+        self.task("closed", at=now - 1000)
+        self.task("awaiting_review", at=now - 5000, session_id=long_id, parent_agent_id=long_id,
+                  duration_ms=-2000, invocation={"task": "x" * 200_000, "parent_worktree": "/work"})
+        local = compose(self.control)
+        projected = _validate_snapshot(json.dumps(local).encode())
+        self.assertNotIn("router_tasks", projected.get("errors", {}))
+        decision, finished = projected["router_tasks"]  # Waiting on a decision sorts before finished work.
+        self.assertEqual((decision["status"], finished["status"]), ("awaiting_review", "closed"))
+        self.assertEqual((decision["parent_session_id"], decision["parent_agent_id"],
+                          decision["parent_reference_omitted"]), (None, None, True))
+        self.assertEqual((decision["elapsed_ms"], len(decision["task"])), (0, 240))
+
+    def test_failed_cleanup_outranks_a_newer_finished_task(self):
+        now = int(time.time() * 1000)
+        stuck = self.task("closed", at=now - 2000, cleanup_pending=True, cleanup_error="worktree busy")
+        self.task("closed", at=now - 1000)
+        self.assertEqual([task["task_id"] for task in self.control.router_task_records(1)], [stuck])
+        self.task("failed", at=now - 500, failure_reason="Executor failed", executor_activity="agent_message")
+        result = query_fleet(FleetConfig((FleetHost("here", "local"),)),
+                             local_snapshot=lambda thresholds: compose(self.control))
+        table = fleet_table(result)
+        self.assertIn("cleanup failed", table)
+        self.assertIn("Executor failed", table)
+
+    def test_one_malformed_router_task_row_is_dropped_not_the_host(self):
+        self.task("running")
+        local = compose(self.control)
+        local["router_tasks"].append({**local["router_tasks"][0], "task_id": "bad", "attempts": -1})
+        projected = _validate_snapshot(json.dumps(local).encode())
+        self.assertEqual(len(projected["router_tasks"]), 1)
+        self.assertTrue(projected["partial"])
+        self.assertIn("1 invalid Router task record(s) omitted", projected["errors"]["router_tasks"])
+        self.assertTrue(projected["sessions"] == local["sessions"] and "capacity" in projected)
 
 
 if __name__ == "__main__":

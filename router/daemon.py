@@ -24,7 +24,7 @@ from router.db import Store, now_ms
 from router.dispatch import MUTATIONS, canonical
 from router.fleet_snapshot import AlertHistory
 from router.host import HostIdentity
-from router.native import NativeObserver
+from router.native import NativeObserver, identifier, safe_text
 from router.process import (
     UncertainProcess,
     UnconfirmedShutdown,
@@ -588,6 +588,48 @@ class Controller:
         if payload.get("filter") is None:
             rows.extend(self.native.status(offset=offset))
         return rows
+
+    def router_task_records(self, limit: int = 100) -> list[dict]:
+        """Lifecycle-only fleet projection of Router-dispatched tasks: open or recently changed."""
+        cutoff = now_ms() - 300_000
+        with self.store.snapshot() as db:
+            tasks = [task for task in self.store.all(db)
+                     if task["status"] != "closed" or task.get("cleanup_pending") or task["updated_at"] >= cutoff]
+            # Active work first, then tasks waiting on a decision, then recently finished ones.
+            tasks.sort(key=lambda task: (task["status"] not in ACTIVE,
+                                         task["status"] not in DECISIONS and not task.get("shutdown_unconfirmed")
+                                         and task.get("cleanup_error") is None,
+                                         -task["updated_at"]))
+            tasks = tasks[:limit]
+            histories = {task["task_id"]: self.store.history(task["task_id"], db) for task in tasks}
+        records = []
+        for task in tasks:
+            view = visibility(task, histories[task["task_id"]])
+            # Parent references are accepted unbounded at dispatch; omit one the fleet wire
+            # cannot carry rather than let it invalidate the host's whole snapshot.
+            parents = {}
+            for key, value in (("parent_session_id", task["session_id"]),
+                               ("parent_agent_id", task.get("parent_agent_id"))):
+                try:
+                    parents[key] = None if value is None else identifier(value, key)
+                except (TypeError, ValueError):
+                    parents[key] = None
+                    parents["parent_reference_omitted"] = True
+            elapsed = view["elapsed_ms"]
+            records.append({
+                "host_id": self.host.host_id, "task_id": task["task_id"], "status": task["status"],
+                "executor": safe_text(task["executor"], 240), "requested_model": safe_text(task.get("requested_model"), 240),
+                "resolved_model": safe_text(task.get("resolved_model"), 240), "attempts": task["attempts"],
+                **parents, "task": safe_text(view["task"], 240), "activity": safe_text(view["activity"], 240),
+                "failure_reason": safe_text(task.get("failure_reason"), 500),
+                "created_at": task["created_at"], "started_at": view["started_at"],
+                # A clock step back can make a stored duration negative; never send that.
+                "elapsed_ms": max(0, int(elapsed)) if elapsed is not None else None,
+                "last_event_at": task["updated_at"], "cleanup_pending": view["cleanup_pending"],
+                "cleanup_failed": task.get("cleanup_error") is not None,
+                "shutdown_unconfirmed": view["shutdown_unconfirmed"],
+            })
+        return records
 
 
 class PhaseStopped(RuntimeError):

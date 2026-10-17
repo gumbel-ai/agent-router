@@ -137,6 +137,17 @@ def _fleet_alert_lines(record: dict, snapshot: dict | None = None) -> list[str]:
     return lines
 
 
+def _router_task_activity(task: dict) -> str:
+    # Conditions that need an operator come before the executor's last activity.
+    if task.get("shutdown_unconfirmed"):
+        return "shutdown unconfirmed"
+    if task.get("cleanup_failed"):
+        return "cleanup failed"
+    if task.get("status") in {"failed", "interrupted", "blocked"} and task.get("failure_reason"):
+        return task["failure_reason"]
+    return task.get("activity") or task.get("failure_reason") or "—"
+
+
 def fleet_table(result: dict, capacity_only: bool = False) -> str:
     lines = ["HOST       CAPACITY   SESSION              AGENT                STATE        ACTIVITY                 CPU    LOAD   MEM FREE DISK FREE"]
     for record in result["hosts"]:
@@ -162,7 +173,8 @@ def fleet_table(result: dict, capacity_only: bool = False) -> str:
             continue
         sessions = snapshot.get("sessions", [])
         agents = snapshot.get("agents", [])
-        if not sessions and not agents:
+        router_tasks = snapshot.get("router_tasks", [])
+        if not sessions and not agents and not router_tasks:
             activity = "partial snapshot" if partial_lines else "no active sessions"
             lines.append(f"{name:<10} {state:<10} {'—':<20} {'—':<20} {'—':<12} {activity:<24} {cpu:<6} {load:<6} {memory:<8} {disk}")
             lines.extend(partial_lines)
@@ -182,6 +194,15 @@ def fleet_table(result: dict, capacity_only: bool = False) -> str:
                          f"{_cell(agent.get('agent_type') or agent.get('agent_id') or 'unknown', 20):<20} "
                          f"{_cell(agent.get('status', 'unknown'), 12):<12} "
                          f"{_cell(agent.get('activity') or '—', 24):<24} "
+                         f"{cpu if first else '—':<6} {load if first else '—':<6} "
+                         f"{memory if first else '—':<8} {disk if first else '—'}")
+        for index, task in enumerate(router_tasks):
+            first = not sessions and not agents and index == 0
+            lines.append(f"{name if first else '':<10} {state if first else '':<10} "
+                         f"{_cell('router:' + str(task.get('parent_session_id') or '—'), 20):<20} "
+                         f"{_cell(str(task.get('executor') or '?') + ':' + str(task.get('task_id')), 20):<20} "
+                         f"{_cell(task.get('status', 'unknown'), 12):<12} "
+                         f"{_cell(_router_task_activity(task), 24):<24} "
                          f"{cpu if first else '—':<6} {load if first else '—':<6} "
                          f"{memory if first else '—':<8} {disk if first else '—'}")
         lines.extend(partial_lines)

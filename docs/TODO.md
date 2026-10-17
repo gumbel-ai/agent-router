@@ -142,6 +142,10 @@ missing prerequisites are visible.
 
 ## 5. Fleet visibility check with both sources
 
+**Status:** Router-task projection done (`router_tasks` snapshot section, fleet table rows,
+older peers accepted). Emulated two-host check is automated; the real two-host check
+runs with the manual Linux testing.
+
 **Scope:**
 - Verify `router fleet status` end to end with Claude and Codex activity on at least
   two hosts (subset of fleet spec §19.3).
