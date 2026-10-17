@@ -51,6 +51,38 @@ class SamplerTests(unittest.TestCase):
         self.assertTrue(all(record["attribution"] == "session" for record in records))
         self.assertEqual([record["pid"] for record in sessions.records("host", roots, 2)], [10, 20])
 
+    @unittest.skipUnless(sys.platform == "darwin", "macOS libproc path")
+    def test_darwin_sample_drops_a_pid_reused_between_reads(self):
+        from router import processes
+        real, calls = processes._darwin_bsd, {}
+
+        def reused(lib, pid):
+            info = real(lib, pid)
+            calls[pid] = calls.get(pid, 0) + 1
+            if pid == os.getpid() and calls[pid] == 2:
+                info.start_usec += 1  # A different process now holds this PID.
+            return info
+
+        with patch("router.processes._darwin_bsd", side_effect=reused):
+            self.assertNotIn(os.getpid(), sample())
+        self.assertIn(os.getpid(), sample())
+
+    @unittest.skipUnless(sys.platform == "linux", "Linux /proc path")
+    def test_linux_sample_drops_a_pid_reused_between_reads(self):
+        from router import processes
+        real, calls = processes._linux_stat, {}
+
+        def reused(pid):
+            stat = real(pid)
+            calls[pid] = calls.get(pid, 0) + 1
+            if pid == os.getpid() and calls[pid] == 2:
+                stat["start_ticks"] += 1  # A different process now holds this PID.
+            return stat
+
+        with patch("router.processes._linux_stat", side_effect=reused):
+            self.assertNotIn(os.getpid(), sample())
+        self.assertIn(os.getpid(), sample())
+
     def test_cpu_percent_comes_from_the_change_since_the_previous_sample(self):
         samples = iter([{10: process(10, 1, cpu_ns=0)}, {10: process(10, 1, cpu_ns=500_000_000)}])
         sessions = SessionProcesses(sampler=lambda: next(samples))
@@ -84,13 +116,16 @@ class SamplerTests(unittest.TestCase):
         self.assertEqual((record["cpu_pct"], record["session_id"]), (49.8, "s"))
 
     def test_concurrent_snapshots_sample_one_at_a_time(self):
-        inside, peak, entered = [0], [0], threading.Event()
+        inside, peak = [0], [0]
+        first_in, overlap = threading.Event(), threading.Event()
 
         def sampler():
             inside[0] += 1
             peak[0] = max(peak[0], inside[0])
-            entered.set()
-            time.sleep(0.2)  # Long enough for an unserialized second caller to enter.
+            if inside[0] > 1:
+                overlap.set()  # Only reachable when a second caller is not serialized.
+            first_in.set()
+            overlap.wait(1)  # The first caller holds the sample open until a second one would enter.
             inside[0] -= 1
             return {10: process(10, 1)}
 
@@ -98,7 +133,7 @@ class SamplerTests(unittest.TestCase):
         roots = [{"source": "claude", "session_id": "s", "pid": 10, "identity": "id-10"}]
         first = threading.Thread(target=sessions.records, args=("host", roots, 10))
         first.start()
-        entered.wait(5)
+        first_in.wait(5)
         sessions.records("host", roots, 10)
         first.join(5)
         self.assertEqual(peak[0], 1)
@@ -117,32 +152,53 @@ class SessionProcessTests(unittest.TestCase):
         self.control.sessions.observe({"source": "claude", "session_id": "S", "kind": kind,
                                        "observed_at": self.at, "process_ancestors": chain})
 
-    def test_session_process_is_the_ancestor_shared_by_successive_hooks(self):
-        claude, terminal = [2128, "darwin:1:2"], [2041, "darwin:1:1"]
-        self.observe([[9001, "darwin:3:1"], claude, terminal])
-        self.assertEqual(self.control.sessions.process_roots(), [])  # One chain cannot tell shell from agent.
-        self.observe("not a chain")
-        self.observe([[9002, "darwin:3:2"], claude, terminal])
-        self.assertEqual(self.control.sessions.process_roots(),
-                         [{"source": "claude", "session_id": "S", "pid": 2128, "identity": "darwin:1:2"}])
-        self.observe([[9003, "darwin:3:3"], claude, terminal], kind="session_end")
-        self.assertEqual(self.control.sessions.process_roots(), [])
-        view = self.control.handle("snapshot", {})["sessions"][0]
-        self.assertFalse({"process_chain", "process_root"} & view.keys())
+    def hook(self, agent, kind="prompt", terminal=(50, "darwin:1:50")):
+        # Each hook call runs through its own fresh shell under the agent.
+        self.shell = getattr(self, "shell", 9000) + 1
+        self.observe([[self.shell, f"darwin:3:{self.shell}"], [agent, f"darwin:1:{agent}"], list(terminal)], kind)
 
-    def test_a_resumed_session_learns_its_new_process_not_the_shared_terminal(self):
-        terminal = [50, "darwin:1:50"]
-        self.observe([[9001, "darwin:3:1"], [60, "darwin:1:60"], terminal], kind="session_start")
-        self.observe([[9002, "darwin:3:2"], [60, "darwin:1:60"], terminal])
-        self.observe([[9003, "darwin:3:3"], [60, "darwin:1:60"], terminal], kind="session_end")
-        self.observe([[9004, "darwin:3:4"], [70, "darwin:1:70"], terminal], kind="session_start")
-        self.assertEqual(self.control.sessions.process_roots(), [])  # Not the terminal.
-        self.observe([[9005, "darwin:3:5"], [70, "darwin:1:70"], terminal])
-        self.assertEqual([root["pid"] for root in self.control.sessions.process_roots()], [70])
+    def roots(self):
+        return [root["pid"] for root in self.control.sessions.process_roots()]
+
+    def test_session_process_is_confirmed_by_successive_hooks(self):
+        self.hook(60)
+        self.observe("not a chain")
+        self.hook(60)
+        self.assertEqual(self.roots(), [])  # One shared pair could still span an agent restart.
+        self.hook(60)
+        self.assertEqual(self.control.sessions.process_roots(),
+                         [{"source": "claude", "session_id": "S", "pid": 60, "identity": "darwin:1:60"}])
+        self.hook(60, kind="session_end")
+        self.assertEqual(self.roots(), [])
+        view = self.control.handle("snapshot", {})["sessions"][0]
+        self.assertFalse({"process_chain", "process_candidate", "process_root"} & view.keys())
+
+    def test_a_new_agent_process_never_hands_the_session_its_terminal(self):
+        for _ in range(3):
+            self.hook(60)
+        self.assertEqual(self.roots(), [60])
+        # Resumed with a SessionStart: learned afresh.
+        self.hook(70, kind="session_start")
+        self.hook(70)
+        self.assertEqual(self.roots(), [])
+        self.hook(70)
+        self.assertEqual(self.roots(), [70])
+        # Replaced without any SessionEnd or SessionStart, before or after a root was confirmed.
+        for expected in ([], [], [80]):
+            self.hook(80)
+            self.assertEqual(self.roots(), expected)  # Never the shared terminal.
+        self.hook(90, kind="session_start")
+        self.hook(90)
+        self.hook(95)  # Restart before confirmation.
+        self.hook(95)
+        self.assertEqual(self.roots(), [])
+        self.hook(95)
+        self.assertEqual(self.roots(), [95])
 
     def test_inferred_processes_reach_the_fleet_snapshot(self):
-        chain = ancestry()
+        chain = ancestry()[:5]  # Room for one fresh hook shell in front.
         self.observe([[999_999, "elsewhere"], *chain])
+        self.observe([[999_998, "elsewhere-2"], *chain])
         self.observe(chain)
         snapshot = _validate_snapshot(json.dumps(compose(self.control)).encode())
         [own] = [record for record in snapshot["inferred_processes"] if record["pid"] == chain[0][0]]

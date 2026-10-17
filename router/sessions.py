@@ -29,6 +29,8 @@ WAITER_CLEARING_KINDS = frozenset({
     "subagent_activity",
 })
 MAX_WAITER_HISTORY = 1024
+# How far above a hook the session's agent process can be (hook shell, login shell, agent).
+MAX_ROOT_DISTANCE = 3
 WAITING_REASON = "Waiting for input"
 
 
@@ -219,16 +221,17 @@ class SessionObserver:
 
     @staticmethod
     def _observe_process_chain(record: dict, event: dict, kind: str) -> None:
-        """Learn the session's own process: the nearest ancestor shared by successive hook calls.
+        """Learn the session's own process from the ancestors of successive hook calls.
 
-        Hooks may run through a fresh shell per call, so a single chain cannot tell that shell
-        from the agent process; the process common to two chains is the one that persists.
+        Hooks may run through a fresh shell per call, so the agent is the nearest ancestor two
+        successive chains share. A pair spanning an agent restart shares only something further
+        out (the terminal), so the agent counts only once two successive pairs agree on it.
         """
         if kind in {"session_start", "session_end"}:
             # A resumed session runs in a new process, possibly under the same terminal;
             # learn its process afresh rather than matching the old lifetime's ancestors.
-            record.pop("process_chain", None)
-            record.pop("process_root", None)
+            for key in ("process_chain", "process_candidate", "process_root"):
+                record.pop(key, None)
             if kind == "session_end":
                 return
         chain = event.get("process_ancestors")
@@ -236,9 +239,13 @@ class SessionObserver:
                 isinstance(entry, list) and len(entry) == 2 and is_wire_integer(entry[0]) and entry[0] > 1
                 and isinstance(entry[1], str) and 0 < len(entry[1]) <= 120 for entry in chain)):
             return
-        common = [entry for entry in chain if entry in (record.get("process_chain") or [])]
-        if common:
-            record["process_root"] = common[0]
+        previous = record.get("process_chain") or []
+        candidate = next((entry for entry in chain[:MAX_ROOT_DISTANCE] if entry in previous), None)
+        if candidate is not None and candidate == record.get("process_candidate"):
+            record["process_root"] = candidate
+        elif record.get("process_root") not in chain:
+            record.pop("process_root", None)  # The agent changed or is not yet confirmed.
+        record["process_candidate"] = candidate
         record["process_chain"] = chain
 
     def process_roots(self, limit: int = 1000) -> list[dict]:
@@ -538,7 +545,7 @@ class SessionObserver:
             "tool_reset_at", "tool_active_until", "tool_overflow_until", "tool_overflow_active",
             "active_tool_times", "tool_correlation_partial", "tool_correlation_partial_until",
             "tool_terminal_floor", "tool_history_partial", "restart_uncertain_until", "root_started_at",
-            "process_chain", "process_root",
+            "process_chain", "process_candidate", "process_root",
         }}
         result = sanitize_structure(result)
         clock_rollback = record["last_event_at"] > at

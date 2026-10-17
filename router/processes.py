@@ -122,6 +122,8 @@ def sample() -> dict[int, dict]:
             try:
                 stat = _linux_stat(int(entry.name))
                 rss = int((entry / "statm").read_text().split()[1]) * page
+                if _linux_stat(stat["pid"])["start_ticks"] != stat["start_ticks"]:
+                    continue  # The PID was reused between reads; the measurements are another process's.
             except (OSError, ValueError, IndexError):
                 continue  # Processes exit between reads, and some are not readable.
             processes[stat["pid"]] = {
@@ -152,6 +154,12 @@ def sample() -> dict[int, dict]:
                 continue
             if lib.proc_pidinfo(pid, 4, 0, ctypes.byref(task), ctypes.sizeof(task)) != ctypes.sizeof(task):
                 continue
+            try:
+                again = _darwin_bsd(lib, pid)
+            except OSError:
+                continue
+            if (again.start_sec, again.start_usec) != (info.start_sec, info.start_usec):
+                continue  # The PID was reused between reads; the measurements are another process's.
             # Task CPU times are Mach absolute units (nanoseconds only on Intel).
             cpu_ns = (task.total_user + task.total_system) * timebase.numer // timebase.denom
             processes[pid] = {
