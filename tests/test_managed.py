@@ -110,6 +110,10 @@ class ManagedRunTests(unittest.TestCase):
                 self.control.handle("managed_start", bad)
         finish = {"managed_id": "managed-y", "finished_at": int(time.time() * 1000), "elapsed_ms": 5, "exit_code": 2,
                   "max_process_rss_bytes": 1, "group_outlived": 1}
+        for outcome in ({"exit_code": None}, {"signal": 9}):
+            with self.subTest(outcome=outcome), self.assertRaises(ValueError):
+                self.control.handle("managed_finish", {**finish, "group_outlived": False, **outcome,
+                                                       "start": self.start_payload("managed-y")})
         with self.assertRaises(ValueError):
             self.control.handle("managed_finish", {**finish, "start": self.start_payload("managed-y")})
         # A start that never reached the daemon is recovered from the finish evidence.
@@ -139,11 +143,48 @@ class ManagedRunTests(unittest.TestCase):
         self.run_command("pass", label="good")
         local = compose(self.control)
         local["managed_processes"].append({**local["managed_processes"][0], "elapsed_ms": -2000})
-        local["inferred_processes"] = [{"host_id": local["host"]["host_id"], "pid": 0}]
+        local["inferred_processes"] = [{"host_id": local["host"]["host_id"], "pid": 0}, None]
         projected = _validate_snapshot(json.dumps(local).encode())
         self.assertEqual(len(projected["managed_processes"]), 1)
         self.assertEqual(projected["inferred_processes"], [])
         self.assertIn("1 invalid record(s) omitted", projected["errors"]["managed_processes"])
+
+    def test_an_interrupt_while_saving_evidence_does_not_lose_it(self):
+        def interrupted(operation, payload, timeout):
+            if operation == "managed_finish":
+                os.kill(os.getpid(), signal.SIGTERM)  # Arrives after the command was reaped.
+            return self.request(operation, payload, timeout)
+
+        with patch("router.managed.request", side_effect=interrupted):
+            code = run([sys.executable, "-c", "raise SystemExit(6)"], "saving", None, None, self.state)
+        self.assertEqual((code, self.managed()["saving"]["exit_code"]), (6, 6))
+
+    def test_completion_files_are_kept_until_imported_and_invalid_ones_set_aside(self):
+        directory = completion_directory(self.state)
+        directory.mkdir(parents=True)
+        finish = {"managed_id": "managed-z", "finished_at": int(time.time() * 1000), "elapsed_ms": 1,
+                  "exit_code": 0, "max_process_rss_bytes": 1, "group_outlived": False,
+                  "start": self.start_payload("managed-z")}
+        good, broken, outcome_less = (directory / f"managed-{name}.json" for name in ("z", "broken", "none"))
+        good.write_text(json.dumps(finish))
+        broken.write_text("{not json")
+        outcome_less.write_text(json.dumps({**finish, "managed_id": "managed-none", "exit_code": None}))
+        with patch("pathlib.Path.read_text", side_effect=OSError("busy")):
+            self.control.managed.reconcile()
+        self.assertTrue(good.exists())  # Unreadable for now: retried, not deleted.
+        self.assertEqual(self.managed()["z"]["status"], "exited")
+        self.assertFalse(good.exists())
+        self.assertEqual(sorted(path.name for path in directory.iterdir()),
+                         ["managed-broken.invalid", "managed-none.invalid"])
+
+    def test_finished_records_are_pruned_even_when_nothing_is_running(self):
+        old = int(time.time() * 1000) - 8 * 86_400_000
+        self.control.handle("managed_finish", {"managed_id": "managed-old", "finished_at": old, "elapsed_ms": 1,
+                                               "exit_code": 0, "max_process_rss_bytes": 1, "group_outlived": False,
+                                               "start": self.start_payload("managed-old")})
+        self.control.managed.records()
+        with self.control.store.connect() as db:
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM managed_processes").fetchone()[0], 0)
 
     def test_labels_follow_fleet_text_sharing(self):
         self.run_command("pass", label="rotate key XYZ")

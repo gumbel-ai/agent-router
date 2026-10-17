@@ -426,8 +426,11 @@ def _validate_snapshot(payload: bytes) -> dict:
     # Router tasks were added within schema v1; older peers omit the section.
     snapshot.setdefault("router_tasks", [])
     collections = ("sessions", "agents", "tasks", "router_tasks", "managed_processes", "inferred_processes", "alerts")
+    # These items are checked per row below, where one bad row is dropped rather than the host.
+    row_checked = {"router_tasks", "managed_processes", "inferred_processes"}
     if not isinstance(capacity, dict) or any(
-            not isinstance(snapshot.get(key), list) or any(not isinstance(item, dict) for item in snapshot[key])
+            not isinstance(snapshot.get(key), list)
+            or key not in row_checked and any(not isinstance(item, dict) for item in snapshot[key])
             for key in collections):
         raise ValueError("Host snapshot has invalid section types")
     if any(len(snapshot[key]) > MAX_COLLECTION_RECORDS for key in collections):
@@ -509,6 +512,8 @@ def _validate_snapshot(payload: bytes) -> dict:
         projected_collections[collection] = []
         for record in snapshot[collection]:
             try:
+                if not isinstance(record, dict):
+                    raise TypeError(f"{collection} row is not an object")
                 projected_collections[collection].append(_project_record(
                     record, record_fields[collection], ("host_id",), collection, host["host_id"]))
             except (ValueError, TypeError):

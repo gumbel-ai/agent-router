@@ -22,8 +22,9 @@ from router.validation import is_wire_integer
 
 # Finished and uncertain commands stay visible (and keep capacity unknown) this long.
 RECENT_MS = 3_600_000
-# Records older than this are pruned.
+# Records older than this are pruned, checked at most this often.
 RETENTION_MS = 7 * 86_400_000
+PRUNE_INTERVAL_MS = 60_000
 FORWARDED_SIGNALS = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
 
 
@@ -75,33 +76,34 @@ def run(argv: list[str], label: str | None, session_id: str | None, agent_id: st
         _report("managed_start", start)
         _, status, usage = os.wait4(child.pid, 0)
         child.returncode = code = os.waitstatus_to_exitcode(status)
+        # Keep forwarding until the evidence is saved: an interrupt now must not lose it.
+        try:
+            os.killpg(child.pid, 0)
+            survivors = True  # Something else in the command's group outlived it.
+        except ProcessLookupError:
+            survivors = False
+        except PermissionError:
+            survivors = True
+        finish = {"managed_id": managed_id, "finished_at": _now(),
+                  "elapsed_ms": int((time.monotonic() - started) * 1000),
+                  "exit_code": code if code >= 0 else None, "signal": -code if code < 0 else None,
+                  # Largest single process among the command and its reaped descendants.
+                  # ru_maxrss is kilobytes on Linux and bytes on macOS.
+                  "max_process_rss_bytes": usage.ru_maxrss * (1024 if sys.platform == "linux" else 1),
+                  "group_outlived": survivors, "start": start}
+        if not _report("managed_finish", finish):
+            try:
+                # Evidence must survive a daemon that is down; the daemon reads it later.
+                directory = completion_directory(Path(state))
+                directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+                temporary = directory / f"{managed_id}.tmp"
+                temporary.write_text(json.dumps(finish))
+                temporary.replace(directory / f"{managed_id}.json")
+            except OSError as error:
+                print(f"Agent Router could not keep completion evidence: {error}", file=sys.stderr)
     finally:
         for signum, handler in previous.items():
             signal.signal(signum, handler)
-    try:
-        os.killpg(child.pid, 0)
-        survivors = True  # Something else in the command's group outlived it.
-    except ProcessLookupError:
-        survivors = False
-    except PermissionError:
-        survivors = True
-    finish = {"managed_id": managed_id, "finished_at": _now(),
-              "elapsed_ms": int((time.monotonic() - started) * 1000),
-              "exit_code": code if code >= 0 else None, "signal": -code if code < 0 else None,
-              # Largest single process among the command and its reaped descendants.
-              # ru_maxrss is kilobytes on Linux and bytes on macOS.
-              "max_process_rss_bytes": usage.ru_maxrss * (1024 if sys.platform == "linux" else 1),
-              "group_outlived": survivors, "start": start}
-    if not _report("managed_finish", finish):
-        try:
-            # Evidence must survive a daemon that is down; the daemon reads it later.
-            directory = completion_directory(Path(state))
-            directory.mkdir(mode=0o700, parents=True, exist_ok=True)
-            temporary = directory / f"{managed_id}.tmp"
-            temporary.write_text(json.dumps(finish))
-            temporary.replace(directory / f"{managed_id}.json")
-        except OSError as error:
-            print(f"Agent Router could not keep completion evidence: {error}", file=sys.stderr)
     return code if code >= 0 else 128 - code
 
 
@@ -136,6 +138,8 @@ def _checked(payload: object, fields: dict[str, str]) -> dict:
     required = {key for key, kind in fields.items() if kind not in {"text", "path", "start"}} - {"exit_code", "signal"}
     if required - payload.keys():
         raise ValueError("Incomplete managed process evidence")
+    if fields is FINISH_FIELDS and (payload.get("exit_code") is None) == (payload.get("signal") is None):
+        raise ValueError("Managed process completion needs exactly one of exit_code and signal")
     checked = {}
     for key, value in payload.items():
         kind = fields[key]
@@ -164,6 +168,7 @@ class ManagedProcesses:
 
     def __init__(self, store, host_id: str, state: Path, identity=_identity):
         self.store, self.host_id, self.state, self.identity = store, host_id, Path(state), identity
+        self._pruned_at = 0
 
     def start(self, payload: dict) -> dict:
         record = {**_checked(payload, START_FIELDS), "host_id": self.host_id, "status": "running"}
@@ -206,16 +211,26 @@ class ManagedProcesses:
         with self.store.connect() as db:
             running = db.execute("""SELECT data FROM managed_processes
                     WHERE json_extract(data,'$.status')='running'""").fetchall()
-        if not files and not running:
+        now = _now()
+        if not files and not running and now - self._pruned_at < PRUNE_INTERVAL_MS:
             return
-        consumed = []
+        consumed, invalid = [], []
         with self.store.transaction() as db:
             for path in files:
                 try:
-                    self._finish(db, _checked(json.loads(path.read_text()), FINISH_FIELDS))
-                except (OSError, ValueError) as error:
-                    print(f"Agent Router ignored unreadable completion evidence {path.name}: {error}",
+                    evidence = json.loads(path.read_text())
+                except OSError:
+                    continue  # Kept for the next pass.
+                except ValueError:
+                    invalid.append(path)
+                    continue
+                try:
+                    self._finish(db, _checked(evidence, FINISH_FIELDS))
+                except ValueError as error:
+                    print(f"Agent Router set aside invalid completion evidence {path.name}: {error}",
                           file=sys.stderr)
+                    invalid.append(path)
+                    continue
                 consumed.append(path)
             for row in running:
                 record = json.loads(row[0])
@@ -236,8 +251,11 @@ class ManagedProcesses:
             db.execute("""DELETE FROM managed_processes WHERE json_extract(data,'$.status')!='running'
                     AND COALESCE(json_extract(data,'$.finished_at'), json_extract(data,'$.uncertain_at'),
                                  json_extract(data,'$.started_at')) < ?""", (_now() - RETENTION_MS,))
+        self._pruned_at = now
         for path in consumed:  # Only after the evidence is committed; replaying a file is harmless.
             path.unlink(missing_ok=True)
+        for path in invalid:  # Kept for inspection, out of the import path.
+            path.replace(path.with_suffix(".invalid"))
 
     def records(self, limit: int = 100) -> tuple[list[dict], int | None]:
         """Running and recently finished commands (running first), and the active count.
@@ -248,7 +266,7 @@ class ManagedProcesses:
         self.reconcile()
         cutoff = _now() - RECENT_MS
         hidden = {"wrapper_pid", "wrapper_identity", "uncertain_at"}
-        with self.store.connect() as db:
+        with self.store.snapshot() as db:  # The page and the count describe one database state.
             rows = [json.loads(row[0]) for row in db.execute("""SELECT data FROM managed_processes
                     WHERE json_extract(data,'$.status')='running'
                        OR COALESCE(json_extract(data,'$.finished_at'), json_extract(data,'$.uncertain_at'))>=?
