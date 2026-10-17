@@ -23,15 +23,20 @@ class ManagedCommandSmokeTest(unittest.TestCase):
         state.mkdir(mode=0o700)
         self.socket = root / "r.sock"
         self.environment = {key: value for key, value in os.environ.items() if not key.startswith("AGENT_ROUTER_")}
+        home = root / "home"
+        home.mkdir()
+        # Isolated from the developer's own Claude and Codex sessions; runnable from any directory.
         self.environment.update(AGENT_ROUTER_STATE_DIR=str(state), AGENT_ROUTER_SOCKET=str(self.socket),
-                                AGENT_ROUTER_ENV_FILE=str(root / "none.env"))
+                                AGENT_ROUTER_ENV_FILE=str(root / "none.env"), HOME=str(home),
+                                PYTHONPATH=str(Path(__file__).resolve().parent.parent))
         self.daemon = subprocess.Popen([sys.executable, "-m", "router.cli", "daemon", "start"], env=self.environment,
                                        stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
         self.addCleanup(self.stop_daemon)
         deadline = time.monotonic() + 30
-        while not self.socket.exists() and time.monotonic() < deadline:
+        while not self.socket.exists() and self.daemon.poll() is None and time.monotonic() < deadline:
             time.sleep(0.05)
-        self.assertTrue(self.socket.exists(), "daemon did not start")
+        if not self.socket.exists():
+            self.fail(f"daemon did not start: {self.daemon.stderr.read() if self.daemon.poll() is not None else ''}")
 
     def stop_daemon(self):
         if self.daemon.poll() is None:
@@ -78,10 +83,15 @@ class ProcessViewTests(unittest.TestCase):
                    {"managed_id": "managed-b", "label": "leaky", "status": "exited", "exit_code": 0,
                     "group_outlived": True, "finished_at": 2},
                    {"managed_id": "managed-c", "label": "fine", "status": "exited", "exit_code": 0, "finished_at": 3}]
-        found = alerts(host, {}, [], [], CapacityThresholds(), 100, 10, managed)
+        found = alerts(host, {}, [], [], CapacityThresholds(), 100, 10, [*managed, {"status": "failed"}])
         self.assertEqual(sorted((alert["kind"], alert["entity"]["managed_id"]) for alert in found),
                          [("managed_process_shutdown_uncertain", "managed-a"),
                           ("managed_process_shutdown_uncertain", "managed-b")])
+        # Many uncertain agents cannot crowd out a managed command's outcome.
+        agents = [{"source": "claude", "parent_session_id": "s", "agent_id": f"a{index}", "status": "unknown"}
+                  for index in range(200)]
+        crowded = alerts(host, {}, [], agents, CapacityThresholds(), 101, 10, managed)
+        self.assertEqual([alert["kind"] for alert in crowded[:2]], ["managed_process_shutdown_uncertain"] * 2)
         snapshot = {"capacity": {}, "sessions": [], "agents": [], "alerts": [], "managed_processes": managed,
                     "inferred_processes": [
                         {"pid": 1, "source": "claude", "session_id": "s", "cpu_pct": 12.5, "rss_bytes": 1024 ** 2},

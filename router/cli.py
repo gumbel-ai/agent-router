@@ -164,9 +164,11 @@ def _process_summary(snapshot: dict) -> list[str]:
 
 def _managed_activity(process: dict) -> str:
     if process.get("status") == "running":
-        return f"pid {process.get('pid')}"
+        return f"pid {process['pid']}" if process.get("pid") else "running"
     if process.get("status") == "unknown" or process.get("group_outlived"):
         return process.get("visibility_reason") or "outcome unknown"
+    if process.get("signal") is None and process.get("exit_code") is None:
+        return process.get("status") or "unknown"
     how = f"signal {process['signal']}" if process.get("signal") else f"exit {process.get('exit_code')}"
     elapsed = process.get("elapsed_ms")
     return how + (f" after {elapsed / 1000:.1f}s" if isinstance(elapsed, int) else "")

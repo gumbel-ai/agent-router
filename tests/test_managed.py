@@ -232,6 +232,13 @@ class ManagedRunTests(unittest.TestCase):
             with self.subTest(bad=bad), self.assertRaises(ValueError):
                 self.control.handle("managed_start", {**self.start_payload("managed-bad"), **bad})
 
+    def test_commands_needing_attention_are_listed_first(self):
+        self.assertEqual(self.run_command("raise SystemExit(1)", label="failed"), 1)
+        for index in range(3):
+            self.run_command("pass", label=f"ok-{index}")
+        records, _ = self.control.managed.records(1)
+        self.assertEqual([record["label"] for record in records], ["failed"])
+
     def test_labels_follow_fleet_text_sharing(self):
         self.run_command("pass", label="rotate key XYZ")
         self.control.settings = type(self.control.settings)(AGENT_ROUTER_FLEET_SHARE_TEXT="false")

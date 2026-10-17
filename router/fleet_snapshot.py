@@ -86,6 +86,22 @@ def alerts(host: dict, capacity: dict, sessions: list[dict], agents: list[dict],
     if len(result) >= limit:
         return result[:limit]
     host_id = host["host_id"]
+    # Managed outcomes come before per-session alerts so a burst of those cannot crowd them out.
+    for record in managed or []:
+        if not record.get("managed_id"):
+            continue
+        entity = {"managed_id": record["managed_id"]}
+        name = record.get("label") or record.get("executable") or record["managed_id"]
+        if record.get("status") in {"failed", "signaled"}:
+            how = (f"signal {record['signal']}" if record.get("signal") else f"exit code {record.get('exit_code')}")
+            result.append(_alert(host_id, "managed_process_failed", "warning", f"{name} ended with {how}",
+                                 entity, record.get("finished_at"), observed_at))
+        if record.get("status") == "unknown" or record.get("group_outlived"):
+            result.append(_alert(host_id, "managed_process_shutdown_uncertain", "warning",
+                                 record.get("visibility_reason") or f"{name} may still be running",
+                                 entity, record.get("uncertain_at") or record.get("finished_at"), observed_at))
+        if len(result) >= limit:
+            return result[:limit]
     for record in sessions + agents:
         entity = {key: record[key] for key in ("source", "session_id", "parent_session_id", "agent_id") if record.get(key)}
         if record.get("needs_input") or record.get("status") == "needs_input":
@@ -98,19 +114,6 @@ def alerts(host: dict, capacity: dict, sessions: list[dict], agents: list[dict],
                                  entity, record.get("last_event_at"), observed_at))
             if len(result) >= limit:
                 return result
-    for record in managed or []:
-        entity = {"managed_id": record["managed_id"]}
-        name = record.get("label") or record.get("executable") or record["managed_id"]
-        if record.get("status") in {"failed", "signaled"}:
-            how = (f"signal {record['signal']}" if record.get("signal") else f"exit code {record.get('exit_code')}")
-            result.append(_alert(host_id, "managed_process_failed", "warning", f"{name} ended with {how}",
-                                 entity, record.get("finished_at"), observed_at))
-        if record.get("status") == "unknown" or record.get("group_outlived"):
-            result.append(_alert(host_id, "managed_process_shutdown_uncertain", "warning",
-                                 record.get("visibility_reason") or f"{name} may still be running",
-                                 entity, record.get("finished_at") or record.get("started_at"), observed_at))
-        if len(result) >= limit:
-            return result[:limit]
     return result
 
 
