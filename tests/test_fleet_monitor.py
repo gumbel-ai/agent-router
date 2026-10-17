@@ -1126,22 +1126,18 @@ class SnapshotAndFleetTests(unittest.TestCase):
             with self.subTest(name=name), self.assertRaisesRegex(ValueError, "unsafe"):
                 _validate_snapshot(json.dumps(unsafe).encode())
 
-        for usage in ({"input_tokens": 2**63},
-                      {"input_tokens": 2**62, "output_tokens": 2**62}):
-            malformed = snapshot()
-            malformed["agents"][0].update(usage=usage, usage_source="transcript",
-                                           usage_partial=False)
-            projected = _validate_snapshot(json.dumps(malformed).encode())
-            agent = projected["agents"][0]
-            self.assertTrue(projected["partial"])
-            self.assertTrue(agent["usage_partial"])
-            self.assertIsNone(agent["usage"])
-            self.assertEqual(agent["usage_source"], "unavailable")
+        # Native usage and cost moved to Langfuse: an older peer still sending them is
+        # projected without them and is not marked partial for that reason.
+        older_peer = snapshot()
+        older_peer["agents"][0].update(usage={"input_tokens": 1}, cost=.5, cost_source="transcript",
+                                       models=["claude-opus"], usage_partial=False)
+        projected = _validate_snapshot(json.dumps(older_peer).encode())
+        self.assertFalse({"usage", "cost", "cost_source", "models", "usage_partial"} & projected["agents"][0].keys())
+        self.assertFalse(projected["partial"])
+        unknown = snapshot()
+        unknown["agents"][0]["future_field"] = 1
+        self.assertTrue(_validate_snapshot(json.dumps(unknown).encode())["partial"])
 
-        malformed = snapshot()
-        malformed["agents"][0]["usage"] = ["not", "a", "mapping"]
-        with self.assertRaisesRegex(ValueError, "invalid agents usage"):
-            _validate_snapshot(json.dumps(malformed).encode())
 
     def test_projection_preserves_producer_fields_and_reports_safe_transformations(self):
         value = snapshot()
@@ -1150,14 +1146,10 @@ class SnapshotAndFleetTests(unittest.TestCase):
             "task_id": "task", "status": "created", "subject": "x" * 501,
             "created_at": 0, "last_event_at": 0,
         }]
-        value["agents"][0].update(
-            price_overrides_used=["MODEL_RATE"],
-            transcript_error="read failed \x1b[31mhere",
-        )
+        value["agents"][0].update(activity="Edit \x1b[31mnow")
         projected = _validate_snapshot(json.dumps(value).encode())
         self.assertEqual(len(projected["tasks"][0]["subject"]), 500)
-        self.assertEqual(projected["agents"][0]["price_overrides_used"], ["MODEL_RATE"])
-        self.assertEqual(projected["agents"][0]["transcript_error"], "read failed here")
+        self.assertEqual(projected["agents"][0]["activity"], "Edit now")
         self.assertTrue(projected["partial"])
         self.assertIn("changed for output safety", projected["errors"]["tasks"])
         self.assertIn("changed for output safety", projected["errors"]["agents"])
@@ -1229,10 +1221,6 @@ class SnapshotAndFleetTests(unittest.TestCase):
                          "1 unrecognized error section(s) omitted")
         self.assertNotIn("swordfish", json.dumps(projected))
 
-        too_many_models = snapshot()
-        too_many_models["agents"][0]["models"] = [f"model-{index}" for index in range(65)]
-        with self.assertRaisesRegex(ValueError, "too many agents models"):
-            _validate_snapshot(json.dumps(too_many_models).encode())
         too_many_reasons = snapshot()
         too_many_reasons["capacity"]["capacity_reasons"] = ["reason"] * 33
         with self.assertRaisesRegex(ValueError, "capacity_reasons"):

@@ -144,7 +144,7 @@ class Controller:
         with self.store.transaction() as db:
             db.execute("INSERT INTO hosts(host_id,data) VALUES(?,?) ON CONFLICT(host_id) DO UPDATE SET data=excluded.data",
                        (self.host.host_id, canonical(self.host.view(now_ms()))))
-        self.native = NativeObserver(self.store, settings.model_prices, self.host.host_id)
+        self.native = NativeObserver(self.store, self.host.host_id)
         self.sessions = SessionObserver(self.store, self.host.host_id)
         self.capacity = CapacitySampler(self.directory)
         self.alert_history = AlertHistory()

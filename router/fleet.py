@@ -237,11 +237,20 @@ def _wire_identity(value: object, name: str, limit: int = MAX_IDENTITY_LENGTH,
     return projected
 
 
+# Native usage and cost moved to Langfuse. Peers on older versions still send these;
+# drop them quietly rather than flagging every such snapshot as partial.
+RETIRED_AGENT_FIELDS = frozenset({
+    "models", "cost", "cost_source", "cost_note", "usage", "usage_source", "price_date",
+    "price_source", "price_overrides_used", "usage_partial", "transcript_pending", "transcript_error",
+})
+
+
 def _project_record(record: dict, allowed: frozenset[str], required: tuple[str, ...],
                     collection: str, host_id: str) -> dict:
     projected = {}
     changed = 0
-    omitted = len(set(record) - allowed)
+    retired = RETIRED_AGENT_FIELDS if collection == "agents" else frozenset()
+    omitted = len(set(record) - allowed - retired)
     identity_fields = {
         "host_id", "source", "session_id", "parent_session_id", "agent_id",
         "parent_agent_id", "task_id", "managed_id",
@@ -250,24 +259,21 @@ def _project_record(record: dict, allowed: frozenset[str], required: tuple[str, 
         "host_id", "source", "session_id", "parent_session_id", "agent_id", "parent_agent_id", "task_id",
         "status", "cwd", "model", "coordinator_role", "visibility_reason", "activity",
         "last_event", "task", "agent_type", "requested_model", "resolved_model", "model_source",
-        "executor", "owner", "control_mode", "cost_source", "cost_note", "usage_source",
-        "price_source", "price_date", "subject", "teammate_name", "failure_reason", "label", "command",
-        "worktree", "last_observed_status", "managed_id", "transcript_error",
+        "executor", "owner", "control_mode", "subject", "teammate_name", "failure_reason", "label",
+        "command", "worktree", "last_observed_status", "managed_id",
     }
     positive_integer_fields = {"pid", "pgid"}
     nonnegative_integer_fields = {
         "started_at", "last_event_at", "finished_at", "duration_ms", "observation_age_ms",
         "elapsed_ms", "inflight_tool_count", "created_at", "completed_at",
     }
-    boolean_fields = {"needs_input", "runtime_partial", "usage_partial", "transcript_pending",
+    boolean_fields = {"needs_input", "runtime_partial",
                       "tool_visibility_partial"}
-    number_fields = {"cost"}
-    usage_invalid = False
     for key in allowed & record.keys():
         value = record[key]
         if key in text_fields:
             limit = 2000 if key in {"cwd", "worktree"} else 500 if key in {
-                "visibility_reason", "cost_note", "failure_reason", "subject", "transcript_error",
+                "visibility_reason", "failure_reason", "subject",
             } else 240
             if key in identity_fields:
                 projected[key] = _wire_identity(
@@ -293,36 +299,6 @@ def _project_record(record: dict, allowed: frozenset[str], required: tuple[str, 
             if not isinstance(value, bool):
                 raise ValueError(f"Host snapshot has invalid {collection} {key}")
             projected[key] = value
-        elif key in number_fields:
-            if value is not None and (not _is_finite_number(value) or value < 0 or value > 1e12):
-                raise ValueError(f"Host snapshot has invalid {collection} {key}")
-            projected[key] = value
-        elif key == "usage" and value is None:
-            projected[key] = None
-        elif key == "usage" and isinstance(value, dict):
-            usage = {}
-            known_usage = {"input_tokens", "output_tokens", "cache_read_input_tokens",
-                           "cache_creation_input_tokens"}
-            omitted += len(set(value) - known_usage)
-            for name in known_usage:
-                if name not in value:
-                    continue
-                amount = value[name]
-                if (not isinstance(amount, int) or isinstance(amount, bool)
-                        or not 0 <= amount <= MAX_WIRE_INTEGER):
-                    usage_invalid = True
-                    continue
-                usage[name] = amount
-            if sum(usage.values()) > MAX_WIRE_INTEGER:
-                usage_invalid = True
-            projected[key] = None if usage_invalid else usage
-        elif key in {"models", "price_overrides_used"}:
-            if not isinstance(value, list) or any(not isinstance(item, str) for item in value):
-                raise ValueError(f"Host snapshot has invalid {collection} {key}")
-            if len(value) > 64:
-                raise ValueError(f"Host snapshot has too many {collection} {key} values")
-            projected[key] = [_wire_text(item, f"{collection} {key}", 240, True) for item in value]
-            changed += projected[key] != value
         else:
             raise ValueError(f"Host snapshot has invalid {collection} {key}")
     if any(not isinstance(projected.get(key), str) or not projected[key]
@@ -332,13 +308,6 @@ def _project_record(record: dict, allowed: frozenset[str], required: tuple[str, 
         raise ValueError(f"Host snapshot has unsafe {collection} identity")
     if projected.get("host_id") != host_id:
         raise ValueError(f"Host snapshot has mismatched {collection} host identity")
-    if usage_invalid:
-        projected.update(usage=None, usage_source="unavailable", usage_partial=True,
-                         _projection_partial=True)
-        if projected.get("cost_source") != "host_reported_estimate":
-            projected.update(cost=None, cost_source="unavailable",
-                             cost_note="Reported usage is invalid or exceeds the supported bound")
-        changed += 1
     projected["_projection_changes"] = changed
     projected["_projection_omissions"] = omitted
     return projected
@@ -503,12 +472,10 @@ def _validate_snapshot(payload: bytes) -> dict:
                                "observation_age_ms", "inflight_tool_count", "tool_visibility_partial"}),
         "agents": frozenset({"host_id", "source", "parent_session_id", "parent_agent_id", "agent_id",
                              "task_id", "executor", "owner", "control_mode", "task", "agent_type",
-                             "requested_model", "resolved_model", "models", "model_source", "status",
+                             "requested_model", "resolved_model", "model_source", "status",
                              "last_observed_status", "started_at", "finished_at", "duration_ms", "last_event_at",
-                             "runtime_partial", "cwd", "worktree", "activity", "cost", "cost_source",
-                             "cost_note", "usage", "usage_source", "price_date", "price_source",
-                             "price_overrides_used", "usage_partial", "transcript_pending",
-                             "transcript_error", "visibility_reason", "observation_age_ms", "elapsed_ms"}),
+                             "runtime_partial", "cwd", "worktree", "activity", "visibility_reason",
+                             "observation_age_ms", "elapsed_ms"}),
         "tasks": frozenset({"host_id", "source", "session_id", "task_id", "status", "created_at",
                             "last_event_at", "completed_at", "subject", "teammate_name", "agent_id"}),
         "managed_processes": frozenset({"host_id", "managed_id", "status", "label", "pid", "pgid",

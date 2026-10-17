@@ -152,7 +152,7 @@ class HookTests(TransportHarness, unittest.TestCase):
             observe({"hook_event_name": "SubagentStart", "session_id": "S", "agent_id": "A"})
         self.assertEqual(calls, ["lifecycle_observe", "observe"])
 
-    def test_observer_keeps_text_strips_controls_and_bounds_each_field(self):
+    def test_observer_keeps_labels_strips_controls_bounds_and_forwards_no_content(self):
         requests = []
 
         def send(operation, payload, timeout):
@@ -174,11 +174,10 @@ class HookTests(TransportHarness, unittest.TestCase):
         self.assertTrue(subject.startswith("Rotate keys for https://user:pw@host s"))
         self.assertEqual(len(subject), 500)
         self.assertEqual(len(requests[1]["native"]["task"]), 240)
-        summary = requests[2]["native"]["summary"]
-        self.assertTrue(summary.startswith("Done. Set API_KEY=example in .env m"))
-        self.assertEqual(len(summary), 800)
+        # Content stays with Langfuse: no assistant text, transcript path, or file path.
+        for request_payload in requests:
+            self.assertFalse({"summary", "transcript", "file_path", "cost"} & (request_payload["native"] or {}).keys())
         self.assertEqual(requests[3]["native"]["activity"], "Bash")
-        self.assertEqual(len(requests[3]["native"]["file_path"]), 2000)
         self.assertNotIn("\\u001b", json.dumps(requests))
 
     def test_observer_reports_only_terminal_lifecycle_failures(self):
