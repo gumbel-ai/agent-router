@@ -275,6 +275,7 @@ class SessionObserver:
                 self._reset_waiters(record, at)
                 self._reset_tools(record)
                 record["started_at"] = min(record["started_at"], at)
+                record["root_started_at"] = at  # Lets native agents tell resumed work from late events.
             elif kind == "session_end":
                 record.update(status="stopped", finished_at=at, activity=None, visibility_reason=None)
                 self._reset_waiters(record, MAX_WIRE_INTEGER)  # A finished session has no waiters.
@@ -496,7 +497,7 @@ class SessionObserver:
             "waiter_history_partial", "waiter_clear_floor", "waiter_evicted_at", "root_turn_open", "root_turn_at",
             "tool_reset_at", "tool_active_until", "tool_overflow_until", "tool_overflow_active",
             "active_tool_times", "tool_correlation_partial", "tool_correlation_partial_until",
-            "tool_terminal_floor", "tool_history_partial", "restart_uncertain_until",
+            "tool_terminal_floor", "tool_history_partial", "restart_uncertain_until", "root_started_at",
         }}
         result = sanitize_structure(result)
         clock_rollback = record["last_event_at"] > at

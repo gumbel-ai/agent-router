@@ -191,10 +191,13 @@ class NativeObserver:
             if source == "codex" and kind in live_kinds and session_ended_at >= 0:
                 # Async Codex hooks are stamped when they run, so an agent event can arrive after
                 # its session ended. Only a later root SessionStart (resume) makes it live again.
-                session_state = db.execute("""SELECT json_extract(data,'$.status') FROM sessions
+                session_state = db.execute("""SELECT json_extract(data,'$.status'),
+                        json_extract(data,'$.root_started_at') FROM sessions
                         WHERE host_id=? AND source=? AND session_id=?""",
                                            (self.host_id, source, session)).fetchone()
-                if session_state is None or session_state[0] == "stopped":
+                resumed_at = session_state[1] if session_state is not None else None
+                if (session_state is None or session_state[0] == "stopped"
+                        or isinstance(resumed_at, int) and at <= resumed_at):
                     at = min(at, session_ended_at)
                 elif (row and record["status"] == "stopped" and at > session_ended_at
                       and record.get("visibility_reason") == "Codex session ended"):
