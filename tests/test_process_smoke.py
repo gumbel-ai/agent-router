@@ -87,8 +87,17 @@ class ProcessViewTests(unittest.TestCase):
                         {"pid": 1, "source": "claude", "session_id": "s", "cpu_pct": 12.5, "rss_bytes": 1024 ** 2},
                         {"pid": 2, "source": "claude", "session_id": "s", "cpu_pct": None, "rss_bytes": 1024 ** 2}]}
         table = fleet_table({"hosts": [{"name": "here", "ok": True, "snapshot": snapshot}]})
-        self.assertIn("session processes: 2 in 1 session(s), CPU 12%, RSS 2.0M", table)
+        self.assertIn("session processes: 2 in 1 session(s), CPU 12% + 1 unmeasured, RSS 2.0M", table)
         self.assertIn("The router run wrapper", table)
+        # Only process evidence (another section failed): the summary still shows, CPU unknown until measured.
+        only = {"capacity": {}, "sessions": [], "agents": [], "alerts": [], "partial": True,
+                "errors": {"sessions": "failed"},
+                "inferred_processes": [{"pid": 3, "source": "codex", "session_id": "t", "cpu_pct": None,
+                                        "rss_bytes": 1024}]}
+        table = fleet_table({"hosts": [{"name": "here", "ok": True, "snapshot": only}]})
+        self.assertIn("session processes: 1 in 1 session(s), CPU unknown, RSS 1.0K", table)
+        measured_zero = {**only, "inferred_processes": [{**only["inferred_processes"][0], "cpu_pct": 0.0}]}
+        self.assertIn("CPU 0%, RSS", fleet_table({"hosts": [{"name": "h", "ok": True, "snapshot": measured_zero}]}))
 
 
 if __name__ == "__main__":

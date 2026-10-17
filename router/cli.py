@@ -148,6 +148,20 @@ def _router_task_activity(task: dict) -> str:
     return task.get("activity") or task.get("failure_reason") or "—"
 
 
+def _process_summary(snapshot: dict) -> list[str]:
+    inferred = snapshot.get("inferred_processes", [])
+    if not inferred:
+        return []
+    measured = [process["cpu_pct"] for process in inferred if isinstance(process.get("cpu_pct"), (int, float))]
+    unmeasured = len(inferred) - len(measured)
+    # A process without a CPU baseline yet is unknown, not idle.
+    cpu = ("CPU unknown" if not measured else f"CPU {sum(measured):.0f}%"
+           + (f" + {unmeasured} unmeasured" if unmeasured else ""))
+    rss = _size(sum(process.get("rss_bytes") or 0 for process in inferred))
+    sessions = len({(process.get("source"), process.get("session_id")) for process in inferred})
+    return [f"{'':<10} session processes: {len(inferred)} in {sessions} session(s), {cpu}, RSS {rss}"]
+
+
 def _managed_activity(process: dict) -> str:
     if process.get("status") == "running":
         return f"pid {process.get('pid')}"
@@ -188,6 +202,7 @@ def fleet_table(result: dict, capacity_only: bool = False) -> str:
         if not sessions and not agents and not router_tasks and not managed:
             activity = "partial snapshot" if partial_lines else "no active sessions"
             lines.append(f"{name:<10} {state:<10} {'—':<20} {'—':<20} {'—':<12} {activity:<24} {cpu:<6} {load:<6} {memory:<8} {disk}")
+            lines.extend(_process_summary(snapshot))
             lines.extend(partial_lines)
             lines.extend(_fleet_alert_lines(record, snapshot))
             continue
@@ -225,13 +240,7 @@ def fleet_table(result: dict, capacity_only: bool = False) -> str:
                          f"{_cell(_managed_activity(process), 24):<24} "
                          f"{cpu if first else '—':<6} {load if first else '—':<6} "
                          f"{memory if first else '—':<8} {disk if first else '—'}")
-        inferred = snapshot.get("inferred_processes", [])
-        if inferred:
-            cpu_total = sum(process.get("cpu_pct") or 0 for process in inferred)
-            rss_total = sum(process.get("rss_bytes") or 0 for process in inferred)
-            sessions_seen = len({(process.get("source"), process.get("session_id")) for process in inferred})
-            lines.append(f"{'':<10} session processes: {len(inferred)} in {sessions_seen} session(s), "
-                         f"CPU {cpu_total:.0f}%, RSS {_size(rss_total)}")
+        lines.extend(_process_summary(snapshot))
         lines.extend(partial_lines)
         lines.extend(_fleet_alert_lines(record, snapshot))
     return "\n".join(lines)
