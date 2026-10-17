@@ -143,6 +143,11 @@ the current implementation.
 - When a change makes an existing test redundant, remove or merge it in the same change.
 - If a race cannot be reproduced deterministically, do not add a sleep-based "stress"
   test that passes either way. Document the reasoning in the review reply instead.
+- Compute fixture boundaries from the data (for example
+  `text[:text.index(secret) + 4]`), never from hand-counted offsets. A miscounted
+  slice can silently test a different case, such as a terminated value instead of a
+  truncated one.
+- Make the marker you assert against unique. `"swor"` also matches `"password"`.
 
 ### 5b. Keep tests deterministic
 
@@ -220,8 +225,11 @@ Fixes are new code and receive the same review as the original change.
   boundary matrix for that dimension.
 - Never drop a "suspected but not reproduced" finding silently. Fix it, or record why
   it cannot occur.
-- When a finding names one instance (one token prefix, one event kind, one field),
-  search for and fix the whole family before replying.
+- When a finding names one instance (one token prefix, one event kind, one field, one
+  nesting depth), search for and fix the whole family before replying. Write the family
+  down (for example "escaping at depth N") and test across it.
+- A finding in a fix you just pushed means the previous re-review missed it. Add the
+  missed check to [Known Defect Patterns](#known-defect-patterns) in the same change.
 
 ## Known Defect Patterns
 
@@ -238,6 +246,9 @@ item before requesting review.
   as `Authorization` and `Cookie` are credential keys too.
 - Cover a vendor's whole token family, not one prefix (for example
   `ghp_`/`gho_`/`ghu_`/`ghs_`/`ghr_`/`github_pat_`).
+- Generalize over repetition, not the observed instance. Escaping nests to any depth
+  (`json.dumps` applied N times), so a fix for one level is incomplete. Test depths 1
+  through 4, inner quotes, trailing backslashes, and values truncated mid-secret.
 - A value that fails a safety check should degrade only that value. For example, a
   token-like path segment must not reject the whole lifecycle event.
 
@@ -276,6 +287,19 @@ item before requesting review.
   upgrade them, and test the upgrade from the previously pushed format. This applies
   even before merge, because a pushed branch may already be running.
 
+**Files read while they change**
+
+- A `stat` taken after reading can describe newer content than the bytes read. Cache the
+  metadata observed before verification and reading. If size or mtime changed across
+  the read, report the result as incomplete rather than caching it as complete.
+
+**Native interfaces**
+
+- Size every ctypes output parameter from the C header, not by assumption. For example,
+  `vm_size_t` is pointer-sized (`c_size_t`), not `c_uint32`. A mismatch writes past the
+  buffer silently. Verify FFI calls against the operating system's own tool output
+  (such as `sysctl`).
+
 **Concurrency and processes**
 
 - Never `clear()` and then refill a shared object that another thread may read. Publish
@@ -285,6 +309,13 @@ item before requesting review.
 
 **Parsing and cost**
 
+- Bound every regex quantifier that runs on untrusted text, and keep a match from
+  starting inside a run it would immediately re-scan. An unbounded `\\*` before an
+  optional quote made redaction quadratic (13 s for 20k backslashes) on hook and peer
+  input. Time each changed pattern on 1 MB of its worst-case character.
+- When you narrow a pattern for speed, rerun its previous positive cases. A lookbehind
+  that blocked starts after any backslash silently stopped redacting
+  `C:\password=...`.
 - Parsers of untrusted JSON must catch `RecursionError` alongside `ValueError`.
 - Verification on hot paths (for example, per-status transcript refresh) must
   short-circuit when inputs are unchanged. Measure the cost on large inputs.
