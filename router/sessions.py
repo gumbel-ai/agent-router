@@ -19,6 +19,14 @@ MAX_INFLIGHT_AGE_MS = 86_400_000
 MAX_DISPLAYED_INFLIGHT_TOOLS = 64
 MAX_EXACT_INFLIGHT_TOOLS = 1024
 UNKNOWN_WAITER = "__session__"
+WAITING_NOTIFICATIONS = frozenset({
+    "permission_prompt", "idle_prompt", "agent_needs_input", "elicitation_dialog", "elicitation_url_dialog",
+})
+WAITER_CLEARING_KINDS = frozenset({
+    "tool_start", "tool_end", "tool_failure", "task_created", "task_completed", "subagent_start", "subagent_stop",
+})
+MAX_WAITER_HISTORY = 256
+WAITING_REASON = "Claude is waiting for input"
 
 
 class SessionObserver:
@@ -40,6 +48,7 @@ class SessionObserver:
                     record.update(status="unknown", needs_input=False,
                                   visibility_reason="Router restarted; awaiting session lifecycle evidence",
                                   inflight_tools=[], tool_event_at={}, tool_finished_at={}, waiting_agents=[],
+                                  waiters={},
                                   tool_active_until=None, tool_overflow_until=None,
                                   active_tool_times={}, tool_correlation_partial=False,
                                   tool_correlation_partial_until=None,
@@ -102,12 +111,64 @@ class SessionObserver:
         return active
 
     @staticmethod
-    def _clear_waiter(record: dict, event: dict) -> bool:
-        waiting = set(record.get("waiting_agents", []))
+    def _waiters(record: dict) -> dict[str, int]:
+        """Waiting agents and when each began waiting (older rows stored a bare list)."""
+        stored = record.get("waiters")
+        if isinstance(stored, dict):
+            return {key: value for key, value in stored.items() if isinstance(key, str) and is_wire_integer(value)}
+        legacy = record.get("waiting_agents", [])
+        at = record.get("last_event_at", 0)
+        return {agent: at for agent in legacy if isinstance(agent, str)} if isinstance(legacy, list) else {}
+
+    @staticmethod
+    def _observe_waiter(record: dict, event: dict, kind: str, at: int) -> bool:
+        """Order waiting state per agent, independently of the session's latest event.
+
+        A needs-input notification adds its agent; that agent's later completion,
+        tool, task, or subagent event removes only that agent. Each is ordered
+        against the agent's own timestamps, so a delayed completion for one agent
+        is applied even after another agent produced newer events.
+        """
+        notification = safe_text(event.get("notification_type"), 240) if kind == "notification" else None
+        adds = notification in WAITING_NOTIFICATIONS
+        clears = (kind in WAITER_CLEARING_KINDS
+                  or (kind == "notification" and notification == "agent_completed"))
+        if not adds and not clears:
+            return False
         agent = event.get("agent_id")
-        waiting.discard(identifier(agent, "agent_id") if agent is not None else UNKNOWN_WAITER)
-        record["waiting_agents"] = sorted(waiting)
-        return bool(waiting)
+        key = identifier(agent, "agent_id") if agent is not None else UNKNOWN_WAITER
+        waiters = SessionObserver._waiters(record)
+        cleared = {name: value for name, value in (record.get("waiter_cleared_at") or {}).items()
+                   if isinstance(name, str) and is_wire_integer(value)}
+        before = (dict(waiters), dict(cleared), record.get("waiter_clear_floor", -1))
+        floor = record.get("waiter_clear_floor", -1)
+        # Ties keep arrival order, as the rest of the session lifecycle does. A notice at
+        # or before the eviction floor cannot be ordered against a forgotten completion.
+        if (adds and at >= cleared.get(key, -1) and at >= record.get("tool_reset_at", -1)
+                and (key in cleared or at > floor)):
+            waiters[key] = max(waiters.get(key, -1), at)
+        elif clears:
+            if at >= waiters.get(key, -1):
+                waiters.pop(key, None)
+            cleared[key] = max(cleared.get(key, -1), at)
+            if len(cleared) > MAX_WAITER_HISTORY:
+                kept = sorted(cleared.items(), key=lambda item: item[1])
+                floor = max(floor, max(value for _, value in kept[:-MAX_WAITER_HISTORY]))
+                cleared = dict(kept[-MAX_WAITER_HISTORY:])
+        record.update(waiters=waiters, waiting_agents=sorted(waiters), needs_input=bool(waiters),
+                      waiter_cleared_at=cleared, waiter_clear_floor=floor)
+        # Completion history is evidence even when no waiter changed; persist it too.
+        return (waiters, cleared, floor) != before
+
+    @staticmethod
+    def _reset_waiters(record: dict, at: int) -> None:
+        waiters = {key: value for key, value in SessionObserver._waiters(record).items() if value > at}
+        # Notices at or before a reset are rejected by the reset itself, so completion
+        # history older than it is no longer needed.
+        cleared = {key: value for key, value in (record.get("waiter_cleared_at") or {}).items()
+                   if is_wire_integer(value) and value > at}
+        record.update(waiters=waiters, waiting_agents=sorted(waiters), needs_input=bool(waiters),
+                      waiter_cleared_at=cleared)
 
     def observe(self, event: dict, timeout: float = 10) -> dict:
         source = event.get("source")
@@ -127,8 +188,13 @@ class SessionObserver:
             if record["status"] == "stopped" and (kind != "session_start" or at <= record["last_event_at"]):
                 return self.view(record, max(now_ms(), at))
             tool_changed, tool_state_evidence = self._observe_tool(record, event, at)
+            waiter_changed = self._observe_waiter(record, event, kind, at)
+            evidence_changed = tool_changed or waiter_changed
+            if waiter_changed and record.get("visibility_reason") in {None, WAITING_REASON}:
+                # Keep the reason consistent with the waiters whatever the arrival order.
+                record["visibility_reason"] = WAITING_REASON if record["needs_input"] else None
             if at < record["last_event_at"]:
-                if tool_changed:
+                if evidence_changed:
                     self._put_session(db, record)
                 return self.view(record, max(now_ms(), at))
             if kind in {"tool_end", "tool_failure"} and not tool_state_evidence:
@@ -136,17 +202,17 @@ class SessionObserver:
                 # it prevents a delayed start for the same tool from becoming live.
                 # It is not evidence that the session resumed after a prompt/stop
                 # reset, and must not refresh session liveness.
-                if tool_changed:
+                if evidence_changed:
                     self._put_session(db, record)
                 return self.view(record, max(now_ms(), at))
-            if kind == "tool_start" and not tool_state_evidence:
-                return self.view(record, max(now_ms(), at))
-            if (at == record["last_event_at"] and record.get("last_event") == "session_end"
-                    and kind != "session_end"):
-                return self.view(record, max(now_ms(), at))
-            if (at == record["last_event_at"] and record.get("last_event") in {"stop", "stop_failure"}
+            if (kind == "tool_start" and not tool_state_evidence
+                    or at == record["last_event_at"] and record.get("last_event") == "session_end"
+                    and kind != "session_end"
+                    # A same-time tie must not reopen a turn that already ended.
+                    or at == record["last_event_at"] and record.get("last_event") in {"stop", "stop_failure"}
                     and kind in {"task_created", "task_completed", "subagent_start", "subagent_stop"}):
-                # A same-time tie must not reopen a turn that already ended.
+                if waiter_changed:
+                    self._put_session(db, record)
                 return self.view(record, max(now_ms(), at))
             record["last_event_at"] = at
             record["last_event"] = kind
@@ -158,61 +224,61 @@ class SessionObserver:
                 record["parent_session_id"] = identifier(event["parent_session_id"], "parent_session_id")
             if kind == "session_start":
                 record.update(status="running", finished_at=None, visibility_reason=None,
-                              activity="session " + (safe_text(event.get("start_source"), 240) or "start"),
-                              needs_input=False, waiting_agents=[])
+                              activity="session " + (safe_text(event.get("start_source"), 240) or "start"))
+                self._reset_waiters(record, at)
                 self._reset_tools(record)
                 record["started_at"] = min(record["started_at"], at)
             elif kind == "session_end":
-                record.update(status="stopped", finished_at=at, activity=None, needs_input=False,
-                              visibility_reason=None, waiting_agents=[])
+                record.update(status="stopped", finished_at=at, activity=None, visibility_reason=None)
+                self._reset_waiters(record, MAX_WIRE_INTEGER)  # A finished session has no waiters.
                 self._reset_tools(record)
             elif kind in {"tool_start", "tool_end", "tool_failure"}:
-                waiting = self._clear_waiter(record, event)
+                waiting = record["needs_input"]
                 reason = ("Inflight tool correlation exceeded the exact tracking bound"
                           if record.get("tool_correlation_partial") else
                           "Tool correlation history exceeded the 128-completion bound"
                           if record.get("tool_history_partial") else
-                          "Claude is waiting for input" if waiting else None)
+                          WAITING_REASON if waiting else None)
                 record.update(status="running", finished_at=None, activity=safe_text(event.get("activity"), 240) or kind,
                               needs_input=waiting,
                               visibility_reason=reason)
             elif kind == "prompt":
-                record.update(status="running", finished_at=None, activity=kind, needs_input=False,
-                              visibility_reason=None, waiting_agents=[])
+                record.update(status="running", finished_at=None, activity=kind, visibility_reason=None)
+                self._reset_waiters(record, at)
                 self._reset_tools(record)
             elif kind in {"task_created", "task_completed",
                           "subagent_start", "subagent_stop"}:
                 activity = safe_text(event.get("activity"), 240) or kind
-                waiting = self._clear_waiter(record, event)
+                waiting = record["needs_input"]
                 record.update(status="running", finished_at=None, activity=activity, needs_input=waiting,
-                              visibility_reason="Claude is waiting for input" if waiting else None)
+                              visibility_reason=WAITING_REASON if waiting else None)
             elif kind == "stop":
                 background = event.get("background_tasks")
                 live = isinstance(background, list) and any(isinstance(item, dict) and item.get("status") not in {"completed", "failed", "stopped"} for item in background)
                 record.update(status="running" if live else "idle", activity="background task" if live else None,
-                              needs_input=False, visibility_reason=None, waiting_agents=[])
+                              visibility_reason=None)
+                self._reset_waiters(record, at)
                 self._reset_tools(record)
             elif kind == "stop_failure":
-                record.update(status="idle", activity="StopFailure", needs_input=False,
-                              visibility_reason="Claude reported that the turn failed", waiting_agents=[])
+                record.update(status="idle", activity="StopFailure",
+                              visibility_reason="Claude reported that the turn failed")
+                self._reset_waiters(record, at)
                 self._reset_tools(record)
             elif kind == "notification":
                 notification = safe_text(event.get("notification_type"), 240) or "notification"
-                needs_input = notification in {"permission_prompt", "idle_prompt", "agent_needs_input", "elicitation_dialog", "elicitation_url_dialog"}
-                if needs_input:
-                    waiting = set(record.get("waiting_agents", []))
-                    agent = event.get("agent_id")
-                    waiting.add(identifier(agent, "agent_id") if agent is not None else UNKNOWN_WAITER)
-                    record.update(status="idle", needs_input=True, waiting_agents=sorted(waiting), activity=notification,
-                                  visibility_reason="Claude is waiting for input")
+                needs_input = notification in WAITING_NOTIFICATIONS
+                if needs_input and record["needs_input"]:
+                    record.update(status="idle", activity=notification, visibility_reason=WAITING_REASON)
+                elif needs_input:
+                    record["activity"] = notification  # Superseded by a newer completion or reset.
                 elif notification == "agent_completed":
-                    waiting = self._clear_waiter(record, event)
+                    waiting = record["needs_input"]
                     live_tool = self._has_active_tool(record, at)
                     reason = ("Inflight tool correlation exceeded the exact tracking bound"
                               if record.get("tool_correlation_partial") else
                               "Tool correlation history exceeded the 128-completion bound"
                               if record.get("tool_history_partial") else
-                              "Claude is waiting for input" if waiting else None)
+                              WAITING_REASON if waiting else None)
                     record.update(status="running" if live_tool else "idle", needs_input=waiting,
                                   activity=(record.get("activity") if live_tool else notification),
                                   visibility_reason=reason)
@@ -366,7 +432,8 @@ class SessionObserver:
         at = now_ms() if at is None else at
         age = max(0, at - record["last_event_at"])
         result = {key: value for key, value in record.items() if key not in {
-            "inflight_tools", "tool_event_at", "tool_finished_at", "waiting_agents",
+            "inflight_tools", "tool_event_at", "tool_finished_at", "waiting_agents", "waiters", "waiter_cleared_at",
+            "waiter_clear_floor",
             "tool_reset_at", "tool_active_until", "tool_overflow_until", "tool_overflow_active",
             "active_tool_times", "tool_correlation_partial", "tool_correlation_partial_until",
             "tool_terminal_floor", "tool_history_partial", "restart_uncertain_until",

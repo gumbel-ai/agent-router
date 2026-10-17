@@ -482,6 +482,64 @@ class SessionAndCapacityTests(unittest.TestCase):
             self.assertEqual(self.observer.sessions()[0]["status"], "unknown")
             self.assertEqual(native.snapshot()[0]["status"], "unknown")
 
+    def test_waiting_state_is_ordered_per_agent_not_per_session(self):
+        def notice(agent, offset, kind="agent_needs_input"):
+            return self.event("notification", observed_at=self.now + offset, notification_type=kind, agent_id=agent)
+
+        cases = {
+            # The deferred PR #4 finding: a delayed completion for A arrives after B's newer notice.
+            "delayed completion for another agent": (
+                [("A", 1, "agent_needs_input"), ("B", 3, "agent_needs_input"),
+                 ("A", 2, "agent_completed"), ("B", 4, "agent_completed")], False),
+            "delayed completion older than the same agent's newer notice": (
+                [("A", 5, "agent_needs_input"), ("A", 2, "agent_completed")], True),
+            "delayed notice older than the agent's completion": (
+                [("A", 4, "agent_completed"), ("A", 2, "agent_needs_input")], False),
+            # A completion that clears nothing is still evidence and must be kept.
+            "completion recorded before its notice arrives": (
+                [("B", 4, "agent_completed"), ("A", 3, "agent_completed"), ("A", 2, "agent_needs_input")], False),
+            # A delayed notice must set the waiting reason as an in-order one would.
+            "delayed session-level notice": ([("A", 10, "agent_completed"), (None, 5, "permission_prompt")], True),
+        }
+        for name, (events, waiting) in cases.items():
+            with self.subTest(name):
+                self.store = Store(Path(tempfile.mkdtemp(dir=self.temp.name)) / "router.sqlite3", "host")
+                self.observer = SessionObserver(self.store, "host")
+                self.event("session_start")
+                for agent, offset, kind in events:
+                    result = notice(agent, offset, kind)
+                self.assertEqual(result["needs_input"], waiting)
+                session = self.observer.sessions()[0]
+                self.assertEqual(session["needs_input"], waiting)
+                self.assertEqual(session["visibility_reason"] == "Claude is waiting for input", waiting)
+                self.assertEqual(self.observer.fleet_records(10)[1], 1 if waiting else 0)
+
+    def test_waiter_history_eviction_cannot_resurrect_a_completed_agent(self):
+        for others, waiting in ((255, False), (256, False)):
+            with self.subTest(others=others):
+                self.store = Store(Path(tempfile.mkdtemp(dir=self.temp.name)) / "router.sqlite3", "host")
+                self.observer = SessionObserver(self.store, "host")
+                self.event("session_start")
+                self.event("notification", observed_at=self.now + 10, notification_type="agent_needs_input", agent_id="X")
+                self.event("notification", observed_at=self.now + 20, notification_type="agent_completed", agent_id="X")
+                for index in range(others):  # 256 others evict X's completion from the bounded history.
+                    self.event("subagent_start", observed_at=self.now + 30 + index, agent_id=f"Y{index}")
+                late = self.event("notification", observed_at=self.now + 15,
+                                  notification_type="agent_needs_input", agent_id="X")
+                self.assertEqual(late["needs_input"], waiting)
+
+    def test_legacy_waiting_list_is_still_cleared_per_agent(self):
+        self.event("session_start")
+        with self.store.transaction() as db:
+            record = self.observer._session(db, "claude", "S", self.now)
+            record.pop("waiters", None)
+            record.update(waiting_agents=["A", "B"], needs_input=True)
+            self.observer._put_session(db, record)
+        one_left = self.event("notification", observed_at=self.now + 1, notification_type="agent_completed", agent_id="A")
+        self.assertTrue(one_left["needs_input"])  # B, migrated from the legacy list, still waits.
+        none_left = self.event("notification", observed_at=self.now + 2, notification_type="agent_completed", agent_id="B")
+        self.assertFalse(none_left["needs_input"])
+
     def test_agent_completion_clears_only_the_matching_waiting_state(self):
         self.event("session_start")
         self.event("notification", observed_at=self.now + 1, notification_type="agent_needs_input", agent_id="A")

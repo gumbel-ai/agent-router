@@ -44,9 +44,8 @@ build it in Router.
 
 ## 1. Codex lifecycle audit (no product code)
 
-**Why:** The first target project switches between Claude Code and Codex. The shared
-lifecycle model (item 3) must be designed with Codex's events in view, not only
-Claude's.
+**Why:** The first target project switches between Claude Code and Codex. Lifecycle
+handling must be designed with Codex's events in view, not only Claude's.
 
 **Scope:**
 - Pin a Codex CLI version (installed: 0.162.1) and document its lifecycle surface:
@@ -94,26 +93,28 @@ duplicate Langfuse and cause most of the complexity in `router/native.py`
 output includes native usage, cost, summaries, or file lists, for new or legacy rows;
 old databases still open and read; CI green.
 
-## 3. Lifecycle as an explicit transition table
+## 3. Per-agent ordering for waiting state
 
-**Why:** Session and agent ordering is spread across many watermarks and flags, and
-review rounds kept finding gaps there. A deferred PR #4 finding remains: waiting state
-must be ordered per agent, not per session (session-wide ordering currently rejects an
-older event before waiter handling, `router/sessions.py`).
+**Why:** A deferred PR #4 finding: waiting-for-input state was ordered per session, so a
+delayed completion for one agent was dropped once another agent produced a newer event,
+leaving the first agent falsely waiting.
 
-**Scope:**
-- One explicit transition table for sessions and agents, shared by both observers and
-  by both sources (Claude, and Codex per item 1), with terminal, restart, and
-  same-time rules written once.
-- Keep per-tool and per-agent evidence alongside the table. A single
-  state/event/timestamp tuple cannot represent independent waiters or concurrent tools.
-- Fix the deferred per-agent waiting finding.
-- Table-driven tests that enumerate event orderings against a small reference model,
-  while keeping meaningful production-path regressions.
+**Scope:** Track waiters per agent with their own timestamps and apply waiter updates
+before the session-wide staleness check, keeping the existing reset boundaries and
+arrival order at exact ties. Migrate rows that stored waiters as a list.
 
-**Done when:** both observers delegate ordering to the table; ordering, duration,
-restart, and capacity invariants are verified by tests; the deferred finding has a
-test; existing contract tests still pass.
+**Decision (recorded):** The original item proposed replacing both observers' ordering
+logic with an event log replayed through one transition table. A design review against
+the contract tests showed that chronological replay changes deliberate behaviour (a
+late `launch` must not extend a stopped agent's duration; a stop plus later result must
+stay stopped even if an older start arrives; a delayed pre-restart tool start must stay
+live), and adds migration, compaction, and per-hook write costs. The redesign was
+rejected. Codex observation (item 4) needs observers that accept a second source, not a
+rewrite.
+
+**Done when:** a delayed completion for one agent is applied after another agent's
+newer events; same-agent ordering and legacy rows are covered by tests; existing
+contract tests pass unchanged.
 
 ## 4. Native Codex activity observation
 
@@ -121,7 +122,7 @@ test; existing contract tests still pass.
 
 **Scope:**
 - Observe Codex sessions and native subagents through the hooks audited in item 1, as
-  a second source for the item 3 transition table. No transcript parsing; lifecycle and
+  a second source for the existing observers. No transcript parsing; lifecycle and
   identifiers only.
 - Restart reconciliation for Codex records (both observers currently reconcile Claude
   only).
