@@ -1,6 +1,7 @@
 import fcntl
 import json
 import os
+import queue
 import sys
 import tempfile
 import threading
@@ -14,7 +15,7 @@ from test_control import settings
 from router import service
 from router.child import launch
 from router.cli import table
-from router.daemon import Controller, Runtime
+from router.daemon import Controller, Runtime, serve
 from router.process import UncertainProcess, creation_identity, owned_state, stop_owned
 from router.snapshot import apply_delta, cleanup, git
 
@@ -60,6 +61,532 @@ class RuntimeHarness:
         self.fail(f"Task did not reach {states}: {task}")
 
 class RuntimeTests(RuntimeHarness, unittest.TestCase):
+    def seed_attempt_task(self, task_id: str, *, second_attempt: bool) -> dict:
+        self.runtime.stop()
+        started = int(time.time() * 1000) - 100
+        first = {
+            "task_id": task_id,
+            "session_id": "S",
+            "status": "awaiting_review",
+            "attempts": 1,
+            "attempt_number": 1,
+            "attempt_started_at": started,
+            "duration_ms": 10,
+            "cost": 2.0,
+            "usage": {"input_tokens": 2},
+            "usage_complete": True,
+            "execution_stopped": True,
+            "execution_outcome": "completed",
+            "created_at": started,
+            "invocation": {"task": "transaction test", "parent_worktree": str(self.repo)},
+        }
+        current = dict(first)
+        if second_attempt:
+            current.update(
+                status="running",
+                attempts=2,
+                attempt_number=2,
+                attempt_started_at=started + 20,
+                cost=20.0,
+                usage={"input_tokens": 20},
+                execution_stopped=False,
+            )
+        with self.control.store.transaction() as db:
+            self.control.store.put(db, current)
+        self.control.store.save_attempt(first)
+        return current
+
+    # Durable outcomes are under test, not the 40 ms acknowledgement latency.
+    @patch("router.daemon.LIFECYCLE_ACK_TIMEOUT_SECONDS", 5)
+    def test_lifecycle_failure_reports_not_persisted_and_writer_continues(self):
+        at = int(time.time() * 1000)
+        failed = self.control.handle("lifecycle_observe", {
+            "session": {"source": "claude", "session_id": "partial-write",
+                        "kind": "session_start", "observed_at": at},
+            "native": {"source": "claude", "session_id": "S",
+                       "agent_id": "unsafe\x1b[2Jidentity", "kind": "result",
+                       "observed_at": at},
+        })
+        self.assertEqual(failed["accepted"], False)
+        self.assertEqual(failed["queued"], False)
+        self.assertEqual(failed["persisted"], False)
+        self.assertTrue(failed["partial"])
+        self.assertEqual(failed["persistence"], {"session": "persisted", "native": "failed"})
+        self.assertIn("partially persisted", failed["reason"])
+        failed_snapshot = self.control.handle("snapshot", {})
+        self.assertIn("partial-write", {session["session_id"] for session in failed_snapshot["sessions"]})
+        self.assertTrue(failed_snapshot["partial"])
+        self.assertIn("1 write failures", failed_snapshot["errors"]["lifecycle"])
+        following = self.control.handle("lifecycle_observe", {"session": {
+            "source": "claude", "session_id": "following", "kind": "session_start",
+            "observed_at": at + 1,
+        }})
+        self.assertEqual(following, {
+            "accepted": True,
+            "queued": False,
+            "persisted": True,
+            "partial": False,
+            "persistence": {"session": "persisted"},
+        })
+        self.assertIn("following", {
+            session["session_id"] for session in self.control.handle("snapshot", {})["sessions"]
+        })
+
+    @patch("router.daemon.LIFECYCLE_ACK_TIMEOUT_SECONDS", 5)
+    def test_one_lost_lifecycle_write_does_not_keep_snapshots_partial_forever(self):
+        at = int(time.time() * 1000)
+        rejected = self.control.handle("lifecycle_observe", {"native": {
+            "source": "claude", "session_id": "S", "agent_id": "child", "kind": "bogus", "observed_at": at}})
+        self.assertFalse(rejected["accepted"])
+        self.assertIn("1 write failures", self.control.lifecycle_health())
+        with patch("router.daemon.now_ms", return_value=at + 60_000):
+            self.assertIsNotNone(self.control.lifecycle_health())
+        with patch("router.daemon.now_ms", return_value=at + 61_000):
+            self.assertIsNone(self.control.lifecycle_health())
+
+    # Durable outcomes are under test, not the 40 ms acknowledgement latency.
+    @patch("router.daemon.LIFECYCLE_ACK_TIMEOUT_SECONDS", 5)
+    def test_lifecycle_failure_identifies_component_when_nothing_persists(self):
+        failed = self.control.handle("lifecycle_observe", {"native": {
+            "source": "claude", "session_id": "S", "agent_id": "unsafe\x1b[2Jidentity",
+            "kind": "result", "observed_at": int(time.time() * 1000),
+        }})
+        self.assertEqual(failed, {
+            "accepted": False,
+            "queued": False,
+            "persisted": False,
+            "partial": False,
+            "persistence": {"native": "failed"},
+            "reason": "Lifecycle observation could not be persisted; failed components: native",
+        })
+
+    # Durable outcomes are under test, not the 40 ms acknowledgement latency.
+    @patch("router.daemon.LIFECYCLE_ACK_TIMEOUT_SECONDS", 5)
+    def test_unexpected_lifecycle_observer_failure_isolated_from_paired_write(self):
+        at = int(time.time() * 1000)
+        payload = {
+            "session": {"source": "claude", "session_id": "unexpected",
+                        "kind": "session_start", "observed_at": at},
+            "native": {"source": "claude", "session_id": "unexpected",
+                       "agent_id": "child", "kind": "start", "observed_at": at},
+        }
+        with patch.object(self.control.sessions, "observe", side_effect=RuntimeError("observer bug")):
+            failed = self.control.handle("lifecycle_observe", payload)
+
+        self.assertFalse(failed["accepted"])
+        self.assertFalse(failed["queued"])
+        self.assertFalse(failed["persisted"])
+        self.assertTrue(failed["partial"])
+        self.assertEqual(failed["persistence"], {"session": "failed", "native": "persisted"})
+        self.assertIn("partially persisted", failed["reason"])
+        self.assertEqual(
+            self.control.handle("lifecycle_observe", {"session": {
+                "source": "claude", "session_id": "writer-survived",
+                "kind": "session_start", "observed_at": at + 1,
+            }})["accepted"],
+            True,
+        )
+
+    def test_lifecycle_queue_overflow_is_reported_in_snapshot_health(self):
+        with patch.object(self.control.lifecycle_queue, "put_nowait", side_effect=queue.Full):
+            result = self.control.handle("lifecycle_observe", {"session": {
+                "source": "claude", "session_id": "full", "kind": "session_start",
+                "observed_at": int(time.time() * 1000),
+            }})
+        self.assertFalse(result["accepted"])
+        self.assertFalse(result["queued"])
+        self.assertFalse(result["partial"])
+        self.assertEqual(result["persistence"], {"session": "rejected"})
+        snapshot = self.control.handle("snapshot", {})
+        self.assertTrue(snapshot["partial"])
+        self.assertIn("1 queue overflows", snapshot["errors"]["lifecycle"])
+
+    def test_queued_lifecycle_work_is_nondurable_before_writer_begins_processing(self):
+        self.control.stop_lifecycle_writer()
+        dequeued = threading.Event()
+        release = threading.Event()
+        original_get = self.control.lifecycle_queue.get
+        response = {}
+
+        def paused_get():
+            work = original_get()
+            if work is not None:
+                dequeued.set()
+                release.wait(1)
+            return work
+
+        with patch.object(self.control.lifecycle_queue, "get", side_effect=paused_get):
+            self.control.start_lifecycle_writer()
+            submitter = threading.Thread(target=lambda: response.update(self.control.handle(
+                "lifecycle_observe", {"session": {
+                    "source": "claude", "session_id": "queued-before-write", "kind": "session_start",
+                    "observed_at": int(time.time() * 1000),
+                }})))
+            submitter.start()
+            try:
+                self.assertTrue(dequeued.wait(1))
+                submitter.join(timeout=1)
+                self.assertEqual(response["accepted"], False)
+                self.assertEqual(response["queued"], True)
+                self.assertEqual(response["persisted"], False)
+                self.assertEqual(response["partial"], False)
+                self.assertEqual(response["persistence"], {"session": "pending"})
+                snapshot = self.control.handle("snapshot", {})
+                self.assertTrue(snapshot["partial"])
+                self.assertIn("1 queued writes pending", snapshot["errors"]["lifecycle"])
+            finally:
+                release.set()
+                submitter.join(timeout=1)
+
+        deadline = time.monotonic() + 1
+        while self.control.lifecycle_pending and time.monotonic() < deadline:
+            time.sleep(.01)
+        self.assertEqual(self.control.lifecycle_pending, 0)
+
+    def test_lifecycle_shutdown_closes_admission_before_writer_sentinel(self):
+        entered = threading.Event()
+        release = threading.Event()
+        write_timeouts = []
+        original = self.control.sessions.observe
+
+        def blocked(event, timeout=10):
+            write_timeouts.append(timeout)
+            entered.set()
+            release.wait(1)
+            return original(event, timeout)
+
+        with patch.object(self.control.sessions, "observe", side_effect=blocked):
+            first = self.control.handle("lifecycle_observe", {"session": {
+                "source": "claude", "session_id": "accepted-first", "kind": "session_start",
+                "observed_at": int(time.time() * 1000),
+            }})
+            self.assertFalse(first["accepted"])
+            self.assertTrue(first["queued"])
+            self.assertIn("not durably persisted", first["reason"])
+            self.assertTrue(entered.wait(1))
+            second = self.control.handle("lifecycle_observe", {"session": {
+                "source": "claude", "session_id": "accepted-second", "kind": "session_start",
+                "observed_at": int(time.time() * 1000),
+            }})
+            self.assertFalse(second["accepted"])
+            self.assertTrue(second["queued"])
+            self.assertIn("not durably persisted", second["reason"])
+            stopper = threading.Thread(target=self.control.stop_lifecycle_writer)
+            stopper.start()
+            deadline = time.monotonic() + 1
+            while not self.control.lifecycle_stopping and time.monotonic() < deadline:
+                time.sleep(.01)
+            rejected = self.control.handle("lifecycle_observe", {"session": {
+                "source": "claude", "session_id": "rejected", "kind": "session_start",
+                "observed_at": int(time.time() * 1000),
+            }})
+            self.assertEqual(rejected["accepted"], False)
+            self.assertEqual(rejected["queued"], False)
+            self.assertIn("stopping", rejected["reason"])
+            release.set()
+            stopper.join(timeout=3)
+        self.assertFalse(stopper.is_alive())
+        self.assertIsNone(self.control.lifecycle_thread)
+        session_ids = {
+            session["session_id"] for session in self.control.handle("snapshot", {})["sessions"]
+        }
+        self.assertIn("accepted-first", session_ids)
+        self.assertIn("accepted-second", session_ids)
+        self.assertEqual(len(write_timeouts), 2)
+        self.assertGreater(write_timeouts[1], 0)
+
+    def test_lifecycle_shutdown_is_hard_bounded_and_retains_blocked_writer(self):
+        entered = threading.Event()
+        release = threading.Event()
+        original = self.control.sessions.observe
+
+        def blocked(event, timeout=10):
+            entered.set()
+            release.wait()
+            return original(event, timeout)
+
+        with (patch.object(self.control.sessions, "observe", side_effect=blocked),
+              patch("router.daemon.LIFECYCLE_STOP_TIMEOUT_SECONDS", .05)):
+            result = self.control.handle("lifecycle_observe", {"session": {
+                "source": "claude", "session_id": "slow-accepted", "kind": "session_start",
+                "observed_at": int(time.time() * 1000),
+            }})
+            self.assertFalse(result["accepted"])
+            self.assertTrue(result["queued"])
+            self.assertIn("not durably persisted", result["reason"])
+            self.assertTrue(entered.wait(1))
+            started = time.monotonic()
+            try:
+                self.control.stop_lifecycle_writer()
+                self.assertLess(time.monotonic() - started, .2)
+                self.assertIsNotNone(self.control.lifecycle_thread)
+                self.assertIn("1 queued writes pending", self.control.lifecycle_health())
+            finally:
+                release.set()
+                self.control.lifecycle_thread.join(timeout=1)
+                self.control.stop_lifecycle_writer()
+
+        self.assertIsNone(self.control.lifecycle_thread)
+        session_ids = {
+            session["session_id"] for session in self.control.handle("snapshot", {})["sessions"]
+        }
+        self.assertIn("slow-accepted", session_ids)
+
+    def test_lifecycle_shutdown_drains_when_sentinel_enqueue_reports_full(self):
+        entered = threading.Event()
+        release = threading.Event()
+        original_observe = self.control.sessions.observe
+        original_put = self.control.lifecycle_queue.put_nowait
+
+        def blocked(event, timeout=10):
+            entered.set()
+            release.wait(1)
+            return original_observe(event, timeout)
+
+        def refuse_sentinel(item):
+            if item is None:
+                raise queue.Full
+            return original_put(item)
+
+        with (patch.object(self.control.sessions, "observe", side_effect=blocked),
+              patch.object(self.control.lifecycle_queue, "put_nowait", side_effect=refuse_sentinel)):
+            response = self.control.handle("lifecycle_observe", {"session": {
+                "source": "claude", "session_id": "sentinel-full", "kind": "session_start",
+                "observed_at": int(time.time() * 1000),
+            }})
+            self.assertTrue(entered.wait(1))
+            self.assertFalse(response["accepted"])
+            self.assertTrue(response["queued"])
+            stopper = threading.Thread(target=self.control.stop_lifecycle_writer)
+            stopper.start()
+            deadline = time.monotonic() + 1
+            while not self.control.lifecycle_stopping and time.monotonic() < deadline:
+                time.sleep(.01)
+            release.set()
+            stopper.join(timeout=3)
+
+        self.assertFalse(stopper.is_alive())
+        self.assertIsNone(self.control.lifecycle_thread)
+        sessions, _active_total = self.control.sessions.fleet_records(100)
+        session_ids = {session["session_id"] for session in sessions}
+        self.assertIn("sentinel-full", session_ids)
+
+    def test_lifecycle_shutdown_is_bounded_during_database_contention(self):
+        import sqlite3
+
+        with sqlite3.connect(self.control.store.path, timeout=0) as locked:
+            locked.execute("BEGIN IMMEDIATE")
+            result = self.control.handle("lifecycle_observe", {"session": {
+                "source": "claude", "session_id": "contended", "kind": "session_start",
+                "observed_at": int(time.time() * 1000),
+            }})
+            started = time.monotonic()
+            self.control.stop_lifecycle_writer()
+            elapsed = time.monotonic() - started
+        self.assertFalse(result["accepted"])
+        self.assertTrue(result["queued"])
+        self.assertFalse(result["persisted"])
+        self.assertLess(elapsed, 3)
+        self.assertIsNone(self.control.lifecycle_thread)
+        self.assertIn("write failures", self.control.lifecycle_health())
+
+    # Ack must fire while native is held (up to 1 s) but after the session write.
+    @patch("router.daemon.LIFECYCLE_ACK_TIMEOUT_SECONDS", .5)
+    def test_snapshot_marks_paired_lifecycle_midpoint_partial(self):
+        native_entered = threading.Event()
+        release_native = threading.Event()
+        original_native = self.control.native.observe
+        response = {}
+
+        def pause_native(event, timeout=10):
+            native_entered.set()
+            release_native.wait(1)
+            return original_native(event, timeout)
+
+        payload = {
+            "session": {"source": "claude", "session_id": "paired", "kind": "session_start",
+                        "observed_at": int(time.time() * 1000)},
+            "native": {"source": "claude", "session_id": "paired", "agent_id": "child",
+                       "kind": "start", "observed_at": int(time.time() * 1000)},
+        }
+        with patch.object(self.control.native, "observe", side_effect=pause_native):
+            submitter = threading.Thread(
+                target=lambda: response.update(self.control.handle("lifecycle_observe", payload)),
+            )
+            submitter.start()
+            self.assertTrue(native_entered.wait(1))
+            submitter.join(timeout=1)
+            self.assertFalse(response["accepted"])
+            self.assertTrue(response["queued"])
+            self.assertTrue(response["partial"])
+            self.assertEqual(response["persistence"], {"session": "persisted", "native": "pending"})
+            midpoint = self.control.handle("snapshot", {})
+            self.assertTrue(midpoint["partial"])
+            self.assertIn("changed during snapshot", midpoint["errors"]["lifecycle_consistency"])
+            release_native.set()
+            submitter.join(timeout=1)
+
+    def test_direct_lifecycle_writes_invalidate_snapshot_consistency(self):
+        original_sessions = self.control.sessions.fleet_records
+        observed_at = int(time.time() * 1000)
+
+        for operation, payload in (
+            ("observe", {"source": "claude", "session_id": "direct-native",
+                         "agent_id": "child", "kind": "start", "observed_at": observed_at}),
+            ("session_observe", {"source": "claude", "session_id": "direct-session",
+                                 "kind": "session_start", "observed_at": observed_at}),
+        ):
+            with self.subTest(operation=operation):
+                injected = False
+
+                def interleaved(limit, operation=operation, payload=payload):
+                    nonlocal injected
+                    result = original_sessions(limit)
+                    if not injected:
+                        injected = True
+                        self.control.handle(operation, payload)
+                    return result
+
+                with patch.object(self.control.sessions, "fleet_records", side_effect=interleaved):
+                    snapshot = self.control.handle("snapshot", {})
+
+                self.assertTrue(snapshot["partial"])
+                self.assertIn("changed during snapshot", snapshot["errors"]["lifecycle_consistency"])
+
+    def test_task_finalization_and_attempt_history_commit_atomically(self):
+        task_id = "task-atomic-finalize"
+        self.seed_attempt_task(task_id, second_attempt=True)
+        entered = threading.Event()
+        release = threading.Event()
+        original_save = self.control.store.save_attempt
+
+        def paused_save(task, db=None):
+            if task.get("attempt_number") == 2:
+                entered.set()
+                release.wait(1)
+            return original_save(task, db)
+
+        with patch.object(self.control.store, "save_attempt", side_effect=paused_save):
+            writer = threading.Thread(target=self.runtime.finish, args=(task_id, "completed", None))
+            writer.start()
+            try:
+                self.assertTrue(entered.wait(1))
+                during = self.control.handle("status", {"task_id": task_id})
+                self.assertEqual(during["status"], "running")
+                self.assertEqual(
+                    [attempt["attempt_number"] for attempt in during["attempt_history"]],
+                    [1],
+                )
+            finally:
+                release.set()
+                writer.join(timeout=2)
+
+        self.assertFalse(writer.is_alive())
+        after = self.control.handle("status", {"task_id": task_id})
+        self.assertEqual(after["status"], "awaiting_review")
+        self.assertEqual(
+            [attempt["attempt_number"] for attempt in after["attempt_history"]],
+            [1, 2],
+        )
+        self.assertEqual(
+            after["elapsed_ms"],
+            sum(attempt["duration_ms"] for attempt in after["attempt_history"]),
+        )
+
+    def test_list_status_holds_one_snapshot_for_tasks_and_attempts(self):
+        task_id = "task-list-snapshot"
+        self.seed_attempt_task(task_id, second_attempt=False)
+        task_read = threading.Event()
+        release_reader = threading.Event()
+        original_all = self.control.store.all
+        rows = {}
+
+        def paused_all(db=None):
+            tasks = original_all(db)
+            task_read.set()
+            release_reader.wait(1)
+            return tasks
+
+        with patch.object(self.control.store, "all", side_effect=paused_all):
+            reader = threading.Thread(
+                target=lambda: rows.update(result=self.control.handle("status", {})),
+            )
+            reader.start()
+            self.assertTrue(task_read.wait(1))
+
+            def finalize_second(current):
+                current.update(
+                    status="failed",
+                    attempts=2,
+                    attempt_number=2,
+                    duration_ms=20,
+                    cost=20.0,
+                    usage={"input_tokens": 20},
+                    execution_stopped=True,
+                    execution_outcome="failed",
+                )
+
+            writer = threading.Thread(
+                target=self.control.store.update_with_attempt,
+                args=(task_id, finalize_second),
+            )
+            writer.start()
+            writer.join(timeout=1)
+            self.assertFalse(writer.is_alive())
+            release_reader.set()
+            reader.join(timeout=2)
+
+        self.assertFalse(reader.is_alive())
+        during = next(row for row in rows["result"] if row["task_id"] == task_id)
+        self.assertEqual(during["status"], "awaiting_review")
+        self.assertEqual(during["attempts"], 1)
+        self.assertEqual(during["cost"], 2.0)
+        after = next(
+            row for row in self.control.handle("status", {}) if row["task_id"] == task_id
+        )
+        self.assertEqual(after["status"], "failed")
+        self.assertEqual(after["attempts"], 2)
+        self.assertEqual(after["cost"], 22.0)
+
+    def test_interrupted_capture_persists_attempt_with_task_state(self):
+        task_id = "task-interrupted-attempt"
+        task = self.seed_attempt_task(task_id, second_attempt=True)
+        Path(task["invocation"]["parent_worktree"]).mkdir(exist_ok=True)
+        self.control.store.update(task_id, lambda current: current.update(
+            snapshot_commit="snapshot", worktree=str(self.repo),
+        ))
+
+        with patch.object(self.runtime, "snapshot_phase", side_effect=UncertainProcess("capture uncertain")):
+            self.runtime.finish(task_id, "completed", None)
+
+        result = self.control.handle("status", {"task_id": task_id})
+        self.assertEqual(result["status"], "interrupted")
+        self.assertFalse(result["execution_stopped"])
+        self.assertEqual(result["attempt_history"][-1]["status"], "interrupted")
+        self.assertEqual(result["attempt_history"][-1]["failure_reason"], "capture uncertain")
+
+    def test_second_daemon_checks_lock_before_database_startup_work(self):
+        directory = self.root / "blocked-state"
+        directory.mkdir()
+        database = directory / "router.sqlite3"
+        import sqlite3
+        with sqlite3.connect(database) as connection:
+            connection.execute("CREATE TABLE observations(task_id TEXT PRIMARY KEY, session_id TEXT, data TEXT)")
+            connection.execute("INSERT INTO observations VALUES('bad','S','not-json')")
+        with (directory / "daemon.lock").open("a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            with self.assertRaisesRegex(ValueError, "already running"):
+                serve(self.config, os.environ.copy(), directory, self.root / "blocked.sock")
+
+    def test_unsafe_state_directory_is_rejected_before_any_change(self):
+        directory = self.repo / "router-state"
+        directory.mkdir()
+        directory.chmod(0o755)
+        with self.assertRaisesRegex(ValueError, "outside every configured"):
+            serve(self.config, os.environ.copy(), directory, self.root / "unsafe.sock")
+        self.assertEqual(directory.stat().st_mode & 0o777, 0o755)
+        self.assertFalse((directory / "daemon.lock").exists())
+
     def enable_codex(self, model="openai/gpt-5.3-codex"):
         self.config.codex_command = self.config.opencode_command
         self.config.models["test"] = model

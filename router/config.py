@@ -20,6 +20,8 @@ class Settings(BaseSettings):
     models: dict[str, str] = Field(default_factory=dict, validation_alias="AGENT_ROUTER_MODELS")
     repositories: dict[str, dict[str, str]] = Field(default_factory=dict, validation_alias="AGENT_ROUTER_REPOSITORIES")
     model_prices: dict[str, list[PriceTier]] = Field(default_factory=dict, validation_alias="AGENT_ROUTER_MODEL_PRICES")
+    # Whether this host's fleet snapshot includes task text written by users and agents.
+    fleet_share_text: bool = Field(default=True, validation_alias="AGENT_ROUTER_FLEET_SHARE_TEXT")
 
     @property
     def delegation_enabled(self) -> bool:

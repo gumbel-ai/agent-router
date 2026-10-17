@@ -4,8 +4,10 @@ import fcntl
 import json
 import logging
 import os
+import queue
 import socket
 import socketserver
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -13,12 +15,15 @@ import time
 import uuid
 from pathlib import Path
 
+from router.capacity import CapacitySampler
 from router.child import child_environment, executor_command, launch
 from router.codex import collect as collect_codex
 from router.codex import price_metadata
 from router.config import Settings
 from router.db import Store, now_ms
 from router.dispatch import MUTATIONS, canonical
+from router.fleet_snapshot import AlertHistory
+from router.host import HostIdentity
 from router.native import NativeObserver
 from router.process import (
     UncertainProcess,
@@ -28,11 +33,34 @@ from router.process import (
     supervised_state,
     verify_shutdown,
 )
+from router.sessions import SessionObserver
 from router.snapshot import cleanup, git, validate_repository
 
 ACTIVE = {"created", "validating", "preparing", "running", "retrying", "cancelling"}
 DECISIONS = {"awaiting_review", "blocked", "failed", "interrupted"}
 LOGGER = logging.getLogger(__name__)
+LIFECYCLE_STOP_TIMEOUT_SECONDS = 2.5
+LIFECYCLE_ACK_TIMEOUT_SECONDS = .04
+# Lost lifecycle evidence keeps snapshots partial for this long, not forever.
+LIFECYCLE_PROBLEM_WINDOW_MS = 60_000
+
+
+def _lifecycle_result(queued: bool, persistence: dict[str, str],
+                      reason: str | None = None) -> dict:
+    """Build the additive lifecycle acknowledgement contract."""
+    states = dict(persistence)
+    persisted = bool(states) and all(state == "persisted" for state in states.values())
+    partial = any(state == "persisted" for state in states.values()) and not persisted
+    result = {
+        "accepted": persisted,
+        "queued": queued,
+        "persisted": persisted,
+        "partial": partial,
+        "persistence": states,
+    }
+    if reason is not None:
+        result["reason"] = reason
+    return result
 
 
 def blocks_maintenance(task: dict) -> bool:
@@ -47,14 +75,14 @@ def required_text(payload: dict, key: str) -> str:
     return value
 
 
-def public(task: dict, store: Store | None = None) -> dict:
+def public(task: dict, store: Store | None = None, history: list[dict] | None = None) -> dict:
     result = {key: value for key, value in task.items() if key not in {
         "session_id", "invocation", "feedback", "permission_profile", "setup_command", "cleanup_requested", "token_prices",
         "codex_usage_baseline", "codex_usage_total", "codex_baseline_complete"}}
-    history = store.history(task["task_id"]) if store is not None else []
-    result.update(visibility(task, history))
-    if store is not None:
-        result["attempt_history"] = history
+    attempt_history = store.history(task["task_id"]) if history is None and store is not None else history or []
+    result.update(visibility(task, attempt_history))
+    if store is not None or history is not None:
+        result["attempt_history"] = attempt_history
     return result
 
 
@@ -95,21 +123,194 @@ def visibility(task: dict, history: list[dict]) -> dict:
             "activity": task.get("executor_activity", task.get("phase")), "visibility_reason": None, "runtime_partial": False}
 
 
+def require_state_directory(settings: Settings, directory: Path) -> Path:
+    resolved = directory.resolve()
+    if resolved in {Path.home().resolve(), Path("/")}:
+        raise ValueError("Router state requires a dedicated directory, not home or filesystem root")
+    if any(resolved.is_relative_to(Path(root)) for root in settings.repositories):
+        raise ValueError("Router state must be outside every configured parent worktree")
+    return resolved
+
+
 class Controller:
     def __init__(self, settings: Settings, environment: dict[str, str], directory: Path):
         self.settings = settings
         self.environment = environment
-        self.directory = directory.resolve()
-        if self.directory in {Path.home().resolve(), Path("/")}:
-            raise ValueError("Router state requires a dedicated directory, not home or filesystem root")
-        if any(self.directory.is_relative_to(Path(root)) for root in settings.repositories):
-            raise ValueError("Router state must be outside every configured parent worktree")
+        self.directory = require_state_directory(settings, directory)
         self.directory.mkdir(parents=True, exist_ok=True, mode=0o700)
-        self.store = Store(self.directory / "router.sqlite3")
-        self.native = NativeObserver(self.store, settings.model_prices)
+        self.directory.chmod(0o700)
+        self.host = HostIdentity(self.directory)
+        self.store = Store(self.directory / "router.sqlite3", self.host.host_id)
+        with self.store.transaction() as db:
+            db.execute("INSERT INTO hosts(host_id,data) VALUES(?,?) ON CONFLICT(host_id) DO UPDATE SET data=excluded.data",
+                       (self.host.host_id, canonical(self.host.view(now_ms()))))
+        self.native = NativeObserver(self.store, settings.model_prices, self.host.host_id)
+        self.sessions = SessionObserver(self.store, self.host.host_id)
+        self.capacity = CapacitySampler(self.directory)
+        self.alert_history = AlertHistory()
+        self.lifecycle_queue: queue.Queue[tuple[dict, threading.Event, dict] | None] = queue.Queue(maxsize=1024)
+        self.lifecycle_thread: threading.Thread | None = None
+        self.lifecycle_stopping = False
+        self.lifecycle_stop_deadline: float | None = None
+        self.lifecycle_failures = 0
+        self.lifecycle_dropped = 0
+        self.lifecycle_problem_at: int | None = None
+        self.lifecycle_pending = 0
+        self.lifecycle_direct_active = 0
+        self.lifecycle_health_lock = threading.Lock()
+        self._lifecycle_generation = 0
         self.changed = threading.Event()
         self.lifecycle_lock = threading.Lock()
         self.draining = False
+
+    def start_lifecycle_writer(self) -> None:
+        with self.lifecycle_lock:
+            if self.lifecycle_thread is not None:
+                return
+            self.lifecycle_stopping = False
+            self.lifecycle_stop_deadline = None
+            self.lifecycle_thread = threading.Thread(
+                target=self._write_lifecycle, name="router-lifecycle", daemon=True,
+            )
+            self.lifecycle_thread.start()
+
+    def _write_lifecycle(self) -> None:
+        while True:
+            work = self.lifecycle_queue.get()
+            completed = None
+            try:
+                if work is None:
+                    return
+                payload, completed, outcome = work
+                for key, observer in (("session", self.sessions), ("native", self.native)):
+                    event = payload.get(key)
+                    if event is None:
+                        continue
+                    try:
+                        observer.observe(event, timeout=self._lifecycle_write_timeout())
+                    except (sqlite3.Error, ValueError, KeyError, TypeError, OSError, OverflowError) as error:
+                        outcome["persistence"][key] = "failed"
+                        LOGGER.warning("Lifecycle %s observation could not be persisted: %s", key, error)
+                        with self.lifecycle_health_lock:
+                            self.lifecycle_failures += 1
+                            self.lifecycle_problem_at = now_ms()
+                    # Protect the long-lived writer from unexpected observer bugs.
+                    except Exception:
+                        outcome["persistence"][key] = "failed"
+                        LOGGER.exception("Unexpected lifecycle %s observation failure", key)
+                        with self.lifecycle_health_lock:
+                            self.lifecycle_failures += 1
+                            self.lifecycle_problem_at = now_ms()
+                    else:
+                        outcome["persistence"][key] = "persisted"
+            # One malformed work item must not kill the writer.
+            except Exception:
+                LOGGER.exception("Unexpected lifecycle work item failure")
+                with self.lifecycle_health_lock:
+                    self.lifecycle_failures += 1
+                    self.lifecycle_problem_at = now_ms()
+            finally:
+                if work is not None:
+                    for key, state in outcome["persistence"].items():
+                        if state == "pending":
+                            outcome["persistence"][key] = "failed"
+                    failed = [key for key, state in outcome["persistence"].items() if state == "failed"]
+                    reason = None
+                    if failed:
+                        prefix = ("Lifecycle observation partially persisted; failed components: "
+                                  if any(state == "persisted" for state in outcome["persistence"].values())
+                                  else "Lifecycle observation could not be persisted; failed components: ")
+                        reason = prefix + ", ".join(failed)
+                    terminal = _lifecycle_result(False, outcome["persistence"], reason)
+                    # No clear(): a request thread that timed out may be reading
+                    # outcome["persistence"] concurrently; update() swaps it whole.
+                    outcome.update(terminal)
+                    with self.lifecycle_health_lock:
+                        self._lifecycle_generation += 1
+                        self.lifecycle_pending -= 1
+                if completed is not None:
+                    completed.set()
+                self.lifecycle_queue.task_done()
+            if self.lifecycle_stopping and self.lifecycle_queue.empty():
+                return
+
+    def _lifecycle_write_timeout(self) -> float:
+        if not self.lifecycle_stopping:
+            return 1
+        with self.lifecycle_health_lock:
+            pending = max(1, self.lifecycle_pending)
+        deadline = self.lifecycle_stop_deadline
+        remaining = max(0.0, deadline - time.monotonic()) if deadline is not None else 0.0
+        # Share the remaining shutdown window across the queued work. Each
+        # item may contain two writes, so no single contended write consumes
+        # the entire hard stop budget. SQLite still gets a nonzero opportunity.
+        return max(.001, min(1.0, remaining / (pending * 2)))
+
+    def stop_lifecycle_writer(self) -> None:
+        with self.lifecycle_lock:
+            thread = self.lifecycle_thread
+            if thread is None:
+                return
+            signal_writer = not self.lifecycle_stopping
+            self.lifecycle_stopping = True
+            if signal_writer:
+                self.lifecycle_stop_deadline = time.monotonic() + LIFECYCLE_STOP_TIMEOUT_SECONDS
+        # Admission is closed under lifecycle_lock. The writer also exits after
+        # draining an empty queue, so a full queue never requires a blocking put.
+        deadline = self.lifecycle_stop_deadline or time.monotonic()
+        if signal_writer:
+            try:
+                self.lifecycle_queue.put_nowait(None)
+            except queue.Full:
+                LOGGER.warning(
+                    "Lifecycle writer is still draining; %d observations remain queued",
+                    self.lifecycle_queue.qsize(),
+                )
+        thread.join(timeout=max(0, deadline - time.monotonic()))
+        if thread.is_alive():
+            with self.lifecycle_health_lock:
+                pending = self.lifecycle_pending
+            LOGGER.warning(
+                "Lifecycle writer did not stop within %.1f seconds; %d queued observations remain pending",
+                LIFECYCLE_STOP_TIMEOUT_SECONDS, pending,
+            )
+            return
+        with self.lifecycle_lock:
+            if self.lifecycle_thread is thread:
+                self.lifecycle_thread = None
+
+    def lifecycle_health(self) -> str | None:
+        with self.lifecycle_health_lock:
+            failures, dropped, pending = self.lifecycle_failures, self.lifecycle_dropped, self.lifecycle_pending
+            problem_at = self.lifecycle_problem_at
+        recent = problem_at is not None and now_ms() - problem_at <= LIFECYCLE_PROBLEM_WINDOW_MS
+        if not pending and not recent:
+            return None
+        return ("Lifecycle observations not persisted: "
+                f"{failures} write failures, {dropped} queue overflows, {pending} queued writes pending")
+
+    def lifecycle_generation(self) -> int:
+        with self.lifecycle_health_lock:
+            return self._lifecycle_generation
+
+    def lifecycle_consistency(self) -> tuple[int, int]:
+        """Return a token and the number of lifecycle writes still in flight."""
+        with self.lifecycle_health_lock:
+            return (self._lifecycle_generation,
+                    self.lifecycle_pending + self.lifecycle_direct_active)
+
+    def _observe_lifecycle_direct(self, observer, payload: dict) -> dict:
+        # The compatibility endpoints remain synchronous, but must participate
+        # in the same snapshot consistency protocol as the queued hook path.
+        with self.lifecycle_health_lock:
+            self.lifecycle_direct_active += 1
+            self._lifecycle_generation += 1
+        try:
+            return observer.observe(payload)
+        finally:
+            with self.lifecycle_health_lock:
+                self.lifecycle_direct_active -= 1
+                self._lifecycle_generation += 1
 
     def busy(self) -> int:
         return sum(blocks_maintenance(task) for task in self.store.all())
@@ -129,7 +330,56 @@ class Controller:
                     "delegation_enabled": self.settings.delegation_enabled,
                     "active_tasks": self.busy()}
         if operation == "observe":
-            return self.native.observe(payload)
+            return self._observe_lifecycle_direct(self.native, payload)
+        if operation == "session_observe":
+            return self._observe_lifecycle_direct(self.sessions, payload)
+        if operation == "lifecycle_observe":
+            if set(payload) - {"session", "native"}:
+                raise ValueError("Unknown lifecycle observation field")
+            if not any(payload.get(key) is not None for key in ("session", "native")):
+                raise ValueError("Lifecycle observation is empty")
+            completed = threading.Event()
+            requested = {
+                key: "pending" for key in ("session", "native")
+                if payload.get(key) is not None
+            }
+            outcome = {"persistence": dict(requested)}
+            with self.lifecycle_lock:
+                if (self.lifecycle_stopping or self.lifecycle_thread is None
+                        or not self.lifecycle_thread.is_alive()):
+                    return _lifecycle_result(
+                        False, dict.fromkeys(requested, "rejected"),
+                        "Lifecycle observation writer is stopping",
+                    )
+                with self.lifecycle_health_lock:
+                    self.lifecycle_pending += 1
+                    self._lifecycle_generation += 1
+                try:
+                    self.lifecycle_queue.put_nowait((dict(payload), completed, outcome))
+                except queue.Full:
+                    with self.lifecycle_health_lock:
+                        self.lifecycle_pending -= 1
+                        self._lifecycle_generation += 1
+                        self.lifecycle_dropped += 1
+                        self.lifecycle_problem_at = now_ms()
+                    return _lifecycle_result(
+                        False, dict.fromkeys(requested, "rejected"),
+                        "Lifecycle observation queue is full",
+                    )
+            if not completed.wait(LIFECYCLE_ACK_TIMEOUT_SECONDS):
+                return _lifecycle_result(
+                    True, outcome["persistence"],
+                    "Lifecycle observation is queued but was not durably persisted before the acknowledgement timeout",
+                )
+            return dict(outcome)
+        if operation == "snapshot":
+            if set(payload) - {"history_limit"}:
+                raise ValueError("Unknown snapshot option")
+            history_limit = payload.get("history_limit", 100)
+            if not isinstance(history_limit, int) or isinstance(history_limit, bool) or not 1 <= history_limit <= 1000:
+                raise ValueError("history_limit must be an integer from 1 to 1000")
+            from router.fleet_snapshot import compose
+            return compose(self, history_limit=history_limit)
         if operation not in MUTATIONS:
             raise ValueError("Unknown operation")
         if str(payload.get("task_id", "")).startswith("native-"):
@@ -316,10 +566,15 @@ class Controller:
         if payload.get("task_id"):
             if str(payload["task_id"]).startswith("native-"):
                 return self.native.status(payload["task_id"])
-            return public(self.store.get(payload["task_id"]), self.store)
+            with self.store.snapshot() as db:
+                task = self.store.get(payload["task_id"], db)
+                history = self.store.history(task["task_id"], db)
+            return public(task, history=history)
         if payload.get("filter") not in {None, "needs_decision"}:
             raise ValueError("Unknown status filter")
-        tasks = [task for task in self.store.all() if task["status"] != "closed" or task.get("cleanup_pending")]
+        with self.store.snapshot() as db:
+            tasks = [task for task in self.store.all(db) if task["status"] != "closed" or task.get("cleanup_pending")]
+            histories = {task["task_id"]: self.store.history(task["task_id"], db) for task in tasks}
         if payload.get("filter") == "needs_decision":
             tasks = [task for task in tasks if task["status"] in DECISIONS or task.get("cleanup_error") is not None or
                      (task["status"] == "awaiting_review" and task["attempts"] >= self.settings.max_attempts)]
@@ -328,7 +583,7 @@ class Controller:
         rows = []
         for task in tasks:
             row = {key: value for key, value in task.items() if key in keys}
-            row.update(visibility(task, self.store.history(task["task_id"])))
+            row.update(visibility(task, histories[task["task_id"]]))
             rows.append(row)
         if payload.get("filter") is None:
             rows.extend(self.native.status(offset=offset))
@@ -352,6 +607,9 @@ class Runtime:
     def start(self) -> None:
         # In serve(), the single-instance daemon lock is already held here.
         self.control.native.reconcile_restart()
+        self.control.sessions.reconcile_restart()
+        self.control.start_lifecycle_writer()
+        self.control.capacity.start()
         for task in self.store.all():
             if task["status"] == "closed" and task.get("cleanup_pending") and task.get("cleanup_error") is None:
                 self.store.update(task["task_id"], lambda t: t.update(cleanup_requested=True))
@@ -364,13 +622,14 @@ class Runtime:
                     self.spawn(task, recovered=True)
                 elif task.get("cancel_requested") and (not record or owned_state(record) == "stopped"):
                     if record and record.get("interrupt_first"):
-                        self.store.update(task["task_id"], lambda t: t.update(status="interrupted", execution_stopped=False,
+                        self.store.update_with_attempt(task["task_id"], lambda t: t.update(status="interrupted", execution_stopped=False,
                             shutdown_unconfirmed=True, failure_reason="Codex shutdown evidence missing after restart; operator inspection required"))
                     else:
                         self.store.update(task["task_id"], lambda t: t.update(status="cancelled", execution_stopped=True))
                 else:
-                    self.store.update(task["task_id"], lambda t: t.update(status="interrupted", execution_stopped=False,
-                                                                         failure_reason="Restart could not establish execution outcome"))
+                    self.store.update_with_attempt(task["task_id"], lambda t: t.update(
+                        status="interrupted", execution_stopped=False,
+                        failure_reason="Restart could not establish execution outcome"))
         self.scheduler = threading.Thread(target=self.schedule, name="router-admission", daemon=True)
         self.scheduler.start()
 
@@ -665,9 +924,9 @@ class Runtime:
         except UncertainProcess as error:
             message = str(error)
             unconfirmed = isinstance(error, UnconfirmedShutdown)
-            self.store.update(task_id, lambda t: t.update(status="interrupted", execution_stopped=False, failure_reason=message,
+            self.store.update_with_attempt(task_id, lambda t: t.update(
+                status="interrupted", execution_stopped=False, failure_reason=message,
                 shutdown_unconfirmed=unconfirmed or t.get("shutdown_unconfirmed", False)))
-            self.store.save_attempt(self.store.get(task_id))
             return
         except Exception as error:
             LOGGER.exception("Task phase failed: %s", task_id)
@@ -683,7 +942,7 @@ class Runtime:
                 except UncertainProcess as stopping_error:
                     message = str(stopping_error)
                     unconfirmed = isinstance(stopping_error, UnconfirmedShutdown)
-                    self.store.update(task_id, lambda t: t.update(status="interrupted", execution_stopped=False,
+                    self.store.update_with_attempt(task_id, lambda t: t.update(status="interrupted", execution_stopped=False,
                         failure_reason=message, shutdown_unconfirmed=unconfirmed or t.get("shutdown_unconfirmed", False)))
                     return
             outcome, reason = "failed", str(error)
@@ -702,7 +961,8 @@ class Runtime:
                 self.snapshot_phase(task_id, "capture")
             except UncertainProcess as error:
                 message = str(error)
-                self.store.update(task_id, lambda t: t.update(status="interrupted", execution_stopped=False, failure_reason=message))
+                self.store.update_with_attempt(task_id, lambda t: t.update(
+                    status="interrupted", execution_stopped=False, failure_reason=message))
                 return
             except PhaseStopped:
                 pass  # Explicit cancellation preserves the established child outcome.
@@ -721,8 +981,7 @@ class Runtime:
                 current["failure_reason"] = reason
             current.pop("pending_outcome", None)
             current.pop("pending_reason", None)
-        self.store.update(task_id, finalize)
-        self.store.save_attempt(self.store.get(task_id))
+        self.store.update_with_attempt(task_id, finalize)
 
     def clean(self, task_id: str) -> None:
         try:
@@ -739,6 +998,8 @@ class Runtime:
 
     def stop(self) -> None:
         self.stopping.set()
+        self.control.stop_lifecycle_writer()
+        self.control.capacity.stop()
         self.control.changed.set()
         self.scheduler.join(timeout=2)
         for task in self.store.all():
@@ -794,7 +1055,9 @@ class Server(socketserver.ThreadingUnixStreamServer):
 
 
 def serve(settings: Settings, environment: dict[str, str], directory: Path, endpoint: Path) -> None:
-    controller = Controller(settings, environment, directory)
+    # Reject unsafe state roots before changing permissions or creating the lock.
+    require_state_directory(settings, directory)
+    directory.mkdir(parents=True, exist_ok=True, mode=0o700)
     directory.chmod(0o700)
     endpoint.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     with (directory / "daemon.lock").open("a") as lock:
@@ -802,6 +1065,7 @@ def serve(settings: Settings, environment: dict[str, str], directory: Path, endp
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as error:
             raise ValueError("Agent Router is already running") from error
+        controller = Controller(settings, environment, directory)
         if endpoint.exists():
             import stat
             endpoint_info = endpoint.lstat()
