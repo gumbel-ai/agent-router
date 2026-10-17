@@ -1310,6 +1310,12 @@ class SnapshotAndFleetTests(unittest.TestCase):
         self.assertNotIn("agents", projected["errors"])  # Removing controls alone is not partial.
         value["tasks"][0]["subject"] = "x" * 500
         self.assertFalse(_validate_snapshot(json.dumps(value).encode())["partial"])
+        alerted = snapshot()
+        alerted["alerts"] = [{"alert_id": "a", "host_id": "host-1", "severity": "w" * 41, "kind": "k",
+                              "first_seen_at": 1, "last_seen_at": 1, "entity": {}, "evidence": "e"}]
+        projected = _validate_snapshot(json.dumps(alerted).encode())
+        self.assertEqual((len(projected["alerts"][0]["severity"]), projected["partial"]), (40, True))
+        self.assertIn("truncated", projected["errors"]["alerts"])
 
     def test_wire_numeric_and_identity_domains_are_field_specific(self):
         cases = {

@@ -538,6 +538,8 @@ def _validate_snapshot(payload: bytes) -> dict:
                            "entity": entity,
                            "evidence": _wire_text(alert["evidence"], "alert evidence", 1000, True)}
         projected_alerts.append(projected_alert)
+        if any(len(sanitize_output_text(alert[key])) > limit for key, limit in (("severity", 40), ("kind", 120))):
+            truncated_sections.append("alerts")  # Evidence is length-checked above; these are not.
     capacity_fields = frozenset({
         "logical_cpus", "load_1m", "load_5m", "cpu_busy_pct", "memory_total_bytes",
         "memory_available_bytes", "swap_used_bytes", "disk_available_bytes", "observed_at", "partial",
@@ -605,7 +607,7 @@ def _validate_snapshot(payload: bytes) -> dict:
     unknown_error_count = len(set(errors) - recognized_error_sections)
     if unknown_error_count:
         projected_errors["other"] = f"{unknown_error_count} unrecognized error section(s) omitted"
-    for section in truncated_sections:
+    for section in dict.fromkeys(truncated_sections):
         projected_errors.setdefault(section, "Text truncated to the fleet length bound")
     if rejected_router_tasks:
         projected_errors["router_tasks"] = bound_text(
