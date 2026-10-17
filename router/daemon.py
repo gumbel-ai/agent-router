@@ -589,6 +589,30 @@ class Controller:
             rows.extend(self.native.status(offset=offset))
         return rows
 
+    def router_task_records(self, limit: int = 100) -> list[dict]:
+        """Lifecycle-only fleet projection of Router-dispatched tasks: open or recently changed."""
+        cutoff = now_ms() - 300_000
+        with self.store.snapshot() as db:
+            tasks = [task for task in self.store.all(db)
+                     if task["status"] != "closed" or task.get("cleanup_pending") or task["updated_at"] >= cutoff]
+            tasks.sort(key=lambda task: (task["status"] not in ACTIVE, -task["updated_at"]))
+            tasks = tasks[:limit]
+            histories = {task["task_id"]: self.store.history(task["task_id"], db) for task in tasks}
+        records = []
+        for task in tasks:
+            view = visibility(task, histories[task["task_id"]])
+            records.append({
+                "host_id": self.host.host_id, "task_id": task["task_id"], "status": task["status"],
+                "executor": task["executor"], "requested_model": task.get("requested_model"),
+                "resolved_model": task.get("resolved_model"), "attempts": task["attempts"],
+                "parent_session_id": task["session_id"], "parent_agent_id": task.get("parent_agent_id"),
+                "task": view["task"], "activity": view["activity"], "failure_reason": task.get("failure_reason"),
+                "created_at": task["created_at"], "started_at": view["started_at"], "elapsed_ms": view["elapsed_ms"],
+                "last_event_at": task["updated_at"], "cleanup_pending": view["cleanup_pending"],
+                "shutdown_unconfirmed": view["shutdown_unconfirmed"],
+            })
+        return records
+
 
 class PhaseStopped(RuntimeError):
     def __init__(self, reason: str):

@@ -237,6 +237,13 @@ def _wire_identity(value: object, name: str, limit: int = MAX_IDENTITY_LENGTH,
     return projected
 
 
+# Router task lifecycle states (router/daemon.py); terminal ones stay visible for a while.
+ROUTER_TASK_STATUSES = frozenset({
+    "created", "validating", "preparing", "running", "retrying", "cancelling", "awaiting_review",
+    "blocked", "failed", "interrupted", "accepted", "integrated", "cancelled", "closed",
+})
+
+
 # Native usage and cost moved to Langfuse. Peers on older versions still send these;
 # drop them quietly rather than flagging every such snapshot as partial.
 RETIRED_AGENT_FIELDS = frozenset({
@@ -269,10 +276,10 @@ def _project_record(record: dict, allowed: frozenset[str], required: tuple[str, 
     positive_integer_fields = {"pid", "pgid"}
     nonnegative_integer_fields = {
         "started_at", "last_event_at", "finished_at", "duration_ms", "observation_age_ms",
-        "elapsed_ms", "inflight_tool_count", "created_at", "completed_at",
+        "elapsed_ms", "inflight_tool_count", "created_at", "completed_at", "attempts",
     }
     boolean_fields = {"needs_input", "runtime_partial",
-                      "tool_visibility_partial"}
+                      "tool_visibility_partial", "cleanup_pending", "shutdown_unconfirmed"}
     for key in allowed & record.keys():
         value = record[key]
         if key in text_fields:
@@ -422,7 +429,7 @@ def _validate_snapshot(payload: bytes) -> dict:
         raise ValueError("Host returned an unsupported snapshot schema")
     top_level_fields = frozenset({
         "schema_version", "generated_at", "partial", "host", "capacity", "sessions",
-        "agents", "tasks", "managed_processes", "inferred_processes", "alerts", "errors",
+        "agents", "tasks", "router_tasks", "managed_processes", "inferred_processes", "alerts", "errors",
     })
     top_level_omissions = len(set(snapshot) - top_level_fields)
     generated_at = snapshot.get("generated_at")
@@ -445,7 +452,9 @@ def _validate_snapshot(payload: bytes) -> dict:
     if not isinstance(snapshot.get("partial"), bool):
         raise ValueError("Host snapshot has invalid partial flag")  # noqa: TRY004 - public wire validation
     capacity = snapshot.get("capacity")
-    collections = ("sessions", "agents", "tasks", "managed_processes", "inferred_processes", "alerts")
+    # Router tasks were added within schema v1; older peers omit the section.
+    snapshot.setdefault("router_tasks", [])
+    collections = ("sessions", "agents", "tasks", "router_tasks", "managed_processes", "inferred_processes", "alerts")
     if not isinstance(capacity, dict) or any(
             not isinstance(snapshot.get(key), list) or any(not isinstance(item, dict) for item in snapshot[key])
             for key in collections):
@@ -456,16 +465,19 @@ def _validate_snapshot(payload: bytes) -> dict:
         "sessions": ("host_id", "source", "session_id"),
         "agents": ("host_id", "source", "parent_session_id", "agent_id"),
         "tasks": ("host_id", "source", "session_id", "task_id"),
+        "router_tasks": ("host_id", "task_id"),
     }
     required_record_fields = {
         "sessions": frozenset({"status", "started_at", "last_event_at"}),
         "agents": frozenset({"status", "started_at", "last_event_at"}),
         "tasks": frozenset({"status", "created_at", "last_event_at"}),
+        "router_tasks": frozenset({"status", "executor", "created_at", "last_event_at"}),
     }
     status_domains = {
         "sessions": frozenset({"running", "idle", "stopped", "unknown"}),
         "agents": frozenset({"running", "idle", "stopped", "unknown", "needs_input", "failed"}),
         "tasks": frozenset({"created", "completed"}),
+        "router_tasks": ROUTER_TASK_STATUSES,
     }
     # Schema-v1 forward compatibility is projection, not passthrough: preserve
     # known fields and deliberately drop unknown additions from newer peers.
@@ -482,6 +494,10 @@ def _validate_snapshot(payload: bytes) -> dict:
                              "observation_age_ms", "elapsed_ms"}),
         "tasks": frozenset({"host_id", "source", "session_id", "task_id", "status", "created_at",
                             "last_event_at", "completed_at", "subject", "teammate_name", "agent_id"}),
+        "router_tasks": frozenset({"host_id", "task_id", "status", "executor", "requested_model", "resolved_model",
+                                   "attempts", "parent_session_id", "parent_agent_id", "task", "activity",
+                                   "failure_reason", "created_at", "started_at", "elapsed_ms", "last_event_at",
+                                   "cleanup_pending", "shutdown_unconfirmed"}),
         "managed_processes": frozenset({"host_id", "managed_id", "status", "label", "pid", "pgid",
                                         "started_at", "finished_at", "exit_code", "visibility_reason"}),
         "inferred_processes": frozenset({"host_id", "pid", "pgid", "status", "label", "started_at",
@@ -616,7 +632,7 @@ def _validate_snapshot(payload: bytes) -> dict:
     if not isinstance(errors, dict):
         raise TypeError("Host snapshot has invalid errors")
     recognized_error_sections = {
-        "host", "sessions", "agents", "tasks", "managed_processes", "inferred_processes",
+        "host", "sessions", "agents", "tasks", "router_tasks", "managed_processes", "inferred_processes",
         "capacity", "alerts", "lifecycle", "lifecycle_consistency", "output", "projection",
         "session_active_count", "agent_active_count", "managed_process_active_count",
     }
@@ -785,7 +801,8 @@ def _prefix_identities(snapshot: dict) -> dict:
     host_id = snapshot["host"]["host_id"]
     for collection, keys in (("sessions", ("source", "session_id")),
                              ("agents", ("source", "parent_session_id", "agent_id")),
-                             ("tasks", ("source", "session_id", "task_id"))):
+                             ("tasks", ("source", "session_id", "task_id")),
+                             ("router_tasks", ("task_id",))):
         for record in snapshot.get(collection, []):
             if isinstance(record, dict):
                 parts = [host_id] + [str(record.get(key) or "unknown") for key in keys]

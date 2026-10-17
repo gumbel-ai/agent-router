@@ -7,7 +7,7 @@ description: Delegate requested work to an operator-configured model, or read-on
 
 Monitoring shows every open Router task and up to 100 native observations per page; use `router status --native-offset 100` for the next native page or look up a native ID directly. Native records hold lifecycle metadata only: no transcripts, assistant output, file lists, token usage, or cost. Router cost/usage/time totals cover Router-launched children, include recorded attempts, and exclude parent review waits.
 
-The structured observation-only commands are `router snapshot --json`, `router fleet status --json`, `router fleet capacity --json`, and `router fleet host NAME --json`. They expose local or fleet host identity, sessions, agents, and capacity without granting control. Fleet capacity is evidence, not scheduling authority: do not infer permission to dispatch work, modify reservations, or control a remote process from an `available` state. Missing or stale evidence stays `unknown` or `offline`.
+The structured observation-only commands are `router snapshot --json`, `router fleet status --json`, `router fleet capacity --json`, and `router fleet host NAME --json`. They expose local or fleet host identity, sessions, agents, Router-dispatched tasks (lifecycle only), and capacity without granting control. Fleet capacity is evidence, not scheduling authority: do not infer permission to dispatch work, modify reservations, or control a remote process from an `available` state. Missing or stale evidence stays `unknown` or `offline`.
 
 Delegate only when the user requests it. Do not replace a requested executor or model. Router supports OpenCode and Codex; unsupported targets fail without fallback. Semantic intent checking is your responsibility, not the router's.
 

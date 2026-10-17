@@ -188,10 +188,12 @@ def compose(controller, thresholds: CapacityThresholds | None = None, history_li
         "agent_active_count",
     )
     _collection(snapshot, "tasks", controller.sessions.tasks, history_limit)
+    if hasattr(controller, "router_task_records"):
+        _collection(snapshot, "router_tasks", controller.router_task_records, history_limit)
     if not getattr(getattr(controller, "settings", None), "fleet_share_text", True):
         # The producing host decides whether user- and agent-written text leaves it.
-        for key in ("agents", "tasks"):
-            for record in snapshot[key]:
+        for key in ("agents", "tasks", "router_tasks"):
+            for record in snapshot.get(key, []):
                 for field in FLEET_TEXT_FIELDS & record.keys():
                     record[field] = None
     sessions = snapshot["sessions"]
@@ -270,7 +272,7 @@ def bound(snapshot: dict, maximum_bytes: int = MAX_SNAPSHOT_BYTES) -> dict:
     result = dict(snapshot)
     result["partial"] = True
     result.setdefault("errors", {})["output"] = "Snapshot truncated to configured one MiB bound"
-    for key in ("tasks", "agents", "sessions", "alerts"):
+    for key in ("tasks", "router_tasks", "agents", "sessions", "alerts"):
         values = list(result.get(key, []))
         while values and len(canonical({**result, key: values}).encode()) > maximum_bytes:
             values = values[:len(values) // 2]

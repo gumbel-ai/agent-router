@@ -16,6 +16,8 @@ from contextlib import contextmanager, redirect_stdout
 from pathlib import Path
 from unittest.mock import mock_open, patch
 
+from test_control import settings
+
 from router.capacity import (
     MAX_RESERVATION_BYTES,
     CapacitySampler,
@@ -30,6 +32,7 @@ from router.cli import fleet_table
 from router.cli import main as cli_main
 from router.client import request
 from router.config import Settings
+from router.daemon import Controller
 from router.db import Store
 from router.fleet import (
     MAX_COLLECTION_RECORDS,
@@ -2771,6 +2774,52 @@ required = false
                             process.terminate()
                             process.wait(timeout=5)
                     process.communicate()
+
+
+class RouterTaskFleetTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix="ar-fleet-tasks-")
+        self.addCleanup(self.temp.cleanup)
+        root = Path(self.temp.name)
+        self.control = Controller(settings(root / "repo"), {}, root / "state")
+
+    def task(self, status, at=None, **fields):
+        task = {"task_id": "task-" + uuid.uuid4().hex, "session_id": "parent-session", "status": status,
+                "executor": "codex", "requested_model": "small", "attempts": 1, "created_at": 1,
+                "invocation": {"task": "PRIVATE TASK TEXT", "parent_worktree": "/work"},
+                "cost": 1.5, "usage": {"input": 9}, "worktree": "/secret", **fields}
+        with self.control.store.transaction() as db, \
+                patch("router.db.now_ms", return_value=at if at is not None else int(time.time() * 1000)):
+            self.control.store.put(db, task)
+        return task["task_id"]
+
+    def test_router_tasks_reach_fleet_status_as_lifecycle_only(self):
+        running = self.task("running", attempt_started_at=int(time.time() * 1000) - 1000)
+        self.task("closed", at=1)  # Long finished: outside the fleet window.
+        local = compose(self.control)
+        self.assertEqual([task["task_id"] for task in local["router_tasks"]], [running])
+        projected = _validate_snapshot(json.dumps(local).encode())
+        [record] = projected["router_tasks"]
+        self.assertEqual((record["status"], record["executor"], record["parent_session_id"]),
+                         ("running", "codex", "parent-session"))
+        self.assertEqual(record["task"], "PRIVATE TASK TEXT")
+        self.assertFalse({"cost", "usage", "worktree", "cwd"} & record.keys())
+        self.assertNotIn("router_tasks", projected.get("errors", {}))
+        # A peer on an older version sends no Router tasks; that is not a partial snapshot.
+        older = _validate_snapshot(json.dumps(snapshot("older-peer")).encode())
+        self.assertEqual((older["router_tasks"], older["partial"]), ([], False))
+        config = FleetConfig((FleetHost("here", "local"), FleetHost("there", "ssh", target="there")))
+        with patch("router.fleet.ssh_snapshot", return_value=older):
+            result = query_fleet(config, local_snapshot=lambda thresholds: local)
+        self.assertTrue(all(host["ok"] for host in result["hosts"]))
+        table = fleet_table(result)
+        self.assertIn("codex:" + running[:14], table)
+        self.assertIn("router:parent-sess", table)
+
+    def test_router_task_text_follows_fleet_text_sharing(self):
+        self.task("running")
+        self.control.settings = Settings(AGENT_ROUTER_FLEET_SHARE_TEXT="false")
+        self.assertIsNone(compose(self.control)["router_tasks"][0]["task"])
 
 
 if __name__ == "__main__":
