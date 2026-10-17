@@ -177,6 +177,12 @@ and the existing hostile-input tests still pass.
 
 ## 7. Replace the regex command matcher in hooks
 
+**Status:** Done. `router/dispatch.py` `mutation_operation()` flags any `router` word followed
+by a mutation word, whatever shell syntax surrounds them (as conservative as the old regex);
+the canonical parser then decides. Parsing shell to find only executed words was tried and
+dropped: review kept finding syntax (eval depth, `${x:-...}`, ANSI-C quoting) that hid
+mutations. No regex remains in `router/`.
+
 **Why:** `router/hooks.py` finds `router start|review|cancel|close --json` in Bash
 commands with a regex. It is the authorization gate, so it must be exact.
 
