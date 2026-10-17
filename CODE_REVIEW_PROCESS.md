@@ -23,6 +23,11 @@ number of valid findings showed that the initial completion claim was unjustifie
 Repeated findings in one subsystem are evidence of a missed invariant, not merely a
 queue of isolated lines to patch.
 
+A third cycle repeated the pattern, and two of its findings were regressions introduced
+by fixes from the previous round. The recurring defect classes are listed in
+[Known defect patterns](#known-defect-patterns); check every applicable item before
+asking for external review.
+
 ## Required Review Sequence
 
 ### 1. Define verifiable completion criteria
@@ -116,6 +121,45 @@ Examples of invariants that require system-wide checks:
   reclassification, slow transport plus freshness, contention plus shutdown, hostile
   nested wire fields plus serialization, and concurrent file or process state.
 
+### 5a. Keep tests proportionate
+
+Each test must protect a distinct contract that a plausible change could break. More
+tests are not better tests: every test costs suite time and maintenance, and may pin
+the current implementation.
+
+- Before adding a test, look for an existing table-driven or boundary test for the same
+  contract, and add a row or a case to it. Redaction formats, threshold boundaries, and
+  event orderings belong in tables, not separate methods.
+- Write one regression per violated invariant, not one per comment. Sibling variants of
+  the same invariant share one parameterized test.
+- A test must fail without the fix. If it cannot, it adds no protection; delete it or
+  say why it remains.
+- Do not test constants, trivial plumbing, logging text, or private helpers already
+  covered through the production entry point.
+- Assert observable behavior (persisted state, API output, process outcome), not
+  internal call sequences, unless the call sequence is the contract.
+- Prefer real components over deep mocks. Mock only process, clock, network, or
+  operating-system boundaries that cannot run safely in the test environment.
+- When a change makes an existing test redundant, remove or merge it in the same change.
+- If a race cannot be reproduced deterministically, do not add a sleep-based "stress"
+  test that passes either way. Document the reasoning in the review reply instead.
+
+### 5b. Keep tests deterministic
+
+A flaky test is a defect in the change that introduced it, not background noise.
+
+- Do not assert outcomes that depend on sub-second wall-clock races, such as a 40 ms
+  acknowledgement window or a 50 ms subprocess timeout. Patch the timing constant when
+  the semantics, not the latency, are under test.
+- When a hook or another process acknowledges before persisting, poll with a bounded
+  deadline instead of reading once.
+- Keep synthetic timestamps in the past. A timestamp later than the current clock is
+  treated as clock rollback.
+- Give subprocess fixtures enough time to start before a timeout fires, then bound the
+  total duration separately.
+- Run new or timing-sensitive tests repeatedly (at least 10 times) and run the full suite
+  at least twice before pushing. Check whether a failure also occurs on the base commit.
+
 ### 6. Make the review scope match the claim
 
 A targeted review supports only a targeted claim. Before claiming that a change or PR
@@ -165,6 +209,85 @@ For each external review finding:
 6. push only after the local review has no unresolved actionable findings;
 7. reply to and resolve addressed review threads;
 8. request another external review when the workflow or user requires it.
+
+### 9. Re-review your own fixes
+
+Fixes are new code and receive the same review as the original change.
+
+- Review the fix diff adversarially before pushing. Ask what the fix could break, not
+  only whether it resolves the comment.
+- When a fix changes a persisted format, a time base, or a counting rule, re-run the
+  boundary matrix for that dimension.
+- Never drop a "suspected but not reproduced" finding silently. Fix it, or record why
+  it cannot occur.
+- When a finding names one instance (one token prefix, one event kind, one field),
+  search for and fix the whole family before replying.
+
+## Known Defect Patterns
+
+These classes recurred across review cycles in this repository. Check each applicable
+item before requesting review.
+
+**Redaction and output safety**
+
+- Redact the complete value, then truncate. Never truncate first.
+- Strip whole terminal escape sequences before filtering characters; removing only ESC
+  leaves fragments such as `[0m` that split credential names.
+- Credential keys appear bare, quoted, single-quoted, escaped (`\"password\"`), doubly
+  escaped, and with prefixes or suffixes (`SECRET_KEY`, `secret_*`). Header names such
+  as `Authorization` and `Cookie` are credential keys too.
+- Cover a vendor's whole token family, not one prefix (for example
+  `ghp_`/`gho_`/`ghu_`/`ghs_`/`ghr_`/`github_pat_`).
+- A value that fails a safety check should degrade only that value. For example, a
+  token-like path segment must not reject the whole lifecycle event.
+
+**Ordering and terminal state**
+
+- Every terminal kind (`stop` and `failed`) needs the same handling for delayed,
+  same-timestamp, result-watermark, and session-end cases.
+- Watermarks must advance on metadata-only paths as well as state-changing paths.
+- Same-timestamp ties must not reopen a terminal or ended state.
+
+**Clocks and freshness**
+
+- Never compare one host's wall clock with another's. Advance the source clock by
+  monotonic elapsed time.
+- Choose the conservative boundary: measure from request start when aging a sample,
+  and from receipt when expiring a reservation.
+- Treat a timestamp later than the current clock as uncertainty in every observer, and
+  report the exact total as unavailable.
+- Use one threshold for a classification and for every alert or `partial` flag derived
+  from it.
+
+**Counting and truncation**
+
+- Compute an active total as one predicate. Disjoint sub-counts drop records that
+  satisfy neither half, for example a fresh idle session with a live tool.
+- Never derive alerts or totals from a page truncated for display. Sort records that
+  need attention first, and mark derived sections partial when the source was truncated.
+- One invalid row must not fail a whole collection. Skip it, log it, and report the
+  result as partial.
+- Health errors must decay. One lost write must not keep snapshots partial until
+  restart.
+
+**Persistence and upgrades**
+
+- Version any change to a persisted digest or format. Verify legacy values once, then
+  upgrade them, and test the upgrade from the previously pushed format. This applies
+  even before merge, because a pushed branch may already be running.
+
+**Concurrency and processes**
+
+- Never `clear()` and then refill a shared object that another thread may read. Publish
+  the new state in one swap.
+- A process-group leader exiting does not prove the group exited. After a failure,
+  check the group and SIGKILL any members that remain.
+
+**Parsing and cost**
+
+- Parsers of untrusted JSON must catch `RecursionError` alongside `ValueError`.
+- Verification on hot paths (for example, per-status transcript refresh) must
+  short-circuit when inputs are unchanged. Measure the cost on large inputs.
 
 ## Completion Standard
 
