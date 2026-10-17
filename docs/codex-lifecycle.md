@@ -134,6 +134,33 @@ Router's `failed` agent state therefore never appears for Codex.
   record the last Codex event seen per host, and, on explicit request, read Codex's
   config read-only for Router's trusted-hash entries.
 
+## Live verification (item 4b)
+
+Verified on 2026-10-17 with Codex CLI 0.162.1. Real `codex exec` sessions ran with
+this repository's `router/plugin/codex/hooks.json` supplied as per-run overrides,
+calling `router/plugin/codex/hook.sh` against an isolated Router daemon:
+
+- A root session with a shell command and one spawned subagent appeared in Router as
+  a `codex` session and a `codex/observe` agent, with the subagent's tool activity,
+  timing, and `stopped` ("Codex session ended") after the session ended. No snapshot
+  section was partial.
+- Resuming the session (`codex exec resume <id>`) did not continue the earlier
+  subagent: the model could only `wait` with no receivers. Treating a Codex
+  session's end as the end of its subagents therefore holds for exec sessions.
+- Not observed live: `PermissionRequest` (exec runs without approvals), `Interrupt`,
+  and compaction. Their mapping rests on the documentation and source.
+
+## Installation and trust (implemented)
+
+`router setup` runs `codex plugin marketplace add <marketplace>` and
+`codex plugin add agent-router@agent-router` when Codex is installed. This step is
+best effort and never blocks setup. The repository root ships `.codex-plugin/plugin.json`
+so Codex loads its own hooks file rather than falling back to the Claude manifest.
+Hooks must then be trusted once in Codex (`/hooks`). `router status` reports Codex
+observation readiness read-only by recomputing Codex's trust hash for each Router hook
+(`router/codex_plugin.py`), so an untrusted, modified, or disabled hook is reported
+instead of looking like an idle Codex.
+
 ## Testing implications for item 4
 
 - Router-launched Codex children disable delegation and ignore user config
@@ -142,8 +169,8 @@ Router's `failed` agent state therefore never appears for Codex.
   with placeholders), and verify the inferred behaviours marked **I** against a real
   session: per-turn `SubagentStop`, `send_input` turns, `Stop` continuation,
   `Interrupt`, and whether a `resume`d session continues existing subagent threads.
-  Router marks a Codex session's subagents stopped when the session ends; if resume
-  can continue them, their later activity must be allowed to reopen them.
+  Router marks a Codex session's subagents stopped when the session ends. Live
+  verification showed resume does not continue them, so they stay stopped.
 - Async hooks are stamped when they run, so a subagent hook can arrive after the
   session's `SessionEnd` with a later timestamp. Decide from the real session whether
   post-end subagent activity is allowed only after a later root `SessionStart`

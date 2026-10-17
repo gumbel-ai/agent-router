@@ -21,4 +21,4 @@ router-host-hook = "router.hooks:main"
 include = ["router*"]
 
 [tool.setuptools.package-data]
-router = ["plugin/.claude-plugin/*.json", "plugin/hooks/*.json", "plugin/skills/*/*.md", "plugin/hook.sh", "plugin/README.md", "plugin/LICENSE"]
+router = ["plugin/.claude-plugin/*.json", "plugin/hooks/*.json", "plugin/skills/*/*.md", "plugin/hook.sh", "plugin/README.md", "plugin/LICENSE", "plugin/codex/*"]
