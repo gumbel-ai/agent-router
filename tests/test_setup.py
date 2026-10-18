@@ -13,6 +13,7 @@ from unittest.mock import patch
 from router.client import request
 from router.config import load_settings
 from router.db import Store
+from router.paths import PROJECT_MARKER, PROJECT_MARKER_CONTENT
 from router.service import definition, start
 from router.setup import init, initialize, setup
 from router.snapshot import git
@@ -200,6 +201,11 @@ class SetupTests(unittest.TestCase):
             self.assertEqual(request("submit", {"session_id": "observe-only", "prompt_id": "turn", "cwd": str(self.root)}),
                              {"instruction_id": None})
             for number in range(2):
+                project = self.root / f"project-{number}"
+                project.mkdir()
+                (project / PROJECT_MARKER).write_text(json.dumps(PROJECT_MARKER_CONTENT))
+            # project-2 has no marker: its sessions are not recorded.
+            for number in range(3):
                 event = {"hook_event_name": "PostToolUse", "session_id": f"session-{number}",
                          "cwd": str(self.root / f"project-{number}"), "tool_name": "Agent",
                          "tool_input": {"description": "Observed task", "prompt": "DO NOT STORE THIS PROMPT"},

@@ -16,6 +16,7 @@ from pathlib import Path
 
 from router.client import request
 from router.dispatch import canonical
+from router.paths import observed_project
 from router.processes import parent_and_identity
 from router.sanitize import bound_text
 from router.validation import is_wire_integer
@@ -50,6 +51,11 @@ def run(argv: list[str], label: str | None, session_id: str | None, agent_id: st
             _identifier(value, name)
     if agent_id is not None and session_id is None:
         raise ValueError("--agent needs --session")
+    # Router records only commands run inside an observed project; others still run, unrecorded.
+    recorded = observed_project(os.getcwd()) is not None
+    if not recorded:
+        print("Agent Router: not recording this command; it is outside every observed project",
+              file=sys.stderr)
     managed_id = "managed-" + uuid.uuid4().hex
     # Everything that can fail is gathered before launch, so a failure never leaves an
     # untracked command behind.
@@ -80,7 +86,7 @@ def run(argv: list[str], label: str | None, session_id: str | None, agent_id: st
         for signum in pending:
             forward(signum, None)
         start = {**metadata, "pid": child.pid, "pgid": child.pid, "started_at": started_at}
-        if not _report("managed_start", start):
+        if recorded and not _report("managed_start", start):
             # The daemon may come back while the command runs; leave the start where it looks.
             _write_evidence(state, f"start-{managed_id}.json", start)
         _, status, usage = os.wait4(child.pid, 0)
@@ -100,7 +106,7 @@ def run(argv: list[str], label: str | None, session_id: str | None, agent_id: st
                   # ru_maxrss is kilobytes on Linux and bytes on macOS.
                   "max_process_rss_bytes": usage.ru_maxrss * (1024 if sys.platform == "linux" else 1),
                   "group_outlived": survivors, "start": start}
-        if not _report("managed_finish", finish):
+        if recorded and not _report("managed_finish", finish):
             # Evidence must survive a daemon that is down; the daemon reads it later.
             _write_evidence(state, f"{managed_id}.json", finish)
     finally:

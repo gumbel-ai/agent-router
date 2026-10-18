@@ -10,7 +10,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from test_control import settings
+from test_control import observe_every_session, settings
 
 from router import service
 from router.child import launch
@@ -36,6 +36,7 @@ class RuntimeHarness:
         git(self.repo, "add", ".")
         git(self.repo, "commit", "-qm", "initial")
         self.config = settings(self.repo, command=[sys.executable, str(Path(__file__).with_name("fixture_executor.py"))])
+        observe_every_session(self)
         self.control = Controller(self.config, os.environ.copy(), self.root / "state")
         self.runtime = Runtime(self.control)
         self.runtime.start()

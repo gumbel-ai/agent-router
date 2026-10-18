@@ -58,6 +58,11 @@ class Store:
                     host_id TEXT NOT NULL, source TEXT NOT NULL, session_id TEXT NOT NULL,
                     ended_at INTEGER NOT NULL,
                     PRIMARY KEY(host_id, source, session_id))""",
+                # Sessions seen inside an observed project; they are followed wherever they go.
+                """CREATE TABLE IF NOT EXISTS observed_sessions (
+                    host_id TEXT NOT NULL, source TEXT NOT NULL, session_id TEXT NOT NULL,
+                    admitted_at INTEGER NOT NULL,
+                    PRIMARY KEY(host_id, source, session_id))""",
                 """CREATE INDEX IF NOT EXISTS sessions_active_tool_deadline
                     ON sessions(host_id, json_extract(data,'$.tool_active_until'))
                     WHERE json_extract(data,'$.status')='running'""",

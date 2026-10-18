@@ -10,6 +10,7 @@ from pathlib import Path
 from router.cli import fleet_table
 from router.client import request
 from router.fleet import FleetConfig, FleetHost, query_fleet
+from router.paths import PROJECT_MARKER, PROJECT_MARKER_CONTENT
 
 
 class ManagedCommandSmokeTest(unittest.TestCase):
@@ -25,6 +26,10 @@ class ManagedCommandSmokeTest(unittest.TestCase):
         self.environment = {key: value for key, value in os.environ.items() if not key.startswith("AGENT_ROUTER_")}
         home = root / "home"
         home.mkdir()
+        # Router records only commands run inside an observed project.
+        self.project = root / "project"
+        self.project.mkdir()
+        (self.project / PROJECT_MARKER).write_text(json.dumps(PROJECT_MARKER_CONTENT))
         # Isolated from the developer's own Claude and Codex sessions; runnable from any directory.
         self.environment.update(AGENT_ROUTER_STATE_DIR=str(state), AGENT_ROUTER_SOCKET=str(self.socket),
                                 AGENT_ROUTER_ENV_FILE=str(root / "none.env"), HOME=str(home),
@@ -51,7 +56,8 @@ class ManagedCommandSmokeTest(unittest.TestCase):
     def router_run(self, label, script):
         return subprocess.run([sys.executable, "-m", "router.cli", "run", "--label", label, "--session", "S",
                                "--agent", "A", "--", sys.executable, "-c", script],
-                              env=self.environment, capture_output=True, text=True, timeout=60, check=False)
+                              env=self.environment, cwd=self.project, capture_output=True, text=True, timeout=60,
+                              check=False)
 
     def test_short_and_failing_managed_commands_reach_fleet_status(self):
         self.assertEqual(self.router_run("smoke-ok", "print('done')").returncode, 0)

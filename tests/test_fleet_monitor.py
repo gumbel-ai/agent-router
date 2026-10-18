@@ -50,6 +50,7 @@ from router.fleet import (
 from router.fleet_snapshot import MAX_SNAPSHOT_BYTES, AlertHistory, bound, compose
 from router.host import HostIdentity, current_boot_id, stable_host_id
 from router.native import NativeObserver
+from router.paths import PROJECT_MARKER, PROJECT_MARKER_CONTENT
 from router.sanitize import bound_text
 from router.sessions import MAX_EXACT_INFLIGHT_TOOLS, SessionObserver
 from router.validation import HOST_STRING_LIMITS
@@ -2735,6 +2736,7 @@ required = false
     def test_two_isolated_daemons_with_colliding_session_ids_merge_as_distinct_hosts(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
+            (root / PROJECT_MARKER).write_text(json.dumps(PROJECT_MARKER_CONTENT))
             processes = []
             endpoints = []
             try:
@@ -2761,7 +2763,7 @@ required = false
                     else:
                         self.fail("isolated daemon did not start")
                     request("session_observe", {"source": "claude", "session_id": "same", "kind": "session_start",
-                                                "observed_at": int(time.time() * 1000)}, endpoint)
+                                                "observed_at": int(time.time() * 1000), "cwd": str(root)}, endpoint)
                 config = FleetConfig((FleetHost("one", "local"), FleetHost("two", "ssh", target="emulated")),
                                      ssh_timeout_seconds=1)
                 with patch("router.fleet.ssh_snapshot", side_effect=lambda host, timeout: request("snapshot", {}, endpoints[1])):

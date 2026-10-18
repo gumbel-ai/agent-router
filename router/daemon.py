@@ -25,7 +25,8 @@ from router.dispatch import MUTATIONS, canonical
 from router.fleet_snapshot import AlertHistory
 from router.host import HostIdentity
 from router.managed import ManagedProcesses
-from router.native import NativeObserver, identifier, safe_text
+from router.native import SOURCES, NativeObserver, identifier, safe_text
+from router.paths import observed_project
 from router.process import (
     UncertainProcess,
     UnconfirmedShutdown,
@@ -51,7 +52,8 @@ def _lifecycle_result(queued: bool, persistence: dict[str, str],
                       reason: str | None = None) -> dict:
     """Build the additive lifecycle acknowledgement contract."""
     states = dict(persistence)
-    persisted = bool(states) and all(state == "persisted" for state in states.values())
+    # An event outside every observed project is deliberately not recorded; that is not a failure.
+    persisted = bool(states) and all(state in {"persisted", "not_observed"} for state in states.values())
     partial = any(state == "persisted" for state in states.values()) and not persisted
     result = {
         "accepted": persisted,
@@ -182,13 +184,46 @@ class Controller:
         while True:
             work = self.lifecycle_queue.get()
             completed = None
+            scope_error = None
             try:
                 if work is None:
                     return
                 payload, completed, outcome = work
+                admitted = set()
+                # Admission is per session: one request's components may name different sessions,
+                # and one component's malformed identity or scope error must not discard another's.
+                sessions: dict[tuple, list[str]] = {}
+                for key in outcome["persistence"]:
+                    event = payload[key]
+                    identity = (event.get("source"), event.get("session_id")) if isinstance(event, dict) else None
+                    if identity is None or not all(isinstance(part, str) for part in identity):
+                        outcome["persistence"][key] = "failed"
+                        LOGGER.warning("Lifecycle %s observation has no valid source and session_id", key)
+                        with self.lifecycle_health_lock:
+                            self.lifecycle_failures += 1
+                            self.lifecycle_problem_at = now_ms()
+                        continue
+                    sessions.setdefault(identity, []).append(key)
+                for keys in sessions.values():
+                    try:
+                        in_scope = self.in_scope([payload[key] for key in keys], self._lifecycle_write_timeout())
+                    except (sqlite3.Error, ValueError, OSError) as error:
+                        scope_error = str(error)
+                        LOGGER.warning("Lifecycle observation project scope could not be checked: %s", error)
+                        with self.lifecycle_health_lock:
+                            self.lifecycle_failures += 1
+                            self.lifecycle_problem_at = now_ms()
+                        for key in keys:
+                            outcome["persistence"][key] = "failed"
+                        continue
+                    for key in keys:
+                        if in_scope:
+                            admitted.add(key)
+                        else:
+                            outcome["persistence"][key] = "not_observed"
                 for key, observer in (("session", self.sessions), ("native", self.native)):
                     event = payload.get(key)
-                    if event is None:
+                    if key not in admitted:
                         continue
                     try:
                         observer.observe(event, timeout=self._lifecycle_write_timeout())
@@ -225,6 +260,8 @@ class Controller:
                                   if any(state == "persisted" for state in outcome["persistence"].values())
                                   else "Lifecycle observation could not be persisted; failed components: ")
                         reason = prefix + ", ".join(failed)
+                        if scope_error is not None:
+                            reason += "; project scope could not be checked: " + scope_error
                     terminal = _lifecycle_result(False, outcome["persistence"], reason)
                     # No clear(): a request thread that timed out may be reading
                     # outcome["persistence"] concurrently; update() swaps it whole.
@@ -246,9 +283,10 @@ class Controller:
         deadline = self.lifecycle_stop_deadline
         remaining = max(0.0, deadline - time.monotonic()) if deadline is not None else 0.0
         # Share the remaining shutdown window across the queued work. Each
-        # item may contain two writes, so no single contended write consumes
-        # the entire hard stop budget. SQLite still gets a nonzero opportunity.
-        return max(.001, min(1.0, remaining / (pending * 2)))
+        # item may contain three writes (session admission and two components),
+        # so no single contended write consumes the entire hard stop budget.
+        # SQLite still gets a nonzero opportunity.
+        return max(.001, min(1.0, remaining / (pending * 3)))
 
     def stop_lifecycle_writer(self) -> None:
         with self.lifecycle_lock:
@@ -303,6 +341,39 @@ class Controller:
             return (self._lifecycle_generation,
                     self.lifecycle_pending + self.lifecycle_direct_active)
 
+    def in_scope(self, events: list[dict], timeout: float = 10) -> bool:
+        """Record a session once it is seen inside an observed project (see observed_project).
+
+        events are one session's. Admission is stored durably, so later events follow the
+        session wherever its working directory goes (even past a malformed marker) and
+        leaving the project cannot strand it as active. Sessions recorded before admission
+        was stored are recognised by their lifecycle rows.
+        """
+        source, session_id = events[0].get("source"), events[0].get("session_id")
+        key = (self.host.host_id, source, session_id)
+        with self.store.connect(timeout) as db:
+            if (db.execute("SELECT 1 FROM observed_sessions WHERE host_id=? AND source=? AND session_id=?",
+                           key).fetchone()
+                    or db.execute("SELECT 1 FROM sessions WHERE host_id=? AND source=? AND session_id=?",
+                                  key).fetchone()
+                    # The agent_id term lets SQLite use the partial observations_identity index.
+                    or db.execute("""SELECT 1 FROM observations WHERE json_extract(data,'$.host_id')=?
+                            AND json_extract(data,'$.source')=? AND session_id=?
+                            AND json_extract(data,'$.agent_id') IS NOT NULL""", key).fetchone()):
+                return True
+        if not any(observed_project(event.get("cwd")) is not None for event in events):
+            return False
+        if source in SOURCES and isinstance(session_id, str):
+            # Malformed identities are not stored; the observer rejects them with its own error.
+            try:
+                identifier(session_id, "session_id")
+            except ValueError:
+                return True
+            with self.store.transaction(timeout) as db:
+                db.execute("""INSERT INTO observed_sessions(host_id,source,session_id,admitted_at)
+                        VALUES(?,?,?,?) ON CONFLICT DO NOTHING""", (*key, now_ms()))
+        return True
+
     def _observe_lifecycle_direct(self, observer, payload: dict) -> dict:
         # The compatibility endpoints remain synchronous, but must participate
         # in the same snapshot consistency protocol as the queued hook path.
@@ -310,6 +381,8 @@ class Controller:
             self.lifecycle_direct_active += 1
             self._lifecycle_generation += 1
         try:
+            if not self.in_scope([payload]):
+                return {"observed": False, "reason": "Session is outside every observed project"}
             return observer.observe(payload)
         finally:
             with self.lifecycle_health_lock:

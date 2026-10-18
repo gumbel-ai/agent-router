@@ -4,6 +4,7 @@ import unittest
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
 from pathlib import Path
+from unittest.mock import patch
 
 from router.config import Settings
 from router.daemon import Controller
@@ -15,6 +16,13 @@ def settings(root: Path, cap: int = 3, timeout: float = 30, attempts: int = 2, c
                     AGENT_ROUTER_MAX_ATTEMPTS=attempts, AGENT_ROUTER_OPENCODE_COMMAND=command or ["opencode"],
                     AGENT_ROUTER_MODELS={"test": "provider/exact"},
                     AGENT_ROUTER_REPOSITORIES={str(root): {"setup_command": "true"}})
+
+
+def observe_every_session(test: unittest.TestCase) -> None:
+    """Admit every lifecycle event, for tests of recording itself; test_project_scope covers scoping."""
+    scope = patch.object(Controller, "in_scope", return_value=True)
+    scope.start()
+    test.addCleanup(scope.stop)
 
 
 class ControlTests(unittest.TestCase):

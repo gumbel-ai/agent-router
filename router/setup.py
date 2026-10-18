@@ -83,7 +83,8 @@ def setup(yes: bool = False, marketplace: str = MARKETPLACE) -> None:
     install_codex_plugin(marketplace)
     private_write(runtime_pointer(), str(Path(sys.executable).absolute()) + "\n")
     result = start(restart=bool(current))
-    print(f"Agent Router ready ({result['version']}). Run ordinary claude in any project, and router status --watch in a terminal.")
+    print(f"Agent Router ready ({result['version']}). Commit {{\"observe\": true}} as .agent-router.json in each project "
+          "to observe, run ordinary claude or codex there, and router status --watch in a terminal.")
     print("External delegation is opt-in: run router init in each target project. Restart existing Claude sessions to load the plugin.")
 
 
