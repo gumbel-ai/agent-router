@@ -10,7 +10,7 @@ readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
 requires-python = ">=3.14"
-dependencies = ["pydantic-settings>=2.10,<3", "tomlkit>=0.13.3,<1"]
+dependencies = ["pydantic-settings>=2.10,<3", "tomlkit>=0.13.3,<1", "websockets>=17.1,<18"]
 
 [project.scripts]
 router = "router.cli:main"

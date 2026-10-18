@@ -8,21 +8,105 @@ they only report which prerequisite is missing, so an untrusted or disabled plug
 is never mistaken for an idle Codex. See docs/codex-lifecycle.md.
 """
 
+import asyncio
 import functools
 import hashlib
 import json
 import os
 import shutil
-import tomllib
 from pathlib import Path
 
+from websockets.asyncio.client import unix_connect
+from websockets.exceptions import WebSocketException
+
 from router.observer_hook import CODEX_EVENTS
+from router.paths import observed_project
 
 PLUGIN_ID = "agent-router@agent-router"
 PLUGIN_CACHE = ("plugins", "cache", "agent-router", "agent-router")
 HOOKS_FILE = "router/plugin/codex/hooks.json"
 # Codex clamps these events' timeouts to 1-3 s; others default to 600 s.
 SHORT_TIMEOUT_EVENTS = {"SessionEnd", "Interrupt"}
+READINESS_TIMEOUT = 5
+READINESS_OUTPUT_LIMIT = 1024 * 1024
+
+
+async def _readiness_evidence(home: Path, cwd: Path) -> tuple[dict, dict, list[str]]:
+    """Query the existing native daemon; never start one or refresh plugins."""
+    # Native Codex can advertise long paths through short rendezvous aliases.
+    endpoint = (home / "app-server-control" / "app-server-control.sock").resolve(strict=True)
+    size = 0
+    async with asyncio.timeout(READINESS_TIMEOUT):
+        async with unix_connect(endpoint, open_timeout=READINESS_TIMEOUT, close_timeout=1,
+                                max_size=READINESS_OUTPUT_LIMIT, max_queue=1,
+                                compression=None, ping_interval=None, proxy=None) as connection:
+            async def receive(identity):
+                nonlocal size
+                while True:
+                    raw = await connection.recv()
+                    size += len(raw.encode() if isinstance(raw, str) else raw)
+                    if size > READINESS_OUTPUT_LIMIT:
+                        raise ValueError("Codex readiness output exceeded the one MiB bound")
+                    try:
+                        message = json.loads(raw)
+                    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError) as failure:
+                        raise ValueError(f"Codex readiness returned invalid JSON: {failure}") from failure
+                    if not isinstance(message, dict):
+                        raise TypeError("Codex readiness returned a non-object JSON message")
+                    if type(message.get("id")) is not int or message["id"] != identity:
+                        continue
+                    if "error" in message:
+                        failure = message["error"]
+                        if not isinstance(failure, dict) or not isinstance(failure.get("message"), str):
+                            raise ValueError("Codex readiness returned a malformed RPC error")
+                        raise ValueError(f"Codex readiness RPC error: {failure['message']}")
+                    if not isinstance(message.get("result"), dict):
+                        raise TypeError("Codex readiness returned a malformed RPC result")
+                    return message["result"]
+
+            await connection.send(json.dumps({"id": 0, "method": "initialize", "params": {
+                # Native daemon probes use this non-originating identity so initialize
+                # leaves daemon-wide auth policy and client metadata unchanged (0.163.0).
+                "clientInfo": {"name": "codex_app_server_daemon", "title": "Agent Router readiness probe", "version": "1"},
+                "capabilities": {"experimentalApi": True}}}))
+            daemon_home = (await receive(0)).get("codexHome")
+            if not isinstance(daemon_home, str) or not Path(daemon_home).is_absolute():
+                raise ValueError("Codex readiness initialization lacks an absolute daemon home")
+            if Path(daemon_home).resolve() != home:
+                raise ValueError("Codex readiness daemon serves a different Codex home")
+            await connection.send(json.dumps({"method": "initialized", "params": {}}))
+            await connection.send(json.dumps({"id": 1, "method": "config/read",
+                                               "params": {"cwd": str(cwd), "includeLayers": False}}))
+            result = (await receive(1)).get("config")
+            if not isinstance(result, dict):
+                raise TypeError("Codex readiness config/read result lacks a configuration object")
+            await connection.send(json.dumps({"id": 2, "method": "hooks/list", "params": {"cwds": [str(cwd)]}}))
+            data = (await receive(2)).get("data")
+            if (not isinstance(data, list) or len(data) != 1 or not isinstance(data[0], dict)
+                    or data[0].get("cwd") != str(cwd) or not isinstance(data[0].get("hooks"), list)
+                    or not isinstance(data[0].get("errors"), list)
+                    or not isinstance(data[0].get("warnings"), list)
+                    or not all(isinstance(warning, str) for warning in data[0]["warnings"])):
+                raise ValueError("Codex readiness hook inventory is missing or malformed")
+            if data[0]["errors"]:
+                raise ValueError("Codex readiness hook inventory errors: " + json.dumps(data[0]["errors"])[:4096])
+            # Native discovery excludes project layers from user hook trust.
+            state = {}
+            for hook in data[0]["hooks"]:
+                if not isinstance(hook, dict):
+                    raise TypeError("Codex readiness hook inventory contains a non-object")
+                if hook.get("pluginId") != PLUGIN_ID:
+                    continue
+                key, status = hook.get("key"), hook.get("trustStatus")
+                if (not isinstance(key, str) or key in state or type(hook.get("enabled")) is not bool
+                        or status not in {"trusted", "untrusted", "modified"}):
+                    raise ValueError("Codex readiness Router hook state is malformed or unsupported")
+                state[key] = {"enabled": hook["enabled"]}
+                if status == "trusted":
+                    if not isinstance(hook.get("currentHash"), str):
+                        raise ValueError("Codex readiness trusted Router hook has no current hash")
+                    state[key]["trusted_hash"] = hook["currentHash"]
+            return result, state, data[0]["warnings"]
 
 
 def _snake(event: str) -> str:
@@ -120,25 +204,50 @@ def availability(codex_home: Path | None = None) -> dict:
     """Return {"state": ..., "detail": ...} describing Codex observation readiness."""
     if shutil.which("codex") is None:
         return {"state": "codex_not_installed", "detail": "Codex CLI not found on PATH"}
-    home = (codex_home or Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex")).expanduser()
+    selected = codex_home if codex_home is not None else os.environ.get("CODEX_HOME")
+    if selected is None:
+        try:
+            selected = Path.home() / ".codex"
+        except RuntimeError as error:
+            return {"state": "unknown", "detail": f"Default Codex home unavailable: {error}"}
+    if not selected:
+        return {"state": "unknown", "detail": "CODEX_HOME must not be empty"}
     try:
-        config = tomllib.loads((home / "config.toml").read_text())
-    except FileNotFoundError:
-        config = {}
-    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as error:
-        return {"state": "unknown", "detail": f"Codex config unreadable: {error}"}
-    plugins, features, hooks = (config.get(name, {}) for name in ("plugins", "features", "hooks"))
+        home, cwd = Path(selected).expanduser().resolve(), Path.cwd().resolve()
+    except (OSError, ValueError, RuntimeError) as error:
+        return {"state": "unknown", "detail": f"Readiness paths unavailable: {error}"}
+    try:
+        if observed_project(str(cwd)) is None:
+            return {"state": "project_not_enabled", "detail": "Run router enable in this project and commit its configuration"}
+    except (OSError, ValueError) as error:
+        return {"state": "unknown", "detail": f"Project admission unavailable: {error}"}
+    try:
+        root = active_plugin_root(home)
+        if root is None:
+            return {"state": "plugin_not_installed", "detail": "Refresh Router's plugin cache in the selected Codex home"}
+    except OSError as error:
+        return {"state": "unknown", "detail": f"Codex plugin cache unreadable: {error}"}
+    try:
+        config, state, warnings = asyncio.run(_readiness_evidence(home, cwd))
+    except TimeoutError:
+        return {"state": "unknown", "detail": "Codex readiness deadline exceeded; existing daemon did not reply"}
+    except (OSError, ValueError, TypeError, WebSocketException) as error:
+        return {"state": "unknown", "detail": f"Codex readiness unavailable; start Codex normally in the selected home: {error}"}
+    # config/read represents absent optional TOML tables as JSON null.
+    plugins, features, hooks = ({} if config.get(name) is None else config[name]
+                               for name in ("plugins", "features", "hooks"))
     if not all(isinstance(table, dict) for table in (plugins, features, hooks)):
         return {"state": "unknown", "detail": "Codex config has an unexpected shape"}
     plugin = plugins.get(PLUGIN_ID)
-    try:
-        root = active_plugin_root(home)
-    except OSError as error:
-        return {"state": "unknown", "detail": f"Codex plugin cache unreadable: {error}"}
-    if not isinstance(plugin, dict) or root is None:
+    if not isinstance(plugin, dict):
         return {"state": "plugin_not_installed", "detail": "Run router setup and router enable; refresh plugins in Codex"}
+    if ("enabled" in plugin and type(plugin["enabled"]) is not bool
+            or any(name in features and type(features[name]) is not bool for name in ("plugins", "hooks", "codex_hooks"))):
+        return {"state": "unknown", "detail": "Codex plugin and hook feature flags must be booleans"}
     if plugin.get("enabled") is False:
         return {"state": "plugin_disabled", "detail": f"Enable {PLUGIN_ID} in Codex"}
+    if features.get("plugins") is False:
+        return {"state": "plugin_disabled", "detail": "Codex plugins are turned off in [features]"}
     # Codex applies features in key order, so `hooks` overrides its legacy alias `codex_hooks`.
     if features.get("hooks", features.get("codex_hooks")) is False:
         return {"state": "hooks_disabled", "detail": "Codex hooks are turned off in [features]"}
@@ -151,7 +260,12 @@ def availability(codex_home: Path | None = None) -> dict:
         return {"state": "unknown", "detail": f"Installed Codex plugin hooks unreadable: {error}"}
     if missing:
         return {"state": "unknown", "detail": "Installed Codex plugin lacks hooks for " + ", ".join(missing)}
-    state = hooks.get("state", {})
+    missing_hooks = trust.keys() - state.keys()
+    if missing_hooks:
+        detail = f"Native Codex inventory is missing Router hooks ({len(missing_hooks)})"
+        if warnings:
+            detail += ": " + json.dumps(warnings)[:4096]
+        return {"state": "unknown", "detail": detail}
     untrusted, modified, disabled = [], [], []
     for key, expected in trust.items():
         entry = state.get(key) if isinstance(state, dict) else None
