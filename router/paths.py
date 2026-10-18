@@ -78,7 +78,10 @@ def observed_project(cwd: str | None) -> Path | None:
                 raw = file.read(MAX_PROJECT_MARKER_BYTES + 1)
             if len(raw) > MAX_PROJECT_MARKER_BYTES:
                 raise ValueError(f'{marker} must contain exactly {{"observe": true}}')
-            content = json.loads(raw)
+            try:
+                content = json.loads(raw)
+            except ValueError as error:
+                raise ValueError(f'{marker} must contain exactly {{"observe": true}}: {error}') from error
             # `is True`: JSON 1 compares equal to True, and only an explicit true opts in.
             if not isinstance(content, dict) or set(content) != {"observe"} or content["observe"] is not True:
                 raise ValueError(f'{marker} must contain exactly {{"observe": true}}')

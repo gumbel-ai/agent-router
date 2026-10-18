@@ -67,8 +67,9 @@ class MarkerLookupTests(unittest.TestCase):
                         '{"observe": true, "extra": 1}', '{"observe": true}' + " " * 64, b"\xff"):
             with self.subTest(content=content):
                 mark(self.root, content)
-                with self.assertRaises(ValueError):
+                with self.assertRaises(ValueError) as caught:
                     observed_project(str(self.root / "src"))
+                self.assertIn(str(self.root / PROJECT_MARKER), str(caught.exception))  # Names what to fix.
 
     def test_a_marker_that_is_not_a_regular_file_is_an_error(self):
         for name, make in (("directory", lambda marker: marker.mkdir()),
@@ -171,6 +172,42 @@ class LifecycleScopeTests(unittest.TestCase):
                 self.assertEqual(stderr, "")
                 self.assertEqual(self.sessions()[session]["status"], "stopped")
 
+    def test_admission_survives_first_events_that_write_no_session_row(self):
+        at = int(time.time() * 1000)
+        first_events = {
+            # A tool completion without a correlation ID creates no session record.
+            "untracked-tool": {"session": {"source": "claude", "session_id": "untracked-tool", "kind": "tool_end",
+                                           "observed_at": at, "cwd": str(self.project)}},
+            # A native-only session end writes only a watermark.
+            "native-end": {"native": {"source": "codex", "session_id": "native-end", "kind": "session_end",
+                                      "observed_at": at, "cwd": str(self.project)}}}
+        for session, payload in first_events.items():
+            with self.subTest(session=session):
+                self.control.handle("lifecycle_observe", payload)
+        self.control.stop_lifecycle_writer()
+        self.start(self.root / "state")
+        for session, payload in first_events.items():
+            with self.subTest(session=session):
+                source = next(iter(payload.values()))["source"]
+                response = self.control.handle("lifecycle_observe", {"session": {
+                    "source": source, "session_id": session, "kind": "session_start", "observed_at": at + 10,
+                    "cwd": str(self.other)}})
+                self.assertEqual(response["persistence"], {"session": "persisted"})
+                self.assertIn(session, self.sessions())
+
+    def test_one_sessions_scope_error_keeps_another_sessions_event(self):
+        mark(self.other, "{}")
+        self.hook("claude", "SessionStart", self.project, "known", source="startup")
+        at = int(time.time() * 1000)
+        with redirect_stderr(io.StringIO()):
+            response = self.control.handle("lifecycle_observe", {
+                "session": {"source": "claude", "session_id": "known", "kind": "session_end", "observed_at": at,
+                            "cwd": str(self.other)},
+                "native": {"source": "claude", "session_id": "new", "agent_id": "a", "kind": "start",
+                           "observed_at": at, "cwd": str(self.other)}})
+        self.assertEqual(response["persistence"], {"session": "persisted", "native": "failed"})
+        self.assertEqual(self.sessions()["known"]["status"], "stopped")
+
     def test_one_request_cannot_admit_another_sessions_event(self):
         at = int(time.time() * 1000)
         response = self.control.handle("lifecycle_observe", {
@@ -188,8 +225,7 @@ class LifecycleScopeTests(unittest.TestCase):
         self.assertFalse(responses[0]["accepted"])
         self.assertEqual(set(responses[0]["persistence"].values()), {"failed"})
         # The hook names the marker, not a generic write failure.
-        self.assertIn(f"Agent Router observation unavailable: Lifecycle observation project scope could not be "
-                      f"checked: {self.other / PROJECT_MARKER}", stderr)
+        self.assertIn(f"project scope could not be checked: {self.other / PROJECT_MARKER}", stderr)
         self.assertEqual(self.control.lifecycle_failures, 1)
         self.assertEqual(self.rows("sessions"), 0)
 

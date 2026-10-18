@@ -25,7 +25,7 @@ from router.dispatch import MUTATIONS, canonical
 from router.fleet_snapshot import AlertHistory
 from router.host import HostIdentity
 from router.managed import ManagedProcesses
-from router.native import NativeObserver, identifier, safe_text
+from router.native import SOURCES, NativeObserver, identifier, safe_text
 from router.paths import observed_project
 from router.process import (
     UncertainProcess,
@@ -190,27 +190,30 @@ class Controller:
                     return
                 payload, completed, outcome = work
                 admitted = set()
-                try:
-                    if not all(isinstance(payload[key], dict) for key in outcome["persistence"]):
-                        raise ValueError("Lifecycle observation components must be objects")
-                    # Admission is per session: one request's components may name different sessions.
-                    sessions: dict[tuple, list[str]] = {}
-                    for key in outcome["persistence"]:
-                        sessions.setdefault((payload[key].get("source"), payload[key].get("session_id")), []).append(key)
-                    for keys in sessions.values():
-                        if self.in_scope([payload[key] for key in keys]):
-                            admitted.update(keys)
+                if not all(isinstance(payload[key], dict) for key in outcome["persistence"]):
+                    raise ValueError("Lifecycle observation components must be objects")
+                # Admission is per session: one request's components may name different sessions,
+                # and one session's scope error must not discard another's event.
+                sessions: dict[tuple, list[str]] = {}
+                for key in outcome["persistence"]:
+                    sessions.setdefault((payload[key].get("source"), payload[key].get("session_id")), []).append(key)
+                for keys in sessions.values():
+                    try:
+                        in_scope = self.in_scope([payload[key] for key in keys])
+                    except (sqlite3.Error, ValueError, OSError) as error:
+                        scope_error = str(error)
+                        LOGGER.warning("Lifecycle observation project scope could not be checked: %s", error)
+                        with self.lifecycle_health_lock:
+                            self.lifecycle_failures += 1
+                            self.lifecycle_problem_at = now_ms()
+                        for key in keys:
+                            outcome["persistence"][key] = "failed"
+                        continue
+                    for key in keys:
+                        if in_scope:
+                            admitted.add(key)
                         else:
-                            for key in keys:
-                                outcome["persistence"][key] = "not_observed"
-                except (sqlite3.Error, ValueError, OSError) as error:
-                    scope_error = str(error)
-                    admitted.clear()
-                    outcome["persistence"] = dict.fromkeys(outcome["persistence"], "failed")
-                    LOGGER.warning("Lifecycle observation project scope could not be checked: %s", error)
-                    with self.lifecycle_health_lock:
-                        self.lifecycle_failures += 1
-                        self.lifecycle_problem_at = now_ms()
+                            outcome["persistence"][key] = "not_observed"
                 for key, observer in (("session", self.sessions), ("native", self.native)):
                     event = payload.get(key)
                     if key not in admitted:
@@ -251,7 +254,7 @@ class Controller:
                                   else "Lifecycle observation could not be persisted; failed components: ")
                         reason = prefix + ", ".join(failed)
                         if scope_error is not None:
-                            reason = "Lifecycle observation project scope could not be checked: " + scope_error
+                            reason += "; project scope could not be checked: " + scope_error
                     terminal = _lifecycle_result(False, outcome["persistence"], reason)
                     # No clear(): a request thread that timed out may be reading
                     # outcome["persistence"] concurrently; update() swaps it whole.
@@ -333,21 +336,35 @@ class Controller:
     def in_scope(self, events: list[dict]) -> bool:
         """Record a session once it is seen inside an observed project (see observed_project).
 
-        events are one session's. Later events follow an admitted session wherever its working
-        directory goes (even past a malformed marker), so leaving the project cannot strand it
-        as active.
+        events are one session's. Admission is stored durably, so later events follow the
+        session wherever its working directory goes (even past a malformed marker) and
+        leaving the project cannot strand it as active. Sessions recorded before admission
+        was stored are recognised by their lifecycle rows.
         """
+        source, session_id = events[0].get("source"), events[0].get("session_id")
+        key = (self.host.host_id, source, session_id)
         with self.store.connect() as db:
-            for event in events:
-                key = (self.host.host_id, event.get("source"), event.get("session_id"))
-                if (db.execute("SELECT 1 FROM sessions WHERE host_id=? AND source=? AND session_id=?",
-                               key).fetchone()
-                        # The agent_id term lets SQLite use the partial observations_identity index.
-                        or db.execute("""SELECT 1 FROM observations WHERE json_extract(data,'$.host_id')=?
-                                AND json_extract(data,'$.source')=? AND session_id=?
-                                AND json_extract(data,'$.agent_id') IS NOT NULL""", key).fetchone()):
-                    return True
-        return any(observed_project(event.get("cwd")) is not None for event in events)
+            if (db.execute("SELECT 1 FROM observed_sessions WHERE host_id=? AND source=? AND session_id=?",
+                           key).fetchone()
+                    or db.execute("SELECT 1 FROM sessions WHERE host_id=? AND source=? AND session_id=?",
+                                  key).fetchone()
+                    # The agent_id term lets SQLite use the partial observations_identity index.
+                    or db.execute("""SELECT 1 FROM observations WHERE json_extract(data,'$.host_id')=?
+                            AND json_extract(data,'$.source')=? AND session_id=?
+                            AND json_extract(data,'$.agent_id') IS NOT NULL""", key).fetchone()):
+                return True
+        if not any(observed_project(event.get("cwd")) is not None for event in events):
+            return False
+        if source in SOURCES and isinstance(session_id, str):
+            # Malformed identities are not stored; the observer rejects them with its own error.
+            try:
+                identifier(session_id, "session_id")
+            except ValueError:
+                return True
+            with self.store.transaction() as db:
+                db.execute("""INSERT INTO observed_sessions(host_id,source,session_id,admitted_at)
+                        VALUES(?,?,?,?) ON CONFLICT DO NOTHING""", (*key, now_ms()))
+        return True
 
     def _observe_lifecycle_direct(self, observer, payload: dict) -> dict:
         # The compatibility endpoints remain synchronous, but must participate
