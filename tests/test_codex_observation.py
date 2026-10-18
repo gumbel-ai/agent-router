@@ -13,7 +13,7 @@ from contextlib import redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 
-from test_control import settings
+from test_control import observe_every_session, settings
 
 from router import observer_hook
 from router.cli import fleet_table, sessions_table
@@ -35,6 +35,7 @@ class CodexObservationTests(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
         self.control = Controller(settings(self.root / "repo"), {}, self.root / "state")
+        observe_every_session(self)
         # Wait for each write to persist instead of racing the 40 ms acknowledgement.
         timeout = patch("router.daemon.LIFECYCLE_ACK_TIMEOUT_SECONDS", 10)
         timeout.start()

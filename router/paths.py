@@ -57,3 +57,23 @@ def configuration(values: dict | None = None) -> tuple[dict, dict[str, str]]:
 
 def delegation_target(cwd: str | None, repositories: dict) -> bool:
     return isinstance(cwd, str) and any(Path(cwd).resolve().is_relative_to(Path(root).expanduser().resolve()) for root in repositories)
+
+
+PROJECT_MARKER = ".agent-router.json"
+PROJECT_MARKER_CONTENT = {"observe": True}
+
+
+def observed_project(cwd: str | None) -> Path | None:
+    """The opted-in project containing cwd: its nearest ancestor holding a project marker."""
+    if not isinstance(cwd, str) or not Path(cwd).is_absolute():
+        return None
+    path = Path(cwd)
+    for directory in (path, *path.parents):
+        marker = directory / PROJECT_MARKER
+        if marker.is_file():
+            content = json.loads(marker.read_text())
+            # `is True`: JSON 1 compares equal to True, and only an explicit true opts in.
+            if not isinstance(content, dict) or set(content) != {"observe"} or content["observe"] is not True:
+                raise ValueError(f'{marker} must contain exactly {{"observe": true}}')
+            return directory
+    return None

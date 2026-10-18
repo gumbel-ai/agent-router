@@ -16,6 +16,7 @@ from router.daemon import Controller
 from router.fleet import _validate_snapshot
 from router.fleet_snapshot import compose
 from router.managed import completion_directory, run
+from router.paths import PROJECT_MARKER, PROJECT_MARKER_CONTENT
 from router.processes import parent_and_identity
 
 
@@ -26,6 +27,12 @@ class ManagedRunTests(unittest.TestCase):
         root = Path(self.temp.name)
         self.state = root / "state"
         self.control = Controller(settings(root / "repo"), {}, self.state)
+        # Router records only commands run inside an observed project.
+        project = root / "project"
+        project.mkdir()
+        (project / PROJECT_MARKER).write_text(json.dumps(PROJECT_MARKER_CONTENT))
+        self.addCleanup(os.chdir, os.getcwd())
+        os.chdir(project)
         self.daemon_up = True
 
     def request(self, operation, payload, timeout):

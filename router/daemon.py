@@ -26,6 +26,7 @@ from router.fleet_snapshot import AlertHistory
 from router.host import HostIdentity
 from router.managed import ManagedProcesses
 from router.native import NativeObserver, identifier, safe_text
+from router.paths import observed_project
 from router.process import (
     UncertainProcess,
     UnconfirmedShutdown,
@@ -51,7 +52,8 @@ def _lifecycle_result(queued: bool, persistence: dict[str, str],
                       reason: str | None = None) -> dict:
     """Build the additive lifecycle acknowledgement contract."""
     states = dict(persistence)
-    persisted = bool(states) and all(state == "persisted" for state in states.values())
+    # An event outside every observed project is deliberately not recorded; that is not a failure.
+    persisted = bool(states) and all(state in {"persisted", "not_observed"} for state in states.values())
     partial = any(state == "persisted" for state in states.values()) and not persisted
     result = {
         "accepted": persisted,
@@ -186,9 +188,21 @@ class Controller:
                 if work is None:
                     return
                 payload, completed, outcome = work
+                try:
+                    in_scope = self.in_scope([payload[key] for key in outcome["persistence"]])
+                except (sqlite3.Error, ValueError, OSError) as error:
+                    in_scope = False
+                    outcome["persistence"] = dict.fromkeys(outcome["persistence"], "failed")
+                    LOGGER.warning("Lifecycle observation project scope could not be checked: %s", error)
+                    with self.lifecycle_health_lock:
+                        self.lifecycle_failures += 1
+                        self.lifecycle_problem_at = now_ms()
+                else:
+                    if not in_scope:
+                        outcome["persistence"] = dict.fromkeys(outcome["persistence"], "not_observed")
                 for key, observer in (("session", self.sessions), ("native", self.native)):
                     event = payload.get(key)
-                    if event is None:
+                    if event is None or not in_scope:
                         continue
                     try:
                         observer.observe(event, timeout=self._lifecycle_write_timeout())
@@ -303,6 +317,24 @@ class Controller:
             return (self._lifecycle_generation,
                     self.lifecycle_pending + self.lifecycle_direct_active)
 
+    def in_scope(self, events: list[dict]) -> bool:
+        """Record a session once it is seen inside an observed project (see observed_project).
+
+        Later events follow an admitted session wherever its working directory goes, so
+        leaving the project cannot strand it as active.
+        """
+        if any(observed_project(event.get("cwd")) is not None for event in events):
+            return True
+        with self.store.connect() as db:
+            for event in events:
+                key = (self.host.host_id, event.get("source"), event.get("session_id"))
+                if (db.execute("SELECT 1 FROM sessions WHERE host_id=? AND source=? AND session_id=?",
+                               key).fetchone()
+                        or db.execute("""SELECT 1 FROM observations WHERE json_extract(data,'$.host_id')=?
+                                AND json_extract(data,'$.source')=? AND session_id=?""", key).fetchone()):
+                    return True
+        return False
+
     def _observe_lifecycle_direct(self, observer, payload: dict) -> dict:
         # The compatibility endpoints remain synchronous, but must participate
         # in the same snapshot consistency protocol as the queued hook path.
@@ -310,6 +342,8 @@ class Controller:
             self.lifecycle_direct_active += 1
             self._lifecycle_generation += 1
         try:
+            if not self.in_scope([payload]):
+                return {"observed": False, "reason": "Session is outside every observed project"}
             return observer.observe(payload)
         finally:
             with self.lifecycle_health_lock:

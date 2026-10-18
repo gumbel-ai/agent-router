@@ -6,7 +6,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest.mock import patch
 
-from test_control import settings
+from test_control import observe_every_session, settings
 
 from router.cli import table
 from router.daemon import Controller
@@ -18,6 +18,7 @@ class NativeTests(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
         self.control = Controller(settings(self.root / "repo"), {}, self.root / "state")
+        observe_every_session(self)
 
     def event(self, kind, agent="child", session="S", at=1000, **values):
         return self.control.handle("observe", {"source": "claude", "session_id": session,

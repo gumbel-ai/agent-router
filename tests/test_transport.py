@@ -9,6 +9,7 @@ from pathlib import Path
 from test_runtime import RuntimeHarness
 
 from router.client import request
+from router.paths import PROJECT_MARKER, PROJECT_MARKER_CONTENT
 
 
 class TransportHarness(RuntimeHarness):
@@ -16,6 +17,8 @@ class TransportHarness(RuntimeHarness):
     def setUp(self):
         super().setUp()
         self.runtime.stop()
+        # The separate daemon records only sessions seen inside an observed project.
+        (self.repo / PROJECT_MARKER).write_text(json.dumps(PROJECT_MARKER_CONTENT))
         self.endpoint = self.root / "router.sock"
         self.environment = {k: v for k, v in os.environ.items() if not k.startswith("AGENT_ROUTER_")}
         self.environment.update(AGENT_ROUTER_STATE_DIR=str(self.root / "state"), AGENT_ROUTER_SOCKET=str(self.endpoint),
@@ -73,7 +76,8 @@ class TransportTests(TransportHarness, unittest.TestCase):
         self.assertEqual(self.endpoint.stat().st_mode & 0o777, 0o600)
         self.assertEqual(len(request("status", {}, self.endpoint)), 0)
         observed = request("observe", {"source": "claude", "session_id": "native", "agent_id": "child",
-                                       "kind": "start", "observed_at": int(time.time() * 1000)}, self.endpoint)
+                                       "kind": "start", "observed_at": int(time.time() * 1000),
+                                       "cwd": str(self.repo)}, self.endpoint)
         second = subprocess.run([sys.executable, "-m", "router.cli", "daemon", "start"], env=self.environment,
                                 capture_output=True, text=True, timeout=15, check=False)
         self.assertNotEqual(second.returncode, 0)
