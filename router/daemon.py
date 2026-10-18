@@ -410,6 +410,10 @@ class Controller:
             return self.managed.start(payload)
         if operation == "managed_finish":
             return self.managed.finish(payload)
+        if operation == "completion_next":
+            return self.managed.next_completion(payload)
+        if operation == "completion_ack":
+            return self.managed.acknowledge(payload)
         if operation == "observe":
             return self._observe_lifecycle_direct(self.native, payload)
         if operation == "session_observe":
@@ -1166,6 +1170,14 @@ class Handler(socketserver.StreamRequestHandler):
             else:
                 result = self.server.control.handle(operation, payload)
             response = {"ok": True, "result": result}
+        except sqlite3.OperationalError as error:
+            if operation in {"completion_next", "completion_ack"} and \
+                    getattr(error, "sqlite_errorcode", 0) & 255 in {sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED}:
+                response = {"ok": False, "error": "Completion database is busy; retry the same delivery request",
+                            "retryable": True}
+            else:
+                LOGGER.exception("Control request database failure")
+                response = {"ok": False, "error": "Router database is unavailable; inspect the operator log"}
         except (ValueError, KeyError, OSError) as error:
             response = {"ok": False, "error": str(error)}
         except Exception:

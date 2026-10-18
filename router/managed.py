@@ -6,15 +6,17 @@ wrapper only forwards the user's own interrupt to the command's group.
 """
 
 import json
+import math
 import os
 import signal
 import subprocess
 import sys
+import threading
 import time
 import uuid
 from pathlib import Path
 
-from router.client import request
+from router.client import CompletionBusy, request
 from router.dispatch import canonical
 from router.paths import observed_project
 from router.processes import parent_and_identity
@@ -26,6 +28,8 @@ RECENT_MS = 3_600_000
 # Records older than this are pruned, checked at most this often.
 RETENTION_MS = 7 * 86_400_000
 PRUNE_INTERVAL_MS = 60_000
+WAIT_POLL_SECONDS = .25
+MAX_WAIT_SECONDS = 3600
 FORWARDED_SIGNALS = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
 
 
@@ -203,19 +207,143 @@ def _valid_identifier(value: object) -> bool:
         return False
 
 
+def wait(consumer: str, timeout: float) -> dict:
+    """Block locally; each daemon request is short and never changes command ownership."""
+    _identifier(consumer, "consumer")
+    if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or not math.isfinite(timeout) \
+            or not 0 < timeout <= MAX_WAIT_SECONDS:
+        raise ValueError(f"timeout must be finite and greater than zero, at most {MAX_WAIT_SECONDS} seconds")
+    deadline = time.monotonic() + timeout
+    last_error = None
+    diagnosed = False
+    saw_pending = False
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return {"status": "unavailable" if last_error else "deadline", "consumer": consumer}
+        try:
+            result = request("completion_next", {"consumer": consumer}, timeout=min(2, remaining), deadline=True)
+            if not isinstance(result, dict) or result.get("status") not in {
+                "pending", "completed", "failed", "uncertain"
+            } or result.get("consumer") != consumer or not _valid_identifier(result.get("host_id")) \
+                    or (result["status"] != "pending" and (
+                        not isinstance(result.get("event"), dict)
+                        or not _valid_identifier(result["event"].get("event_id"))
+                        or ("managed_id" in result["event"] and not _valid_identifier(result["event"]["managed_id"]))
+                        or not _valid_identifier(result["event"].get("host_id")))):
+                raise ValueError("Invalid completion response")
+        except (OSError, ValueError, KeyError, TypeError, AttributeError, RecursionError) as error:
+            timed_out = isinstance(error, TimeoutError) or isinstance(error.__cause__, TimeoutError)
+            if timed_out and saw_pending and last_error is None and time.monotonic() >= deadline:
+                return {"status": "deadline", "consumer": consumer}
+            transient = isinstance(error, (CompletionBusy, TimeoutError, ConnectionError)) \
+                or isinstance(error.__cause__, TimeoutError)
+            if not diagnosed or not transient:
+                print(f"Agent Router completion wait {'retrying' if transient else 'unavailable'}: "
+                      f"{bound_text(str(error) or type(error).__name__, 300)}", file=sys.stderr, flush=True)
+                diagnosed = True
+            if not transient:
+                return {"status": "unavailable", "consumer": consumer}
+            last_error = error
+            time.sleep(min(WAIT_POLL_SECONDS, max(0, deadline - time.monotonic())))
+            continue
+        last_error = None
+        if result["status"] != "pending":
+            return result
+        saw_pending = True
+        if time.monotonic() >= deadline:
+            return {"status": "deadline", "consumer": consumer}
+        time.sleep(min(WAIT_POLL_SECONDS, max(0, deadline - time.monotonic())))
+
+
 class ManagedProcesses:
     """Daemon-side records of `router run` commands, kept across Router restarts."""
 
     def __init__(self, store, host_id: str, state: Path, identity=_identity):
         self.store, self.host_id, self.state, self.identity = store, host_id, Path(state), identity
         self._pruned_at = 0
+        self._reconcile_lock = threading.Lock()
+        # Upgrade existing retained evidence without changing the managed-record format.
+        with self.store.transaction() as db:
+            for row in db.execute("SELECT data FROM managed_processes WHERE json_extract(data,'$.status')!='running'"):
+                self._completion(db, json.loads(row[0]))
+
+    def _completion(self, db, record: dict) -> None:
+        fields = {"host_id", "managed_id", "session_id", "agent_id", "attribution", "status",
+                  "exit_code", "signal", "finished_at", "uncertain_at", "group_outlived"}
+        event = {key: value for key, value in record.items() if key in fields}
+        if "group_outlived" not in event and isinstance(record.get("shutdown_uncertain"), bool):
+            event["group_outlived"] = record["shutdown_uncertain"]
+        # Omit malformed identity without losing its known process outcome.
+        if not _valid_identifier(event.get("managed_id")):
+            event.pop("managed_id", None)
+        phase = "uncertain" if record["status"] == "unknown" else "finished"
+        status = ("failed" if record["status"] in {"failed", "signaled"} else
+                  "completed" if record["status"] == "exited" and event.get("group_outlived") is False else "uncertain")
+        timestamp = next((record[key] for key in ("finished_at", "uncertain_at", "started_at")
+                          if is_wire_integer(record.get(key))), _now())
+        db.execute("""INSERT OR IGNORE INTO completion_events(managed_id,host_id,phase,created_at,data)
+                    VALUES(?,?,?,?,?)""", (record["managed_id"], record["host_id"], phase,
+                    timestamp, canonical({"status": status, "event": event})))
+
+    def next_completion(self, payload: dict) -> dict:
+        if set(payload) != {"consumer"}:
+            raise ValueError("completion_next needs only consumer")
+        consumer = _identifier(payload["consumer"], "consumer")
+        # Admission precedes reconciliation/pruning. An interrupted first read still subscribes.
+        with self.store.connect(timeout=.1) as db:
+            subscribed = db.execute("SELECT 1 FROM completion_consumers WHERE name=?", (consumer,)).fetchone()
+        if not subscribed:
+            with self.store.transaction(timeout=.1) as db:
+                db.execute("INSERT OR IGNORE INTO completion_consumers(name) VALUES(?)", (consumer,))
+        query = """SELECT sequence,data FROM completion_events
+                WHERE data IS NOT NULL AND sequence > (SELECT cursor FROM completion_consumers WHERE name=?)
+                ORDER BY sequence LIMIT 1"""
+        with self.store.connect(timeout=.1) as db:
+            row = db.execute(query, (consumer,)).fetchone()
+        if row is None:
+            self.reconcile(blocking=False, timeout=.1)
+            with self.store.connect(timeout=.1) as db:
+                row = db.execute(query, (consumer,)).fetchone()
+        result = json.loads(row["data"]) if row else {"status": "pending"}
+        if row:
+            result["event"]["event_id"] = f"completion-{row['sequence']}"
+        return {**result, "consumer": consumer, "host_id": self.host_id}
+
+    def acknowledge(self, payload: dict) -> dict:
+        if set(payload) != {"consumer", "event_id"}:
+            raise ValueError("completion_ack needs consumer and event_id")
+        consumer = _identifier(payload["consumer"], "consumer")
+        event_id = payload["event_id"]
+        suffix = event_id.removeprefix("completion-") if isinstance(event_id, str) else ""
+        if not suffix.isascii() or not suffix.isdigit() or len(suffix) > 19 \
+                or not 0 < int(suffix) <= 2**63 - 1 or event_id != f"completion-{int(suffix)}":
+            raise ValueError("Invalid completion event ID")
+        sequence = int(suffix)
+        with self.store.transaction(timeout=.1) as db:
+            row = db.execute("SELECT cursor FROM completion_consumers WHERE name=?", (consumer,)).fetchone()
+            if row is None:
+                raise ValueError("Unknown completion consumer; wait first")
+            if db.execute("SELECT 1 FROM completion_events WHERE sequence=?", (sequence,)).fetchone() is None:
+                raise ValueError("Unknown completion event ID")
+            if sequence > row["cursor"]:
+                pending = db.execute("SELECT MIN(sequence) FROM completion_events WHERE data IS NOT NULL AND sequence>?",
+                                     (row["cursor"],)).fetchone()[0]
+                if sequence != pending:
+                    raise ValueError("Acknowledge the oldest pending event first")
+                db.execute("UPDATE completion_consumers SET cursor=? WHERE name=?", (sequence, consumer))
+        return {"acknowledged": True, "event_id": event_id, "consumer": consumer, "host_id": self.host_id}
 
     def start(self, payload: dict) -> dict:
-        record = {**_checked(payload, START_FIELDS), "host_id": self.host_id, "status": "running"}
         with self.store.transaction() as db:
-            db.execute("INSERT OR IGNORE INTO managed_processes(managed_id,data) VALUES(?,?)",
-                       (record["managed_id"], canonical(record)))
+            self._start(db, payload)
         return {"recorded": True}
+
+    def _start(self, db, payload: dict) -> None:
+        record = {**_checked(payload, START_FIELDS), "host_id": self.host_id, "status": "running"}
+        db.execute("""INSERT OR IGNORE INTO managed_processes(managed_id,data)
+                    SELECT ?,? WHERE NOT EXISTS (SELECT 1 FROM completion_events WHERE managed_id=?)""",
+                   (record["managed_id"], canonical(record), record["managed_id"]))
 
     def finish(self, payload: dict) -> dict:
         with self.store.transaction() as db:
@@ -223,13 +351,18 @@ class ManagedProcesses:
         return {"recorded": True}
 
     def _finish(self, db, finish: dict) -> None:
+        if db.execute("SELECT 1 FROM completion_events WHERE managed_id=? AND phase='finished'",
+                      (finish["managed_id"],)).fetchone():
+            return  # Final evidence remains final even after its payload has expired.
         row = db.execute("SELECT data FROM managed_processes WHERE managed_id=?",
                          (finish["managed_id"],)).fetchone()
         start = finish.pop("start", None)
         if row is not None:
             record = json.loads(row[0])
         elif start is not None and start["managed_id"] == finish["managed_id"]:
-            record = {**start, "host_id": self.host_id, "status": "running"}  # The start never reached the daemon.
+            previous = db.execute("SELECT host_id FROM completion_events WHERE managed_id=? AND phase='uncertain'",
+                                  (finish["managed_id"],)).fetchone()
+            record = {**start, "host_id": previous[0] if previous else self.host_id, "status": "running"}
         else:
             raise ValueError("Unknown managed process")
         if record.get("status") not in {"running", "unknown"}:
@@ -243,31 +376,38 @@ class ManagedProcesses:
         db.execute("INSERT INTO managed_processes(managed_id,data) VALUES(?,?) "
                    "ON CONFLICT(managed_id) DO UPDATE SET data=excluded.data",
                    (record["managed_id"], canonical(record)))
+        self._completion(db, record)
 
-    def reconcile(self) -> None:
+    def reconcile(self, *, blocking: bool = True, timeout: float = 10) -> None:
+        # Concurrent readers must not import or rename the same spool file at once.
+        if not self._reconcile_lock.acquire(blocking=blocking):
+            return
+        try:
+            self._reconcile(timeout=timeout)
+        finally:
+            self._reconcile_lock.release()
+
+    def _reconcile(self, *, timeout: float = 10) -> None:
         """Apply completion files; mark running records whose wrapper vanished without evidence."""
         directory = completion_directory(self.state)
         files = sorted(directory.glob("managed-*.json")) if directory.exists() else []
         starts = sorted(directory.glob("start-managed-*.json")) if directory.exists() else []
-        with self.store.connect() as db:
+        with self.store.connect(timeout=timeout) as db:
             running = db.execute("""SELECT data FROM managed_processes
                     WHERE json_extract(data,'$.status')='running'""").fetchall()
         now = _now()
         if not files and not starts and not running and now - self._pruned_at < PRUNE_INTERVAL_MS:
             return
         consumed, invalid = [], []
-        with self.store.transaction() as db:
+        with self.store.transaction(timeout=timeout) as db:
             for path in starts:  # Starts the daemon missed: the command may still be running.
                 try:
-                    record = {**_checked(json.loads(path.read_text()), START_FIELDS),
-                              "host_id": self.host_id, "status": "running"}
+                    self._start(db, json.loads(path.read_text()))
                 except OSError:
                     continue
                 except (ValueError, TypeError):  # Malformed evidence is set aside, never fatal.
                     invalid.append(path)
                     continue
-                db.execute("INSERT OR IGNORE INTO managed_processes(managed_id,data) VALUES(?,?)",
-                           (record["managed_id"], canonical(record)))
                 consumed.append(path)
             running = db.execute("""SELECT data FROM managed_processes
                     WHERE json_extract(data,'$.status')='running'""").fetchall()
@@ -303,9 +443,17 @@ class ManagedProcesses:
                               visibility_reason="The router run wrapper ended without completion evidence")
                 db.execute("UPDATE managed_processes SET data=? WHERE managed_id=?",
                            (canonical(record), record["managed_id"]))
+                self._completion(db, record)
+            # Every registered consumer protects everything after its durable cursor.
+            # Keep identity tombstones so expired evidence can never acquire a new event ID.
+            db.execute("""UPDATE completion_events SET data=NULL WHERE data IS NOT NULL AND created_at < ? AND sequence <=
+                    COALESCE((SELECT MIN(cursor) FROM completion_consumers),
+                             (SELECT MAX(sequence) FROM completion_events))""", (_now() - RETENTION_MS,))
             db.execute("""DELETE FROM managed_processes WHERE json_extract(data,'$.status')!='running'
                     AND COALESCE(json_extract(data,'$.finished_at'), json_extract(data,'$.uncertain_at'),
-                                 json_extract(data,'$.started_at')) < ?""", (_now() - RETENTION_MS,))
+                                 json_extract(data,'$.started_at')) < ?
+                    AND NOT EXISTS (SELECT 1 FROM completion_events e
+                        WHERE e.managed_id=managed_processes.managed_id AND e.data IS NOT NULL)""", (_now() - RETENTION_MS,))
         self._pruned_at = now
         for path in consumed:  # Only after the evidence is committed; replaying a file is harmless.
             path.unlink(missing_ok=True)

@@ -272,6 +272,12 @@ def main() -> None:
     run.add_argument("--session", help="Launching Claude Code or Codex session ID")
     run.add_argument("--agent", help="Launching agent ID (with --session: exact attribution)")
     run.add_argument("argv", nargs=argparse.REMAINDER, help="-- command [arguments]")
+    wait = commands.add_parser("wait", help="Wait for the oldest unacknowledged managed-command completion")
+    wait.add_argument("--consumer", required=True)
+    wait.add_argument("--timeout", type=float, required=True, help="Deadline in seconds, greater than 0 and at most 3600")
+    ack = commands.add_parser("ack", help="Acknowledge a completion after durably handling it")
+    ack.add_argument("--consumer", required=True)
+    ack.add_argument("event_id")
     snapshot = commands.add_parser("snapshot", help="Print a bounded read-only local host snapshot")
     snapshot.add_argument("--json", action="store_true", required=True)
     snapshot.add_argument("--history-limit", type=int, default=100)
@@ -355,6 +361,21 @@ def main() -> None:
             from router.managed import run as run_managed
             argv = args.argv[1:] if args.argv[:1] == ["--"] else args.argv
             sys.exit(run_managed(argv, args.label, args.session, args.agent, state_dir()))
+        elif args.command == "wait":
+            from router.managed import wait as wait_managed
+            failure_code = 1
+            try:
+                result = wait_managed(args.consumer, args.timeout)
+            except KeyboardInterrupt:
+                print("Agent Router completion wait interrupted; pending events remain unacknowledged", file=sys.stderr)
+                result = {"status": "unavailable", "consumer": args.consumer}
+                failure_code = 130
+            print(json.dumps(result, separators=(",", ":")))
+            if result["status"] == "unavailable":
+                sys.exit(failure_code)
+        elif args.command == "ack":
+            print(json.dumps(request("completion_ack", {"consumer": args.consumer, "event_id": args.event_id}),
+                             separators=(",", ":")))
         elif args.command == "snapshot":
             print(json.dumps(request("snapshot", {"history_limit": args.history_limit}), separators=(",", ":")))
         elif args.command == "fleet":
