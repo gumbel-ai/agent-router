@@ -159,9 +159,11 @@ calling `router/plugin/codex/hook.sh` against an isolated Router daemon:
 
 ## Installation and trust (implemented)
 
-`router setup` runs `codex plugin marketplace add <marketplace>` and
-`codex plugin add agent-router@agent-router` when Codex is installed. This step is
-best effort and never blocks setup. The repository root ships `.codex-plugin/plugin.json`
+`router setup` registers the Codex marketplace when Codex is installed, without
+enabling the plugin globally. This step is best effort and never blocks setup.
+`router enable` merges the project plugin entry; refresh plugins in Codex to populate
+its cache. See [project enablement](project-enablement.md), including confirmed
+migration of legacy global entries. The repository root ships `.codex-plugin/plugin.json`
 so Codex loads its own hooks file rather than falling back to the Claude manifest.
 Hooks must then be trusted once in Codex (`/hooks`). `router status` reports Codex
 observation readiness read-only (`router/codex_plugin.py`): it reads the hooks file from

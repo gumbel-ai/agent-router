@@ -3,8 +3,8 @@
 Codex runs a plugin hook only when the plugin is enabled and the hook is trusted:
 `[hooks.state."<plugin>@<marketplace>:<file>:<event>:<group>:<handler>"]` must hold
 the SHA-256 of the hook's normalized declaration, as installed in Codex's plugin cache.
-Router never writes Codex config;
-this only reports which prerequisite is missing, so an untrusted or disabled plugin
+These readiness checks never write Codex config or hook trust;
+they only report which prerequisite is missing, so an untrusted or disabled plugin
 is never mistaken for an idle Codex. See docs/codex-lifecycle.md.
 """
 
@@ -136,7 +136,7 @@ def availability(codex_home: Path | None = None) -> dict:
     except OSError as error:
         return {"state": "unknown", "detail": f"Codex plugin cache unreadable: {error}"}
     if not isinstance(plugin, dict) or root is None:
-        return {"state": "plugin_not_installed", "detail": "Run router setup, or install the Codex plugin"}
+        return {"state": "plugin_not_installed", "detail": "Run router setup and router enable; refresh plugins in Codex"}
     if plugin.get("enabled") is False:
         return {"state": "plugin_disabled", "detail": f"Enable {PLUGIN_ID} in Codex"}
     # Codex applies features in key order, so `hooks` overrides its legacy alias `codex_hooks`.
