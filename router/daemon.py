@@ -184,31 +184,33 @@ class Controller:
         while True:
             work = self.lifecycle_queue.get()
             completed = None
+            scope_error = None
             try:
                 if work is None:
                     return
                 payload, completed, outcome = work
                 admitted = set()
-                for key in list(outcome["persistence"]):
+                try:
+                    if not all(isinstance(payload[key], dict) for key in outcome["persistence"]):
+                        raise ValueError("Lifecycle observation components must be objects")
                     # Admission is per session: one request's components may name different sessions.
-                    try:
-                        if not all(isinstance(payload[name], dict) for name in outcome["persistence"]):
-                            raise ValueError("Lifecycle observation components must be objects")
-                        identity = (payload[key].get("source"), payload[key].get("session_id"))
-                        in_scope = self.in_scope([payload[name] for name in outcome["persistence"]
-                                                  if (payload[name].get("source"),
-                                                      payload[name].get("session_id")) == identity])
-                    except (sqlite3.Error, ValueError, OSError) as error:
-                        outcome["persistence"][key] = "failed"
-                        LOGGER.warning("Lifecycle %s observation project scope could not be checked: %s", key, error)
-                        with self.lifecycle_health_lock:
-                            self.lifecycle_failures += 1
-                            self.lifecycle_problem_at = now_ms()
-                        continue
-                    if in_scope:
-                        admitted.add(key)
-                    else:
-                        outcome["persistence"][key] = "not_observed"
+                    sessions: dict[tuple, list[str]] = {}
+                    for key in outcome["persistence"]:
+                        sessions.setdefault((payload[key].get("source"), payload[key].get("session_id")), []).append(key)
+                    for keys in sessions.values():
+                        if self.in_scope([payload[key] for key in keys]):
+                            admitted.update(keys)
+                        else:
+                            for key in keys:
+                                outcome["persistence"][key] = "not_observed"
+                except (sqlite3.Error, ValueError, OSError) as error:
+                    scope_error = str(error)
+                    admitted.clear()
+                    outcome["persistence"] = dict.fromkeys(outcome["persistence"], "failed")
+                    LOGGER.warning("Lifecycle observation project scope could not be checked: %s", error)
+                    with self.lifecycle_health_lock:
+                        self.lifecycle_failures += 1
+                        self.lifecycle_problem_at = now_ms()
                 for key, observer in (("session", self.sessions), ("native", self.native)):
                     event = payload.get(key)
                     if key not in admitted:
@@ -248,6 +250,8 @@ class Controller:
                                   if any(state == "persisted" for state in outcome["persistence"].values())
                                   else "Lifecycle observation could not be persisted; failed components: ")
                         reason = prefix + ", ".join(failed)
+                        if scope_error is not None:
+                            reason = "Lifecycle observation project scope could not be checked: " + scope_error
                     terminal = _lifecycle_result(False, outcome["persistence"], reason)
                     # No clear(): a request thread that timed out may be reading
                     # outcome["persistence"] concurrently; update() swaps it whole.
@@ -338,8 +342,10 @@ class Controller:
                 key = (self.host.host_id, event.get("source"), event.get("session_id"))
                 if (db.execute("SELECT 1 FROM sessions WHERE host_id=? AND source=? AND session_id=?",
                                key).fetchone()
+                        # The agent_id term lets SQLite use the partial observations_identity index.
                         or db.execute("""SELECT 1 FROM observations WHERE json_extract(data,'$.host_id')=?
-                                AND json_extract(data,'$.source')=? AND session_id=?""", key).fetchone()):
+                                AND json_extract(data,'$.source')=? AND session_id=?
+                                AND json_extract(data,'$.agent_id') IS NOT NULL""", key).fetchone()):
                     return True
         return any(observed_project(event.get("cwd")) is not None for event in events)
 

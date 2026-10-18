@@ -61,6 +61,7 @@ def delegation_target(cwd: str | None, repositories: dict) -> bool:
 
 PROJECT_MARKER = ".agent-router.json"
 PROJECT_MARKER_CONTENT = {"observe": True}
+MAX_PROJECT_MARKER_BYTES = 64
 
 
 def observed_project(cwd: str | None) -> Path | None:
@@ -70,8 +71,14 @@ def observed_project(cwd: str | None) -> Path | None:
     path = Path(cwd).resolve()  # `..` and symlinks must not place cwd inside a project it is not in.
     for directory in (path, *path.parents):
         marker = directory / PROJECT_MARKER
-        if marker.is_file():
-            content = json.loads(marker.read_text())
+        if os.path.lexists(marker):
+            if not marker.is_file():
+                raise ValueError(f"{marker} must be a regular file")
+            with marker.open("rb") as file:
+                raw = file.read(MAX_PROJECT_MARKER_BYTES + 1)
+            if len(raw) > MAX_PROJECT_MARKER_BYTES:
+                raise ValueError(f'{marker} must contain exactly {{"observe": true}}')
+            content = json.loads(raw)
             # `is True`: JSON 1 compares equal to True, and only an explicit true opts in.
             if not isinstance(content, dict) or set(content) != {"observe"} or content["observe"] is not True:
                 raise ValueError(f'{marker} must contain exactly {{"observe": true}}')

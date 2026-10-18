@@ -20,9 +20,10 @@ from router.managed import completion_directory, run
 from router.paths import PROJECT_MARKER, PROJECT_MARKER_CONTENT, observed_project
 
 
-def mark(directory: Path, content: str = json.dumps(PROJECT_MARKER_CONTENT)) -> None:
+def mark(directory: Path, content: str | bytes = json.dumps(PROJECT_MARKER_CONTENT)) -> None:
     directory.mkdir(parents=True, exist_ok=True)
-    (directory / PROJECT_MARKER).write_text(content)
+    marker = directory / PROJECT_MARKER
+    marker.write_bytes(content) if isinstance(content, bytes) else marker.write_text(content)
 
 
 class MarkerLookupTests(unittest.TestCase):
@@ -63,11 +64,21 @@ class MarkerLookupTests(unittest.TestCase):
 
     def test_a_malformed_marker_is_an_error_not_a_silent_opt_out(self):
         for content in ("", "not json", "[]", '{"observe": false}', '{"observe": 1}',
-                        '{"observe": true, "extra": 1}'):
+                        '{"observe": true, "extra": 1}', '{"observe": true}' + " " * 64, b"\xff"):
             with self.subTest(content=content):
                 mark(self.root, content)
                 with self.assertRaises(ValueError):
                     observed_project(str(self.root / "src"))
+
+    def test_a_marker_that_is_not_a_regular_file_is_an_error(self):
+        for name, make in (("directory", lambda marker: marker.mkdir()),
+                           ("dangling", lambda marker: marker.symlink_to(self.root / "missing"))):
+            with self.subTest(name=name):
+                project = self.root / name
+                project.mkdir()
+                make(project / PROJECT_MARKER)
+                with self.assertRaises(ValueError):
+                    observed_project(str(project))
 
 
 class LifecycleScopeTests(unittest.TestCase):
@@ -76,7 +87,7 @@ class LifecycleScopeTests(unittest.TestCase):
     def setUp(self):
         temp = tempfile.TemporaryDirectory(prefix="ar-scope-")
         self.addCleanup(temp.cleanup)
-        self.root = Path(temp.name)
+        self.root = Path(temp.name).resolve()
         self.project = self.root / "project"
         mark(self.project)
         self.other = self.root / "other"
@@ -173,10 +184,12 @@ class LifecycleScopeTests(unittest.TestCase):
 
     def test_a_malformed_marker_fails_the_observation_visibly(self):
         mark(self.other, '{"observe": false}')
-        responses, stderr = self.hook("claude", "SessionStart", self.other, source="startup")
+        responses, stderr = self.hook("claude", "SubagentStart", self.other, agent_id="a", agent_type="worker")
         self.assertFalse(responses[0]["accepted"])
         self.assertEqual(set(responses[0]["persistence"].values()), {"failed"})
-        self.assertIn("Agent Router observation unavailable", stderr)
+        # The hook names the marker, not a generic write failure.
+        self.assertIn(f"Agent Router observation unavailable: Lifecycle observation project scope could not be "
+                      f"checked: {self.other / PROJECT_MARKER}", stderr)
         self.assertEqual(self.control.lifecycle_failures, 1)
         self.assertEqual(self.rows("sessions"), 0)
 
