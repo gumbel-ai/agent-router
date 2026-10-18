@@ -410,6 +410,10 @@ class Controller:
             return self.managed.start(payload)
         if operation == "managed_finish":
             return self.managed.finish(payload)
+        if operation == "completion_next":
+            return self.managed.next_completion(payload)
+        if operation == "completion_ack":
+            return self.managed.acknowledge(payload)
         if operation == "observe":
             return self._observe_lifecycle_direct(self.native, payload)
         if operation == "session_observe":

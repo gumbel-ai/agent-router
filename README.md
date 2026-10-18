@@ -1,5 +1,8 @@
 # Agent Router
 
+Use [`router wait` and `router ack`](docs/completions.md) for durable delivery of
+managed-command completions to an active agent's blocking tool call.
+
 Delegate coding tasks to another agent while the parent stays in control.
 
 ## What you get
