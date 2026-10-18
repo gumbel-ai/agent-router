@@ -438,6 +438,31 @@ class ManagedRunTests(unittest.TestCase):
                 self.control.handle("completion_ack", {"consumer": consumer, "event_id": event_id})
         self.assertEqual(self.next_completion(), first)
 
+    def test_host_bound_ack_refuses_other_servers_and_event_producers_before_mutation(self):
+        self.run_command("pass", label="batch-job")
+        event = self.next_completion()
+        payload = {"consumer": "worker-a", "event_id": event["event"]["event_id"],
+                   "host_id": event["host_id"], "event_host_id": event["event"]["host_id"]}
+        for field in ("host_id", "event_host_id"):
+            with self.subTest(field=field), self.assertRaises(ValueError):
+                self.control.handle("completion_ack", {**payload, field: "other-host"})
+            self.assertEqual(self.next_completion()["event"], event["event"])
+        subscription = self.control.handle("completion_subscribe", {"consumer": "worker-a"})["subscription_id"]
+        payload["subscription_id"] = subscription
+        clone = Controller(settings(self.state.parent / "repo"), {}, self.state / "other-database")
+        clone.managed.host_id = event["host_id"]  # Same host identity, independent database and subscription.
+        clone.handle("managed_finish", {"managed_id": "managed-clone", "finished_at": 1,
+            "elapsed_ms": 1, "exit_code": 0, "max_process_rss_bytes": 1, "group_outlived": False,
+            "start": self.start_payload("managed-clone")})
+        other = clone.handle("completion_next", {"consumer": "worker-a"})
+        self.assertEqual(other["event"]["event_id"], payload["event_id"])
+        with self.assertRaises(ValueError):
+            clone.handle("completion_ack", payload)
+        self.assertEqual(clone.handle("completion_next", {"consumer": "worker-a"}), other)
+        self.assertTrue(self.control.handle("completion_ack", payload)["acknowledged"])
+        self.assertTrue(self.control.handle("completion_ack", payload)["acknowledged"])
+        self.assertEqual(self.next_completion()["status"], "pending")
+
     def test_blocking_wait_deadline_and_unavailable_transport_are_distinct(self):
         from types import SimpleNamespace
 
@@ -472,9 +497,16 @@ class ManagedRunTests(unittest.TestCase):
                          {**nested, "host_id": None}]
         for broken in (None, [], {"status": "completed"}, {"status": []},
                        *({**envelope, "event": event} for event in broken_events)):
-            binding = {"consumer": "worker-a", "subscription_id": "subscription-a", "host_id": "host-a"}
+            binding = {"consumer": "worker-a", "subscription_id": "subscription-a", "host_id": "serving-host"}
             with self.subTest(broken=broken), patch("router.managed.request", side_effect=[binding, broken]):
                 self.assertEqual(wait("worker-a", 5)["status"], "unavailable")
+
+        good = {**envelope, "event": nested}
+        binding = {"consumer": "worker-a", "subscription_id": "subscription-a", "host_id": "serving-host"}
+        with patch("router.managed.request", side_effect=[binding, good]):
+            self.assertEqual(wait("worker-a", 5), good)
+        with patch("router.managed.request", side_effect=[{**binding, "host_id": "other-server"}, good]):
+            self.assertEqual(wait("worker-a", 5)["status"], "unavailable")
 
     def test_wait_retries_transient_delivery_errors_within_its_deadline(self):
         from types import SimpleNamespace
@@ -593,7 +625,8 @@ class ManagedRunTests(unittest.TestCase):
                     self.assertIs(event["event"]["group_outlived"], True)
                 self.assertNotIn("managed_id", event["event"])  # Unknown metadata must not jam a valid outcome.
                 self.assertEqual(event["event"]["host_id"], "original-host")
-                self.ack_completion(event)
+                self.control.handle("completion_ack", {"consumer": "worker-a", "event_id": event["event"]["event_id"],
+                                                       "host_id": event["host_id"], "event_host_id": "original-host"})
                 self.run_command("pass")
                 self.assertEqual(self.next_completion()["status"], "completed")
 

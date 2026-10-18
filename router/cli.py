@@ -275,9 +275,13 @@ def main() -> None:
     wait = commands.add_parser("wait", help="Wait for the oldest unacknowledged managed-command completion")
     wait.add_argument("--consumer", required=True)
     wait.add_argument("--timeout", type=float, required=True, help="Deadline in seconds, greater than 0 and at most 3600")
+    wait.add_argument("--include-subscription", action="store_true", help="Include the durable serving subscription binding")
     ack = commands.add_parser("ack", help="Acknowledge a completion after durably handling it")
     ack.add_argument("--consumer", required=True)
     ack.add_argument("event_id")
+    ack.add_argument("--host-id")
+    ack.add_argument("--event-host-id")
+    ack.add_argument("--subscription-id")
     consumer = commands.add_parser("consumer", help="Inspect and remove completion subscriptions")
     consumer_commands = consumer.add_subparsers(dest="consumer_command", required=True)
     consumer_list = consumer_commands.add_parser("list")
@@ -292,7 +296,7 @@ def main() -> None:
     snapshot = commands.add_parser("snapshot", help="Print a bounded read-only local host snapshot")
     snapshot.add_argument("--json", action="store_true", required=True)
     snapshot.add_argument("--history-limit", type=int, default=100)
-    fleet = commands.add_parser("fleet", help="Read configured local and SSH host snapshots")
+    fleet = commands.add_parser("fleet", help="Query configured local and SSH hosts")
     fleet_commands = fleet.add_subparsers(dest="fleet_command", required=True)
     fleet_status = fleet_commands.add_parser("status")
     fleet_status.add_argument("--json", action="store_true")
@@ -308,6 +312,19 @@ def main() -> None:
     fleet_host.add_argument("--json", action="store_true")
     fleet_host.add_argument("--strict", action="store_true")
     fleet_host.add_argument("--config", type=Path)
+    fleet_wait = fleet_commands.add_parser("wait", help="Wait once on each configured completion host")
+    fleet_wait.add_argument("--consumer", required=True)
+    fleet_wait.add_argument("--timeout", type=float, required=True)
+    fleet_wait.add_argument("--host")
+    fleet_wait.add_argument("--config", type=Path)
+    fleet_ack = fleet_commands.add_parser("ack", help="Acknowledge an event on its verified host")
+    fleet_ack.add_argument("--consumer", required=True)
+    fleet_ack.add_argument("--host", required=True)
+    fleet_ack.add_argument("--host-id", required=True)
+    fleet_ack.add_argument("--event-host-id", required=True)
+    fleet_ack.add_argument("--subscription-id", required=True)
+    fleet_ack.add_argument("--config", type=Path)
+    fleet_ack.add_argument("event_id")
     daemon = commands.add_parser("daemon")
     daemon.add_argument("action", choices=["start", "stop"])
     commands.add_parser("plugin-path", help="Print the bundled Claude plugin directory")
@@ -380,7 +397,7 @@ def main() -> None:
             from router.managed import wait as wait_managed
             failure_code = 1
             try:
-                result = wait_managed(args.consumer, args.timeout)
+                result = wait_managed(args.consumer, args.timeout, include_subscription=args.include_subscription)
             except ValueError as error:
                 parser.error(str(error))
             except KeyboardInterrupt:
@@ -395,10 +412,23 @@ def main() -> None:
             try:
                 _identifier(args.consumer, "consumer")
                 _completion_sequence(args.event_id)
+                if (args.host_id is None) != (args.event_host_id is None):
+                    raise ValueError("--host-id and --event-host-id must be supplied together")
+                if args.subscription_id is not None:
+                    if args.host_id is None:
+                        raise ValueError("--subscription-id needs --host-id and --event-host-id")
+                    _identifier(args.subscription_id, "subscription")
+                if args.host_id is not None:
+                    _identifier(args.host_id, "host")
+                    _identifier(args.event_host_id, "event host")
             except ValueError as error:
                 parser.error(str(error))
-            print(json.dumps(request("completion_ack", {"consumer": args.consumer, "event_id": args.event_id}),
-                             separators=(",", ":")))
+            payload = {"consumer": args.consumer, "event_id": args.event_id}
+            if args.host_id is not None:
+                payload.update(host_id=args.host_id, event_host_id=args.event_host_id)
+            if args.subscription_id is not None:
+                payload["subscription_id"] = args.subscription_id
+            print(json.dumps(request("completion_ack", payload), separators=(",", ":")))
         elif args.command == "consumer":
             operation, payload = (("completion_consumer_list", {"limit": args.limit, "offset": args.offset})
                                   if args.consumer_command == "list" else
@@ -411,6 +441,26 @@ def main() -> None:
             print(json.dumps(request("correlation", payload, timeout=15, deadline=True), separators=(",", ":")))
         elif args.command == "snapshot":
             print(json.dumps(request("snapshot", {"history_limit": args.history_limit}), separators=(",", ":")))
+        elif args.command == "fleet" and args.fleet_command in {"wait", "ack"}:
+            from router.fleet import DEFAULT_CONFIG, load_fleet_config
+            from router.fleet_completions import (
+                acknowledge_completion,
+                query_completions,
+            )
+            config = load_fleet_config(args.config or DEFAULT_CONFIG)
+            try:
+                if args.fleet_command == "wait":
+                    result = query_completions(config, args.consumer, args.timeout, only=args.host)
+                    failed = result["partial"]
+                else:
+                    result = acknowledge_completion(config, args.host, args.consumer, args.event_id,
+                                                    args.host_id, args.event_host_id, args.subscription_id)
+                    failed = not result["ok"]
+            except ValueError as error:
+                parser.error(str(error))
+            print(json.dumps(result, separators=(",", ":")))
+            if failed:
+                parser.exit(1, "Agent Router: completion delivery failed; inspect per-host errors.\n")
         elif args.command == "fleet":
             from router.fleet import (
                 DEFAULT_CONFIG,
@@ -472,6 +522,9 @@ def main() -> None:
     except (ValueError, OSError) as error:
         parser.exit(1, f"Agent Router: {error}\n")
     except KeyboardInterrupt:
+        if args.command == "fleet" and args.fleet_command in {"wait", "ack"}:
+            parser.exit(130, "Agent Router fleet completion interrupted; events remain durable; "
+                        "acknowledgment commit state is unknown. Retry the same delivery, never the command.\n")
         if args.command == "correlation":
             parser.exit(130, "Agent Router correlation export interrupted; no state changed.\n")
         if args.command == "ack":

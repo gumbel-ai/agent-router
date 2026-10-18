@@ -5,6 +5,7 @@ import json
 import math
 import os
 import selectors
+import shlex
 import signal
 import subprocess
 import time
@@ -661,19 +662,28 @@ def _validate_snapshot(payload: bytes) -> dict:
     return projected
 
 
-def ssh_snapshot(host: FleetHost, timeout: float) -> dict:
-    command = ["ssh", "-o", "BatchMode=yes", "-o", f"ConnectTimeout={max(1, math.ceil(timeout))}",
-               "-n", "--", host.target, "router", "snapshot", "--json"]
+class SSHQueryError(ValueError):
+    def __init__(self, code: str, message: str, *, exit_code: int | None = None, errno: int | None = None):
+        super().__init__(message)
+        self.code, self.exit_code, self.errno = code, exit_code, errno
+
+
+def ssh_stdout(host: FleetHost, timeout: float, arguments: list[str], *,
+               accepted_exit_codes: tuple[int, ...] = (0,), connect_timeout: float | None = None,
+               cancelled=None) -> bytes:
+    command = ["ssh", "-o", "BatchMode=yes", "-o", f"ConnectTimeout={max(1, math.ceil(timeout if connect_timeout is None else connect_timeout))}",
+               "-n", "--", host.target, "router", *(shlex.quote(argument) for argument in arguments)]
     try:
         process = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                                    stderr=subprocess.PIPE, start_new_session=True)
     except OSError as error:
-        raise ValueError(str(error)) from error
+        raise SSHQueryError("spawn_failed", str(error), errno=error.errno) from error
     selector = None
     stdout = bytearray()
     stderr = bytearray()
     deadline = time.monotonic() + timeout
     failure = None
+    failure_code = "transport_failed"
     try:
         if process.stdout is None or process.stderr is None:
             raise ValueError("ssh output pipes unavailable")
@@ -684,10 +694,14 @@ def ssh_snapshot(host: FleetHost, timeout: float) -> dict:
             selector.register(stream, selectors.EVENT_READ)
         while selector.get_map():
             remaining = deadline - time.monotonic()
+            if cancelled is not None and cancelled.is_set():
+                failure_code, failure = "interrupted", "SSH collection interrupted"
+                break
             if remaining <= 0:
+                failure_code = "deadline"
                 failure = f"snapshot timed out after {timeout:g}s"
                 break
-            for key, _ in selector.select(remaining):
+            for key, _ in selector.select(min(remaining, .25) if cancelled is not None else remaining):
                 try:
                     chunk = os.read(key.fd, 65_536)
                 except BlockingIOError:
@@ -700,6 +714,7 @@ def ssh_snapshot(host: FleetHost, timeout: float) -> dict:
                     if keep > 0:
                         stdout.extend(chunk[:keep])
                     if len(stdout) > MAX_SNAPSHOT_BYTES:
+                        failure_code = "output_limit"
                         failure = "Host snapshot exceeds one MiB"
                         break
                 elif len(stderr) < 65_536:
@@ -708,6 +723,9 @@ def ssh_snapshot(host: FleetHost, timeout: float) -> dict:
                 break
     except (OSError, ValueError) as error:
         failure = str(error)
+    except KeyboardInterrupt:
+        failure = "SSH collection interrupted"
+        raise
     finally:
         if failure:
             try:
@@ -736,15 +754,21 @@ def ssh_snapshot(host: FleetHost, timeout: float) -> dict:
             except subprocess.TimeoutExpired:
                 pass
             if failure is None:
+                failure_code = "cleanup_failed"
                 failure = "ssh process did not exit after snapshot collection"
+        if failure is None and process.returncode not in accepted_exit_codes:
+            detail = stderr.decode(errors="replace").strip() or f"ssh exited {process.returncode}"
+            failure_code, failure = "exit_failed", _error_text(detail)
         if failure and leader_reaped:
             _kill_remaining_group(process.pid)
     if failure:
-        raise ValueError(failure)
-    if process.returncode:
-        detail = stderr.decode(errors="replace").strip() or f"ssh exited {process.returncode}"
-        raise ValueError(_error_text(detail))
-    return _validate_snapshot(bytes(stdout))
+        raise SSHQueryError(failure_code, failure,
+                            exit_code=process.returncode if failure_code == "exit_failed" else None)
+    return bytes(stdout)
+
+
+def ssh_snapshot(host: FleetHost, timeout: float) -> dict:
+    return _validate_snapshot(ssh_stdout(host, timeout, ["snapshot", "--json"]))
 
 
 def _kill_remaining_group(pgid: int, grace_seconds: float = .5) -> None:
