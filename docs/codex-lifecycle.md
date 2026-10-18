@@ -170,9 +170,33 @@ observation readiness read-only (`router/codex_plugin.py`): it reads the hooks f
 the plugin copy Codex loads (`$CODEX_HOME/plugins/cache/agent-router/agent-router/<version>`,
 `local` first, else the highest version, as Codex selects it), recomputes Codex's trust
 hash for each hook, and checks the `[features] hooks` switch. An untrusted, modified, or
-disabled hook is reported instead of looking like an idle Codex. Codex keeps a Git
-marketplace snapshot until `codex plugin marketplace upgrade agent-router`; status
+disabled hook is reported instead of looking like an idle Codex. Configuration comes
+from bounded native `config/read` and `hooks/list` requests to the selected home's
+existing control socket, including Codex's project trust and configuration precedence,
+rather than the user file alone. Hook trust comes from the native inventory, which
+excludes project-layer trust entries. Missing
+project admission or unavailable probe evidence cannot report `ready`. The selected
+home is explicit `CODEX_HOME` or its default; no other homes are searched. See the
+[readiness contract](project-enablement.md#codex-prerequisites).
+Router starts no process or daemon and requests no plugin refresh. Missing native
+daemon/API support reports `unknown`. Codex keeps a Git marketplace snapshot until
+`codex plugin marketplace upgrade agent-router`; status
 reflects that installed copy, not Router's package.
+
+Readiness verification on 2026-10-18 used Codex 0.163.0 with isolated configuration:
+an unmarked directory reported `project_not_enabled`; enabled roots, subdirectories
+and worktrees reported ten untrusted Router hooks, rather than the global disabled
+entry. The fixture daemon was started separately before probing. User configuration
+and hook trust were unchanged, zero probe processes started, and the daemon remained
+running with its user-agent identity unchanged after the checks. The three
+enabled-directory queries took 0.033, 0.006 and 0.013 seconds respectively in this
+local sample. A marked but
+untrusted project reported `plugin_disabled`; its project enablement was ignored.
+No agent turn was started. The native non-originating initialization path was checked
+against Codex 0.163.0's source and a policy fixture on success and RPC failure.
+Long directory and socket aliases, including dangling aliases, were tested with an
+isolated socket fixture. Live OAuth behavior, enabled hook execution and observation
+after manual trust are **NOT CHECKED** in this verification.
 
 ## Testing implications for item 4
 

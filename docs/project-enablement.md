@@ -42,9 +42,32 @@ project trust and hook trust remain separate prerequisites. See the upstream
 [project plugin configuration](https://developers.openai.com/codex/plugins/build#enable-or-disable-a-plugin-for-a-repo)
 and [configuration precedence](https://developers.openai.com/codex/config-basic#configuration-precedence).
 
-The current `router status` readiness check inspects the selected home's user
-configuration; it does not establish whether a particular project's layer loaded.
-Check project plugin loading and hook trust in Codex.
+`router status` checks readiness for a fresh Codex session in its current directory.
+It uses only the explicit `CODEX_HOME`, or the default home when unset. It connects
+to that home's already-running Codex daemon control socket for `config/read` and
+`hooks/list`, so Codex applies project trust, subdirectory/worktree inheritance and
+configuration precedence. Router does not
+guess which project layer Codex would load. It checks the project marker and the
+selected home's installed hook declarations against the native hook inventory.
+Project configuration cannot grant user hook trust.
+
+The probe starts no process, agent turn or daemon, refreshes no plugins and writes
+no hook trust. It uses Codex's native non-originating daemon-probe handshake, which
+preserves daemon-wide authentication policy and client identity. Socket aliases
+are resolved, including a long selected-home path pointing to a short native
+rendezvous socket. Start Codex normally before checking readiness. A missing or
+unreachable daemon reports `unknown`; Router does not start one as a fallback.
+The daemon's initialization reply must identify the selected home; an alias into
+another home's daemon reports `unknown` before its configuration or hooks are read.
+The native control socket/API was verified with Codex 0.163.0. Unsupported clients
+also report `unknown`. Queries and normal connection close share a five-second
+deadline with a one MiB output bound; cleanup after cancellation allows up to one
+further second. A missing marker is
+`project_not_enabled`; untrusted hooks remain `hooks_untrusted`. Missing support,
+malformed replies, transport failures and deadlines report `unknown` with a reason.
+Readiness describes configuration prerequisites, not proof that an existing
+session delivered events. Per-session overrides and an existing app-server's
+environment still require checking in that session.
 
 ## Legacy global installations
 
