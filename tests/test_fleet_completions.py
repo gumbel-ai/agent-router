@@ -351,16 +351,34 @@ main()
                 processes.append(process)
                 return process
             return start
-        for source, code in (("import sys;sys.stderr.write('fixture-private-value');sys.exit(255)", 'exit_failed'),
-                             ("import os;os.write(1,b'x'*(1024*1024+1))", 'output_limit')):
+        rejected = ["import sys;sys.stderr.write('fixture-private-value');sys.exit(255)"]
+        for reply in (self.event, {'status': 'deadline', 'consumer': 'batch-job', 'host_id': 'host-b',
+                                   'subscription_id': 'subscription-b'}):
+            rejected.append(f"import sys;sys.stdout.write({json.dumps(reply)!r});"
+                            "sys.stderr.write('\\x1b[0m');sys.exit(255)")
+        for source, code in [(source, 'exit_failed') for source in rejected] + [
+                ("import os;os.write(1,b'x'*(1024*1024+1))", 'output_limit')]:
             with self.subTest(code=code), patch('router.fleet.subprocess.Popen', side_effect=launch(source)):
                 result = query_completions(config, 'batch-job', 15)
+            self.assertFalse(result['hosts'][0]['ok'])
             self.assertEqual(result['hosts'][0]['error']['code'], code)
             self.assertNotIn('fixture-private-value', canonical(result))
             self.assertIsNotNone(processes[-1].poll())
+            if code == 'exit_failed':
+                with patch('router.fleet.subprocess.Popen', side_effect=launch(source)), \
+                        self.assertRaises(SSHQueryError) as caught:
+                    ssh_stdout(config.hosts[0], 15, ['wait'])
+                self.assertTrue(str(caught.exception))
         with patch('router.fleet.subprocess.Popen', side_effect=FileNotFoundError(2, 'fixture-private-value')):
             result = query_completions(config, 'batch-job', 15)
         self.assertEqual(result['hosts'][0]['error'], {'code': 'spawn_failed', 'errno': 2})
+        with patch('router.fleet.subprocess.Popen', side_effect=launch('import time;time.sleep(30)')), \
+                patch('router.fleet.os.set_blocking', side_effect=OSError('')), \
+                self.assertRaises(SSHQueryError) as caught:
+            ssh_stdout(config.hosts[0], 15, ['wait'])
+        self.assertEqual(caught.exception.code, 'transport_failed')
+        self.assertTrue(str(caught.exception))
+        self.assertIsNotNone(processes[-1].poll())
         with patch('router.fleet.subprocess.Popen', side_effect=launch('import time;time.sleep(30)')), \
                 patch('router.fleet.time.monotonic', side_effect=[0, 16]), \
                 patch('router.fleet._kill_remaining_group'), self.assertRaises(SSHQueryError) as caught:
@@ -372,7 +390,8 @@ main()
             source = ("import subprocess,sys;from pathlib import Path; "
                       "child=subprocess.Popen([sys.executable,'-c','import time;time.sleep(30)'],"
                       "stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL); "
-                      f"Path({str(Path(temporary) / 'child')!r}).write_text(str(child.pid));sys.exit(255)")
+                      f"Path({str(Path(temporary) / 'child')!r}).write_text(str(child.pid));"
+                      "sys.stderr.write('\\x1b[0m');sys.exit(255)")
             with patch('router.fleet.subprocess.Popen', side_effect=launch(source)):
                 result = query_completions(config, 'batch-job', 15)
             child = int((Path(temporary) / 'child').read_text())

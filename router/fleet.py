@@ -719,7 +719,7 @@ def ssh_stdout(host: FleetHost, timeout: float, arguments: list[str], *,
                         break
                 elif len(stderr) < 65_536:
                     stderr.extend(chunk[:65_536 - len(stderr)])
-            if failure:
+            if failure is not None:
                 break
     except (OSError, ValueError) as error:
         failure = str(error)
@@ -727,7 +727,7 @@ def ssh_stdout(host: FleetHost, timeout: float, arguments: list[str], *,
         failure = "SSH collection interrupted"
         raise
     finally:
-        if failure:
+        if failure is not None:
             try:
                 os.killpg(process.pid, signal.SIGTERM)
             except (OSError, AttributeError):
@@ -758,11 +758,11 @@ def ssh_stdout(host: FleetHost, timeout: float, arguments: list[str], *,
                 failure = "ssh process did not exit after snapshot collection"
         if failure is None and process.returncode not in accepted_exit_codes:
             detail = stderr.decode(errors="replace").strip() or f"ssh exited {process.returncode}"
-            failure_code, failure = "exit_failed", _error_text(detail)
-        if failure and leader_reaped:
+            failure_code, failure = "exit_failed", _error_text(detail) or f"ssh exited {process.returncode}"
+        if failure is not None and leader_reaped:
             _kill_remaining_group(process.pid)
-    if failure:
-        raise SSHQueryError(failure_code, failure,
+    if failure is not None:
+        raise SSHQueryError(failure_code, failure or "SSH collection failed",
                             exit_code=process.returncode if failure_code == "exit_failed" else None)
     return bytes(stdout)
 
