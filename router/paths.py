@@ -67,7 +67,7 @@ def observed_project(cwd: str | None) -> Path | None:
     """The opted-in project containing cwd: its nearest ancestor holding a project marker."""
     if not isinstance(cwd, str) or not Path(cwd).is_absolute():
         return None
-    path = Path(cwd)
+    path = Path(cwd).resolve()  # `..` and symlinks must not place cwd inside a project it is not in.
     for directory in (path, *path.parents):
         marker = directory / PROJECT_MARKER
         if marker.is_file():

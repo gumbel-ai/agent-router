@@ -11,6 +11,7 @@ from pathlib import Path
 
 from router.cli import table
 from router.client import request
+from router.paths import PROJECT_MARKER, PROJECT_MARKER_CONTENT
 
 
 def stop_process(process: subprocess.Popen) -> None:
@@ -30,6 +31,7 @@ def main() -> None:
     directory = Path(tempfile.mkdtemp(prefix="ar-native-live-")).resolve()
     repository = directory / "repo"
     repository.mkdir()
+    (repository / PROJECT_MARKER).write_text(json.dumps(PROJECT_MARKER_CONTENT))  # Router observes opted-in projects only.
     environment = {key: value for key, value in os.environ.items() if not key.startswith("AGENT_ROUTER_")}
     environment.update(AGENT_ROUTER_STATE_DIR=str(directory / "state"), AGENT_ROUTER_SOCKET=str(directory / "router.sock"),
                        AGENT_ROUTER_ENV_FILE=str(directory / "missing.env"), AGENT_ROUTER_CONCURRENCY_CAP="1",

@@ -29,7 +29,7 @@ class MarkerLookupTests(unittest.TestCase):
     def setUp(self):
         temp = tempfile.TemporaryDirectory(prefix="ar-scope-")
         self.addCleanup(temp.cleanup)
-        self.root = Path(temp.name)
+        self.root = Path(temp.name).resolve()
 
     def test_nearest_marked_ancestor_is_the_project(self):
         mark(self.root / "outer")
@@ -40,6 +40,18 @@ class MarkerLookupTests(unittest.TestCase):
                 (self.root / "outer" / "inner" / "src", self.root / "outer" / "inner"),
                 (self.root / "outer" / "missing" / "dir", self.root / "outer"),  # Need not exist.
                 (self.root / "elsewhere", None)):
+            with self.subTest(cwd=cwd):
+                self.assertEqual(observed_project(str(cwd)), expected)
+
+    def test_the_real_location_decides_not_the_spelling(self):
+        project = self.root / "observed"
+        mark(project)
+        (self.root / "outside").mkdir()
+        (self.root / "into").symlink_to(project / "src", target_is_directory=True)
+        (project / "src").mkdir()
+        (project / "escape").symlink_to(self.root / "outside", target_is_directory=True)
+        for cwd, expected in ((project / ".." / "outside", None), (project / "escape", None),
+                              (self.root / "into", project), (self.root / "outside" / ".." / "observed", project)):
             with self.subTest(cwd=cwd):
                 self.assertEqual(observed_project(str(cwd)), expected)
 
@@ -136,6 +148,28 @@ class LifecycleScopeTests(unittest.TestCase):
                 self.assertEqual(len(agents), 1)
                 # The session end closed its agent: Codex agents stop with it, Claude's become unknown.
                 self.assertEqual(agents[0]["status"], "stopped" if source == "codex" else "unknown")
+
+    def test_a_malformed_marker_cannot_strand_an_admitted_session(self):
+        for source in ("claude", "codex"):
+            with self.subTest(source=source):
+                session = f"{source}-strand"
+                broken = self.root / f"broken-{source}"
+                mark(broken, "{}")
+                self.hook(source, "SessionStart", self.project, session, source="startup")
+                _, stderr = self.hook(source, "SessionEnd", broken, session)
+                self.assertEqual(stderr, "")
+                self.assertEqual(self.sessions()[session]["status"], "stopped")
+
+    def test_one_request_cannot_admit_another_sessions_event(self):
+        at = int(time.time() * 1000)
+        response = self.control.handle("lifecycle_observe", {
+            "session": {"source": "claude", "session_id": "inside", "kind": "session_start", "observed_at": at,
+                        "cwd": str(self.project)},
+            "native": {"source": "claude", "session_id": "outside", "agent_id": "a", "kind": "start",
+                       "observed_at": at, "cwd": str(self.other)}})
+        self.assertEqual(response["persistence"], {"session": "persisted", "native": "not_observed"})
+        self.assertEqual(self.rows("observations"), 0)
+        self.assertEqual(set(self.sessions()), {"inside"})
 
     def test_a_malformed_marker_fails_the_observation_visibly(self):
         mark(self.other, '{"observe": false}')

@@ -188,21 +188,30 @@ class Controller:
                 if work is None:
                     return
                 payload, completed, outcome = work
-                try:
-                    in_scope = self.in_scope([payload[key] for key in outcome["persistence"]])
-                except (sqlite3.Error, ValueError, OSError) as error:
-                    in_scope = False
-                    outcome["persistence"] = dict.fromkeys(outcome["persistence"], "failed")
-                    LOGGER.warning("Lifecycle observation project scope could not be checked: %s", error)
-                    with self.lifecycle_health_lock:
-                        self.lifecycle_failures += 1
-                        self.lifecycle_problem_at = now_ms()
-                else:
-                    if not in_scope:
-                        outcome["persistence"] = dict.fromkeys(outcome["persistence"], "not_observed")
+                admitted = set()
+                for key in list(outcome["persistence"]):
+                    # Admission is per session: one request's components may name different sessions.
+                    try:
+                        if not all(isinstance(payload[name], dict) for name in outcome["persistence"]):
+                            raise ValueError("Lifecycle observation components must be objects")
+                        identity = (payload[key].get("source"), payload[key].get("session_id"))
+                        in_scope = self.in_scope([payload[name] for name in outcome["persistence"]
+                                                  if (payload[name].get("source"),
+                                                      payload[name].get("session_id")) == identity])
+                    except (sqlite3.Error, ValueError, OSError) as error:
+                        outcome["persistence"][key] = "failed"
+                        LOGGER.warning("Lifecycle %s observation project scope could not be checked: %s", key, error)
+                        with self.lifecycle_health_lock:
+                            self.lifecycle_failures += 1
+                            self.lifecycle_problem_at = now_ms()
+                        continue
+                    if in_scope:
+                        admitted.add(key)
+                    else:
+                        outcome["persistence"][key] = "not_observed"
                 for key, observer in (("session", self.sessions), ("native", self.native)):
                     event = payload.get(key)
-                    if event is None or not in_scope:
+                    if key not in admitted:
                         continue
                     try:
                         observer.observe(event, timeout=self._lifecycle_write_timeout())
@@ -320,11 +329,10 @@ class Controller:
     def in_scope(self, events: list[dict]) -> bool:
         """Record a session once it is seen inside an observed project (see observed_project).
 
-        Later events follow an admitted session wherever its working directory goes, so
-        leaving the project cannot strand it as active.
+        events are one session's. Later events follow an admitted session wherever its working
+        directory goes (even past a malformed marker), so leaving the project cannot strand it
+        as active.
         """
-        if any(observed_project(event.get("cwd")) is not None for event in events):
-            return True
         with self.store.connect() as db:
             for event in events:
                 key = (self.host.host_id, event.get("source"), event.get("session_id"))
@@ -333,7 +341,7 @@ class Controller:
                         or db.execute("""SELECT 1 FROM observations WHERE json_extract(data,'$.host_id')=?
                                 AND json_extract(data,'$.source')=? AND session_id=?""", key).fetchone()):
                     return True
-        return False
+        return any(observed_project(event.get("cwd")) is not None for event in events)
 
     def _observe_lifecycle_direct(self, observer, payload: dict) -> dict:
         # The compatibility endpoints remain synchronous, but must participate
