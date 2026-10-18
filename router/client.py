@@ -9,6 +9,10 @@ from router.dispatch import canonical
 from router.paths import socket_path
 
 
+class CompletionBusy(ValueError):
+    """A completion request can be retried without changing command ownership."""
+
+
 def request(operation: str, payload: dict, endpoint: Path | None = None, *, timeout: float = 15,
             deadline: bool = False) -> dict | list:
     """With deadline=True, timeout bounds the whole request rather than each socket operation."""
@@ -42,9 +46,13 @@ def request(operation: str, payload: dict, endpoint: Path | None = None, *, time
             if newline >= 0:
                 break
         line = bytes(received)
+        if operation == "completion_next" and len(line) <= limit and not line.endswith(b"\n"):
+            raise ConnectionResetError("Router closed the connection before a complete reply")
         if not line or len(line) > 4 * 1024 * 1024:
             raise ValueError("Invalid daemon response")
         response = json.loads(line)
         if not response.get("ok"):
+            if operation in {"completion_next", "completion_ack"} and response.get("retryable") is True:
+                raise CompletionBusy(response.get("error", "Completion database is busy; retry delivery"))
             raise ValueError(response.get("error", "Router request failed"))
         return response["result"]

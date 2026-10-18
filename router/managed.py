@@ -16,7 +16,7 @@ import time
 import uuid
 from pathlib import Path
 
-from router.client import request
+from router.client import CompletionBusy, request
 from router.dispatch import canonical
 from router.paths import observed_project
 from router.processes import parent_and_identity
@@ -214,10 +214,13 @@ def wait(consumer: str, timeout: float) -> dict:
             or not 0 < timeout <= MAX_WAIT_SECONDS:
         raise ValueError(f"timeout must be finite and greater than zero, at most {MAX_WAIT_SECONDS} seconds")
     deadline = time.monotonic() + timeout
+    last_error = None
+    diagnosed = False
+    saw_pending = False
     while True:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
-            return {"status": "deadline", "consumer": consumer}
+            return {"status": "unavailable" if last_error else "deadline", "consumer": consumer}
         try:
             result = request("completion_next", {"consumer": consumer}, timeout=min(2, remaining), deadline=True)
             if not isinstance(result, dict) or result.get("status") not in {
@@ -231,12 +234,25 @@ def wait(consumer: str, timeout: float) -> dict:
                 raise ValueError("Invalid completion response")
         except (OSError, ValueError, KeyError, TypeError, AttributeError, RecursionError) as error:
             timed_out = isinstance(error, TimeoutError) or isinstance(error.__cause__, TimeoutError)
-            status = "deadline" if timed_out and time.monotonic() >= deadline else "unavailable"
-            return {"status": status, "consumer": consumer}
-        if time.monotonic() >= deadline:
-            return {"status": "deadline", "consumer": consumer}
+            if timed_out and saw_pending and last_error is None and time.monotonic() >= deadline:
+                return {"status": "deadline", "consumer": consumer}
+            transient = isinstance(error, (CompletionBusy, TimeoutError, ConnectionError)) \
+                or isinstance(error.__cause__, TimeoutError)
+            if not diagnosed or not transient:
+                print(f"Agent Router completion wait {'retrying' if transient else 'unavailable'}: "
+                      f"{bound_text(str(error) or type(error).__name__, 300)}", file=sys.stderr, flush=True)
+                diagnosed = True
+            if not transient:
+                return {"status": "unavailable", "consumer": consumer}
+            last_error = error
+            time.sleep(min(WAIT_POLL_SECONDS, max(0, deadline - time.monotonic())))
+            continue
+        last_error = None
         if result["status"] != "pending":
             return result
+        saw_pending = True
+        if time.monotonic() >= deadline:
+            return {"status": "deadline", "consumer": consumer}
         time.sleep(min(WAIT_POLL_SECONDS, max(0, deadline - time.monotonic())))
 
 
@@ -280,11 +296,15 @@ class ManagedProcesses:
         if not subscribed:
             with self.store.transaction(timeout=.1) as db:
                 db.execute("INSERT OR IGNORE INTO completion_consumers(name) VALUES(?)", (consumer,))
-        self.reconcile(blocking=False)
+        query = """SELECT sequence,data FROM completion_events
+                WHERE data IS NOT NULL AND sequence > (SELECT cursor FROM completion_consumers WHERE name=?)
+                ORDER BY sequence LIMIT 1"""
         with self.store.connect(timeout=.1) as db:
-            row = db.execute("""SELECT sequence,data FROM completion_events
-                    WHERE data IS NOT NULL AND sequence > (SELECT cursor FROM completion_consumers WHERE name=?)
-                    ORDER BY sequence LIMIT 1""", (consumer,)).fetchone()
+            row = db.execute(query, (consumer,)).fetchone()
+        if row is None:
+            self.reconcile(blocking=False, timeout=.1)
+            with self.store.connect(timeout=.1) as db:
+                row = db.execute(query, (consumer,)).fetchone()
         result = json.loads(row["data"]) if row else {"status": "pending"}
         if row:
             result["event"]["event_id"] = f"completion-{row['sequence']}"
@@ -358,28 +378,28 @@ class ManagedProcesses:
                    (record["managed_id"], canonical(record)))
         self._completion(db, record)
 
-    def reconcile(self, *, blocking: bool = True) -> None:
+    def reconcile(self, *, blocking: bool = True, timeout: float = 10) -> None:
         # Concurrent readers must not import or rename the same spool file at once.
         if not self._reconcile_lock.acquire(blocking=blocking):
             return
         try:
-            self._reconcile()
+            self._reconcile(timeout=timeout)
         finally:
             self._reconcile_lock.release()
 
-    def _reconcile(self) -> None:
+    def _reconcile(self, *, timeout: float = 10) -> None:
         """Apply completion files; mark running records whose wrapper vanished without evidence."""
         directory = completion_directory(self.state)
         files = sorted(directory.glob("managed-*.json")) if directory.exists() else []
         starts = sorted(directory.glob("start-managed-*.json")) if directory.exists() else []
-        with self.store.connect() as db:
+        with self.store.connect(timeout=timeout) as db:
             running = db.execute("""SELECT data FROM managed_processes
                     WHERE json_extract(data,'$.status')='running'""").fetchall()
         now = _now()
         if not files and not starts and not running and now - self._pruned_at < PRUNE_INTERVAL_MS:
             return
         consumed, invalid = [], []
-        with self.store.transaction() as db:
+        with self.store.transaction(timeout=timeout) as db:
             for path in starts:  # Starts the daemon missed: the command may still be running.
                 try:
                     self._start(db, json.loads(path.read_text()))

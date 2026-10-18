@@ -376,6 +376,10 @@ item before requesting review.
 
 **Concurrency and processes**
 
+- Exercise SQLite lock contention through the daemon wire protocol for both new
+  subscriptions and acknowledgments. Classify busy/locked errors explicitly, preserve
+  useful diagnostics, and keep delivery retries within the caller's overall deadline.
+  Cover empty and partial replies, and a healthy poll followed by a deadline-truncated poll.
 - Never `clear()` and then refill a shared object that another thread may read. Publish
   the new state in one swap.
 - A process-group leader exiting does not prove the group exited. After a failure,

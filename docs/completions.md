@@ -13,6 +13,8 @@ JSON object with `status` equal to `completed`, `failed`, `uncertain`, `deadline
 checking the daemon with short requests rather than repeatedly asking the user for
 status. It opens no write transaction between checks and does not occupy a daemon
 connection between requests. No service is automatically started.
+Short reconciliation requests may open write transactions while a command is running;
+they do not span the wait's sleep. Reducing this polling work is tracked in issue #25.
 
 ## Subscription and acknowledgment
 
@@ -20,7 +22,9 @@ A consumer name subscribes to **all managed-command completion events in this Ro
 state directory**, across projects, sessions, and labels. The first successful request
 persists the subscription before checking for events and includes all retained backlog.
 Events already removed by ordinary retention cannot be recovered. Existing retained
-terminal records are imported when upgrading. This interface does not include
+terminal records are imported when upgrading. Import does not re-check project
+markers: retained evidence from before project admission was required is also imported,
+including evidence from unmarked projects. This interface does not include
 Router-dispatched agent tasks or native session lifecycle events.
 
 Event results include the existing `host_id` and an `event` object containing a stable
@@ -56,6 +60,7 @@ imports cannot recreate expired events with new IDs; expired event payloads are 
 With no subscriptions, ordinary retention still applies. An abandoned
 consumer can therefore retain events indefinitely. There is no automatic subscription
 expiry or consumer deletion in this interface.
+Explicit consumer management is tracked in issue #26; use stable names in the meantime.
 For old evidence without a valid timestamp, payload retention starts at import; the
 source time remains unknown.
 
@@ -78,7 +83,7 @@ do not treat the oldest event or a matching display label as proof of your comma
 | `completed` | The wrapped process exited successfully and reported no group survivors. |
 | `failed` | The wrapped process exited unsuccessfully or was signalled. Inspect `exit_code`, `signal`, and `group_outlived`. |
 | `uncertain` | The wrapper vanished without completion evidence, or the successful process left group survivors or has unknown group state. |
-| `deadline` | No pending event was found before the wait deadline. |
+| `deadline` | A valid poll found no pending event before the wait deadline. |
 | `unavailable` | The daemon, database, or response transport could not provide a valid result. |
 
 `event.status` preserves the original managed-process state. A vanished wrapper's event
@@ -88,6 +93,15 @@ the top-level status and `group_outlived` preserves that uncertainty.
 
 The timeout must be finite, greater than zero, and at most 3600 seconds. `unavailable`
 exits with code 1; the other results exit with code 0. Invalid arguments are CLI errors.
+Database contention, slow responses, and disconnected replies are retried within that
+same deadline. Diagnostics go to stderr, leaving stdout as one JSON result. An unreachable
+daemon returns `unavailable` immediately. If delivery still fails at the deadline,
+the result is `unavailable`; a successful pending poll restores the normal `deadline`
+outcome, including when the deadline truncates the last poll. A validated event is
+returned even if validation finishes at the deadline. Already-pending events are read
+before reconciliation, so SQLite write contention does not block their delivery.
+A busy acknowledgment fails with a clear diagnostic: retry the same consumer
+and event ID. Ctrl-C prints `unavailable` JSON and an interruption diagnostic, and exits 130.
 A timeout, interrupted consumer, disconnected waiter, or unavailable Router never
 cancels, restarts, or duplicates a command. Retry delivery with the same consumer;
 do not relaunch a command merely because integration or delivery failed. A command

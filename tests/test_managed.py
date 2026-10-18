@@ -1,3 +1,4 @@
+import io
 import json
 import os
 import signal
@@ -7,11 +8,13 @@ import tempfile
 import threading
 import time
 import unittest
+from contextlib import redirect_stderr
 from pathlib import Path
 from unittest.mock import patch
 
 from test_control import settings
 
+from router.client import CompletionBusy
 from router.daemon import Controller
 from router.fleet import _validate_snapshot
 from router.fleet_snapshot import compose
@@ -366,13 +369,60 @@ class ManagedRunTests(unittest.TestCase):
                        *({**envelope, "event": event} for event in broken_events)):
             with self.subTest(broken=broken), patch("router.managed.request", return_value=broken):
                 self.assertEqual(wait("worker-a", 5)["status"], "unavailable")
-        for timeout, expected in ((1, "deadline"), (30, "unavailable")):
-            def deadline_during_request(*args, **kwargs):
-                clock[0] += 1
-                raise TimeoutError("No complete reply before the transport deadline")
-            with self.subTest(timeout=timeout), patch("router.managed.time", timer), \
-                    patch("router.managed.request", side_effect=deadline_during_request):
-                self.assertEqual(wait("worker-a", timeout)["status"], expected)
+
+    def test_wait_retries_transient_delivery_errors_within_its_deadline(self):
+        from types import SimpleNamespace
+
+        from router.managed import wait
+        clock = [0.0]
+
+        def advance(seconds):
+            clock[0] += seconds
+
+        timer = SimpleNamespace(monotonic=lambda: clock[0], sleep=advance)
+        pending = {"status": "pending", "consumer": "worker-a", "host_id": "host-a"}
+        completed = {**pending, "status": "completed", "event": {"host_id": "host-a", "event_id": "completion-1"}}
+        for error in (TimeoutError("slow response"), ConnectionResetError("reply lost"),
+                      CompletionBusy("Completion database is busy")):
+            for recovered in (False, True):
+                clock[0] = 0.0
+                diagnostics = io.StringIO()
+                with self.subTest(error=type(error).__name__, recovered=recovered), \
+                        patch("router.managed.time", timer), redirect_stderr(diagnostics), \
+                        patch("router.managed.request", side_effect=[error, completed] if recovered else error):
+                    result = wait("worker-a", 1)
+                    self.assertEqual(result, completed if recovered else {"status": "unavailable", "consumer": "worker-a"})
+                self.assertIn(str(error), diagnostics.getvalue())
+                self.assertLessEqual(clock[0], 1)
+                if not recovered:
+                    self.assertEqual(clock[0], 1)
+        clock[0] = 0.0
+        with patch("router.managed.time", timer), redirect_stderr(io.StringIO()), \
+                patch("router.managed.request", side_effect=[TimeoutError("slow"), pending, pending, pending]):
+            self.assertEqual(wait("worker-a", 1)["status"], "deadline")
+        # An unreachable daemon fails promptly; delivery retries never launch or restart it.
+        clock[0] = 0.0
+        with patch("router.managed.time", timer), redirect_stderr(io.StringIO()), \
+                patch("router.managed.request", side_effect=ValueError("Router is not reachable")):
+            self.assertEqual(wait("worker-a", 1)["status"], "unavailable")
+        self.assertEqual(clock[0], 0)
+        # A healthy pending poll followed by a deadline-truncated poll is still a wait timeout.
+        for reply in (pending, completed):
+            clock[0] = 0.0
+
+            def at_deadline(*args, reply=reply, **kwargs):
+                if clock[0] == 0:
+                    clock[0] = .74
+                    return pending
+                clock[0] = 1.0
+                if reply is completed:
+                    return completed
+                raise TimeoutError("The final poll exhausted the wait budget")
+
+            with self.subTest(final_reply=reply["status"]), patch("router.managed.time", timer), \
+                    patch("router.managed.request", side_effect=at_deadline):
+                self.assertEqual(wait("worker-a", 1), completed if reply is completed else {
+                    "status": "deadline", "consumer": "worker-a"})
 
     def test_upgrade_backfills_retained_terminal_records_without_replaying_acks(self):
         self.run_command("pass")
@@ -472,6 +522,7 @@ class ManagedRunTests(unittest.TestCase):
     def test_subscribed_consumer_can_read_while_reconciliation_is_busy(self):
         self.run_command("pass")
         event = self.next_completion()
+        self.ack_completion(event)  # An empty backlog must reach the nonblocking reconciliation path.
         self.control.managed.start({**self.start_payload("managed-busy"), "wrapper_identity": "blocked"})
         entered, release, read = threading.Event(), threading.Event(), threading.Event()
         outcomes = []
@@ -495,7 +546,7 @@ class ManagedRunTests(unittest.TestCase):
                 self.assertTrue(entered.wait(15))
                 consumer.start()
                 self.assertTrue(read.wait(15))  # Must read while reconciliation still owns its write transaction.
-                self.assertEqual(outcomes, [event])
+                self.assertEqual([outcome["status"] for outcome in outcomes], ["pending"])
             finally:
                 release.set()
                 reconciler.join(15)

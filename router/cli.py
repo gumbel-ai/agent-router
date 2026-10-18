@@ -363,12 +363,19 @@ def main() -> None:
             sys.exit(run_managed(argv, args.label, args.session, args.agent, state_dir()))
         elif args.command == "wait":
             from router.managed import wait as wait_managed
-            result = wait_managed(args.consumer, args.timeout)
+            failure_code = 1
+            try:
+                result = wait_managed(args.consumer, args.timeout)
+            except KeyboardInterrupt:
+                print("Agent Router completion wait interrupted; pending events remain unacknowledged", file=sys.stderr)
+                result = {"status": "unavailable", "consumer": args.consumer}
+                failure_code = 130
             print(json.dumps(result, separators=(",", ":")))
             if result["status"] == "unavailable":
-                sys.exit(1)
+                sys.exit(failure_code)
         elif args.command == "ack":
-            print(json.dumps(request("completion_ack", {"consumer": args.consumer, "event_id": args.event_id})))
+            print(json.dumps(request("completion_ack", {"consumer": args.consumer, "event_id": args.event_id}),
+                             separators=(",", ":")))
         elif args.command == "snapshot":
             print(json.dumps(request("snapshot", {"history_limit": args.history_limit}), separators=(",", ":")))
         elif args.command == "fleet":
