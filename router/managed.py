@@ -138,6 +138,14 @@ def _identifier(value: object, name: str) -> str:
     return value
 
 
+def _completion_sequence(event_id: object) -> int:
+    suffix = event_id.removeprefix("completion-") if isinstance(event_id, str) else ""
+    if not suffix.isascii() or not suffix.isdigit() or len(suffix) > 19 \
+            or not 0 < int(suffix) <= 2**63 - 1 or event_id != f"completion-{int(suffix)}":
+        raise ValueError("Invalid completion event ID")
+    return int(suffix)
+
+
 def _identity(pid: int) -> str | None:
     try:
         return parent_and_identity(pid)[1]
@@ -366,11 +374,7 @@ class ManagedProcesses:
             raise ValueError("completion_ack needs consumer and event_id")
         consumer = _identifier(payload["consumer"], "consumer")
         event_id = payload["event_id"]
-        suffix = event_id.removeprefix("completion-") if isinstance(event_id, str) else ""
-        if not suffix.isascii() or not suffix.isdigit() or len(suffix) > 19 \
-                or not 0 < int(suffix) <= 2**63 - 1 or event_id != f"completion-{int(suffix)}":
-            raise ValueError("Invalid completion event ID")
-        sequence = int(suffix)
+        sequence = _completion_sequence(event_id)
         with self.store.transaction(timeout=.1) as db:
             row = db.execute("SELECT cursor FROM completion_consumers WHERE name=?", (consumer,)).fetchone()
             if row is None:

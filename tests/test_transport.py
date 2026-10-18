@@ -2,11 +2,13 @@ import io
 import json
 import os
 import signal
+import socket
 import subprocess
 import sys
 import threading
 import time
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import redirect_stderr
 from pathlib import Path
 from types import SimpleNamespace
@@ -261,6 +263,7 @@ class TransportTests(TransportHarness, unittest.TestCase):
         self.assertIn("not recording", outside.stderr)
         # A consumer subscribes even when it times out before any command starts.
         initial = self.completion_cli("wait", "--consumer", "worker-a", "--timeout", "2")
+        self.assertEqual(initial.returncode, 0, initial.stderr)
         self.assertEqual(json.loads(initial.stdout)["status"], "deadline")
         request("daemon_stop", {}, self.endpoint)
         self.daemons[-1].wait(timeout=15)
@@ -271,7 +274,9 @@ class TransportTests(TransportHarness, unittest.TestCase):
         unavailable = self.completion_cli("wait", "--consumer", "worker-a", "--timeout", "5")
         self.assertEqual((unavailable.returncode, json.loads(unavailable.stdout)["status"]), (1, "unavailable"))
         self.boot()
-        first = json.loads(self.completion_cli("wait", "--consumer", "worker-a", "--timeout", "5").stdout)
+        delivered = self.completion_cli("wait", "--consumer", "worker-a", "--timeout", "5")
+        self.assertEqual(delivered.returncode, 0, delivered.stderr)
+        first = json.loads(delivered.stdout)
         self.assertEqual(first["status"], "failed")
         request("daemon_stop", {}, self.endpoint)
         self.daemons[-1].wait(timeout=15)
@@ -280,8 +285,91 @@ class TransportTests(TransportHarness, unittest.TestCase):
         event_id = first["event"]["event_id"]
         # Discard the first ack reply, then retry with a new consumer process.
         request("completion_ack", {"consumer": "worker-a", "event_id": event_id}, self.endpoint)
-        self.assertTrue(json.loads(self.completion_cli("ack", "--consumer", "worker-a", event_id).stdout)["acknowledged"])
+        acknowledged = self.completion_cli("ack", "--consumer", "worker-a", event_id)
+        self.assertEqual(acknowledged.returncode, 0, acknowledged.stderr)
+        self.assertTrue(json.loads(acknowledged.stdout)["acknowledged"])
         self.assertEqual(json.loads(self.completion_cli("wait", "--consumer", "worker-a", "--timeout", "2").stdout)["status"], "deadline")
+
+    def test_invalid_completion_arguments_exit_two_even_when_daemon_is_unavailable(self):
+        refused = self.completion_cli("ack", "--consumer", "worker-a", "completion-1")
+        self.assertEqual(refused.returncode, 1, refused.stderr)
+        self.assertIn("Unknown completion consumer", refused.stderr)
+        request("daemon_stop", {}, self.endpoint)
+        self.daemons[-1].wait(timeout=15)
+        invalid = []
+        for consumer in ("", " worker-a", "worker-\na", "x" * 241):
+            invalid.extend((("wait", "--consumer", consumer, "--timeout", "1"),
+                            ("ack", "--consumer", consumer, "completion-1")))
+        invalid.extend(("wait", "--consumer", "worker-a", "--timeout", value)
+                       for value in ("0", "-1", "3601", "nan", "inf", "not-a-number"))
+        invalid.extend(("ack", "--consumer", "worker-a", value)
+                       for value in ("completion-0", "completion-01", "completion-x"))
+        for arguments in invalid:
+            with self.subTest(arguments=arguments):
+                result = self.completion_cli(*arguments)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertEqual(result.stdout, "")
+                self.assertTrue(result.stderr)
+        for arguments in (("wait", "--consumer", "worker-a", "--timeout", "1"),
+                          ("ack", "--consumer", "worker-a", "completion-1"), ("status",)):
+            with self.subTest(arguments=arguments):
+                self.assertEqual(self.completion_cli(*arguments).returncode, 1)
+
+    def test_interrupted_ack_before_or_after_commit_can_retry_without_skipping(self):
+        for _ in range(2):
+            completed = subprocess.run([sys.executable, "-m", "router.cli", "run", "--", sys.executable, "-c", "pass"],
+                                       cwd=self.repo, env=self.environment, capture_output=True, timeout=15, check=False)
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+
+        def hold_reply(listener, committed, admitted, release):
+            connection, _ = listener.accept()
+            with connection, connection.makefile("rb") as incoming:
+                connection.settimeout(15)
+                message = json.loads(incoming.readline(1024 * 1024))
+                self.assertEqual(message["operation"], "completion_ack")
+                if committed:
+                    request("completion_ack", message["payload"], self.endpoint)
+                admitted.set()
+                self.assertTrue(release.wait(60))
+                # Drop an undelivered request or a committed reply at the chosen boundary.
+
+        for committed in (False, True):
+            with self.subTest(committed=committed):
+                consumer = "worker-after" if committed else "worker-before"
+                first = json.loads(self.completion_cli("wait", "--consumer", consumer, "--timeout", "3600").stdout)
+                event_id = first["event"]["event_id"]
+                admitted, release = threading.Event(), threading.Event()
+                endpoint = self.root / (consumer + ".sock")
+                with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as listener, ThreadPoolExecutor(max_workers=1) as executor:
+                    listener.bind(str(endpoint))
+                    listener.listen(1)
+                    listener.settimeout(15)
+
+                    future = executor.submit(hold_reply, listener, committed, admitted, release)
+                    child = subprocess.Popen([sys.executable, "-m", "router.cli", "ack", "--consumer", consumer, event_id],
+                        env={**self.environment, "AGENT_ROUTER_SOCKET": str(endpoint)},
+                        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                    try:
+                        self.assertTrue(admitted.wait(15))
+                        child.send_signal(signal.SIGINT)
+                        output, errors = child.communicate(timeout=15)
+                        self.assertEqual(child.returncode, 130)
+                        self.assertEqual(output, "")
+                        self.assertIn("commit state is unknown", errors)
+                        pending = request("completion_next", {"consumer": consumer}, self.endpoint)
+                        self.assertEqual(pending["event"]["event_id"] == event_id, not committed)
+                    finally:
+                        release.set()
+                        if child.poll() is None:
+                            child.kill()
+                        child.communicate()
+                        future.result(timeout=15)
+                for _ in range(2):
+                    retried = self.completion_cli("ack", "--consumer", consumer, event_id)
+                    self.assertEqual(retried.returncode, 0, retried.stderr)
+                next_event = request("completion_next", {"consumer": consumer}, self.endpoint)
+                self.assertNotEqual(next_event["event"]["event_id"], event_id)
+                self.assertEqual(request("completion_next", {"consumer": consumer}, self.endpoint), next_event)
 
     def test_deadline_and_disconnected_waiter_do_not_change_running_command(self):
         release = self.root / "release"
