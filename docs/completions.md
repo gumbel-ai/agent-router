@@ -59,8 +59,7 @@ payload remains. Small identity tombstones remain indefinitely so old spool repl
 imports cannot recreate expired events with new IDs; expired event payloads are removed.
 With no subscriptions, ordinary retention still applies. An abandoned
 consumer can therefore retain events indefinitely. There is no automatic subscription
-expiry or consumer deletion in this interface.
-Explicit consumer management is tracked in issue #26; use stable names in the meantime.
+expiry. Use explicit removal when a consumer is abandoned, as described below.
 For old evidence without a valid timestamp, payload retention starts at import; the
 source time remains unknown.
 
@@ -93,7 +92,7 @@ the top-level status and `group_outlived` preserves that uncertainty.
 
 The timeout must be finite, greater than zero, and at most 3600 seconds. `unavailable`
 exits with code 1; the other results exit with code 0. Invalid arguments are CLI errors.
-Database contention, slow responses, and disconnected replies are retried within that
+After subscription admission, database contention, slow responses, and disconnected replies are retried within that
 same deadline. Diagnostics go to stderr, leaving stdout as one JSON result. An unreachable
 daemon returns `unavailable` immediately. If delivery still fails at the deadline,
 the result is `unavailable`; a successful pending poll restores the normal `deadline`
@@ -116,3 +115,46 @@ matches the work to be observed. Start failures before process creation are repo
 replies can be recovered from the existing completion spool, without launching again.
 
 This interface is local. Fleet waiting and acknowledgment are separate capabilities.
+
+## Managing consumers
+
+Inspect subscriptions before removing an abandoned name:
+
+```sh
+router consumer list
+router consumer list --limit 100 --offset 100
+router consumer remove worker-a
+```
+
+`list` returns compact JSON containing `consumers`, `total`, `limit`, `offset`, and
+`host_id`. Each consumer has its exact `name`, acknowledged `cursor`, and `pending`
+event count. The list is ordered by name. Pages default to 100 entries; `limit` must
+be 1–1000 and `offset` nonnegative. Counts and rows share one database snapshot.
+Consumer names are identities and are never inferred from command labels.
+
+`remove` returns `{"consumer":"worker-a","removed":true,"host_id":"..."}` even
+when the name was already absent. It changes no other consumer's cursor and deletes
+no command or completion evidence directly. Retention resumes on its next ordinary
+pass for old events no remaining consumer needs. Removing the last consumer permits
+ordinary seven-day retention for the retained backlog.
+
+Current waiters bind to a persisted subscription identity. Removing that subscription
+ends those waits with `unavailable` and a diagnostic on stderr. A newly invoked wait
+with the same name creates a fresh subscription at the retained backlog; expired
+payloads do not return, and old waiters cannot attach to the replacement. An in-flight
+result read before removal may still arrive and is not an acknowledgment. Acknowledgments
+remain explicitly addressed by consumer name and event ID. Stop a consumer that will
+automatically invoke new waits before removing its subscription. Wait CLIs predating
+consumer management must also be stopped: their legacy polling requests can subscribe
+again. Daemon restarts preserve existing subscription identities and cursors.
+
+A lost initial subscription reply returns `unavailable` because registration may have
+committed; it is not automatically repeated across a possible removal. Retry a new wait
+with the same name. Confirmed database contention during admission remains retryable.
+Once joined, transient completion reads retry within the original deadline as before.
+The public `wait` and `ack` JSON results and their CLI syntax are unchanged.
+
+There is no idle expiry. An intentionally offline consumer is indistinguishable from an
+abandoned one; expiring it silently could prune unacknowledged evidence needed after a
+restart. Bounded inspection and explicit, idempotent removal provide operator control
+without weakening durable replay for consumers that remain subscribed.

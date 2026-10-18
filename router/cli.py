@@ -278,6 +278,13 @@ def main() -> None:
     ack = commands.add_parser("ack", help="Acknowledge a completion after durably handling it")
     ack.add_argument("--consumer", required=True)
     ack.add_argument("event_id")
+    consumer = commands.add_parser("consumer", help="Inspect and remove completion subscriptions")
+    consumer_commands = consumer.add_subparsers(dest="consumer_command", required=True)
+    consumer_list = consumer_commands.add_parser("list")
+    consumer_list.add_argument("--limit", type=int, default=100)
+    consumer_list.add_argument("--offset", type=int, default=0)
+    consumer_remove = consumer_commands.add_parser("remove")
+    consumer_remove.add_argument("name")
     snapshot = commands.add_parser("snapshot", help="Print a bounded read-only local host snapshot")
     snapshot.add_argument("--json", action="store_true", required=True)
     snapshot.add_argument("--history-limit", type=int, default=100)
@@ -376,6 +383,11 @@ def main() -> None:
         elif args.command == "ack":
             print(json.dumps(request("completion_ack", {"consumer": args.consumer, "event_id": args.event_id}),
                              separators=(",", ":")))
+        elif args.command == "consumer":
+            operation, payload = (("completion_consumer_list", {"limit": args.limit, "offset": args.offset})
+                                  if args.consumer_command == "list" else
+                                  ("completion_consumer_remove", {"consumer": args.name}))
+            print(json.dumps(request(operation, payload), separators=(",", ":")))
         elif args.command == "snapshot":
             print(json.dumps(request("snapshot", {"history_limit": args.history_limit}), separators=(",", ":")))
         elif args.command == "fleet":

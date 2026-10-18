@@ -217,12 +217,25 @@ def wait(consumer: str, timeout: float) -> dict:
     last_error = None
     diagnosed = False
     saw_pending = False
+    subscription = None
     while True:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
-            return {"status": "unavailable" if last_error else "deadline", "consumer": consumer}
+            if not saw_pending and not diagnosed:
+                print("Agent Router completion wait unavailable: deadline reached before reading completion evidence",
+                      file=sys.stderr, flush=True)
+            return {"status": "unavailable" if last_error or not saw_pending else "deadline", "consumer": consumer}
         try:
-            result = request("completion_next", {"consumer": consumer}, timeout=min(2, remaining), deadline=True)
+            if subscription is None:
+                binding = request("completion_subscribe", {"consumer": consumer}, timeout=min(2, remaining), deadline=True)
+                if not isinstance(binding, dict) or binding.get("consumer") != consumer \
+                        or not _valid_identifier(binding.get("subscription_id")) or not _valid_identifier(binding.get("host_id")):
+                    raise ValueError("Invalid completion subscription response")
+                subscription = binding["subscription_id"]
+                last_error = None
+                continue
+            result = request("completion_next", {"consumer": consumer, "subscription_id": subscription},
+                             timeout=min(2, remaining), deadline=True)
             if not isinstance(result, dict) or result.get("status") not in {
                 "pending", "completed", "failed", "uncertain"
             } or result.get("consumer") != consumer or not _valid_identifier(result.get("host_id")) \
@@ -236,8 +249,9 @@ def wait(consumer: str, timeout: float) -> dict:
             timed_out = isinstance(error, TimeoutError) or isinstance(error.__cause__, TimeoutError)
             if timed_out and saw_pending and last_error is None and time.monotonic() >= deadline:
                 return {"status": "deadline", "consumer": consumer}
-            transient = isinstance(error, (CompletionBusy, TimeoutError, ConnectionError)) \
-                or isinstance(error.__cause__, TimeoutError)
+            # A lost admission reply is uncertain: do not recreate a concurrently removed subscription.
+            transient = isinstance(error, CompletionBusy) or (subscription is not None and (
+                isinstance(error, (TimeoutError, ConnectionError)) or isinstance(error.__cause__, TimeoutError)))
             if not diagnosed or not transient:
                 print(f"Agent Router completion wait {'retrying' if transient else 'unavailable'}: "
                       f"{bound_text(str(error) or type(error).__name__, 300)}", file=sys.stderr, flush=True)
@@ -286,25 +300,62 @@ class ManagedProcesses:
                     VALUES(?,?,?,?,?)""", (record["managed_id"], record["host_id"], phase,
                     timestamp, canonical({"status": status, "event": event})))
 
-    def next_completion(self, payload: dict) -> dict:
+    def subscribe(self, payload: dict) -> dict:
         if set(payload) != {"consumer"}:
-            raise ValueError("completion_next needs only consumer")
+            raise ValueError("completion_subscribe needs only consumer")
         consumer = _identifier(payload["consumer"], "consumer")
-        # Admission precedes reconciliation/pruning. An interrupted first read still subscribes.
         with self.store.connect(timeout=.1) as db:
-            subscribed = db.execute("SELECT 1 FROM completion_consumers WHERE name=?", (consumer,)).fetchone()
-        if not subscribed:
+            row = db.execute("SELECT subscription_id FROM completion_consumers WHERE name=?", (consumer,)).fetchone()
+        if row is None:
             with self.store.transaction(timeout=.1) as db:
-                db.execute("INSERT OR IGNORE INTO completion_consumers(name) VALUES(?)", (consumer,))
-        query = """SELECT sequence,data FROM completion_events
-                WHERE data IS NOT NULL AND sequence > (SELECT cursor FROM completion_consumers WHERE name=?)
-                ORDER BY sequence LIMIT 1"""
+                db.execute("INSERT OR IGNORE INTO completion_consumers(name,subscription_id) VALUES(?,?)",
+                           (consumer, uuid.uuid4().hex))
+                row = db.execute("SELECT subscription_id FROM completion_consumers WHERE name=?", (consumer,)).fetchone()
+        return {"consumer": consumer, "subscription_id": row[0], "host_id": self.host_id}
+
+    def list_consumers(self, payload: dict) -> dict:
+        if set(payload) - {"limit", "offset"}:
+            raise ValueError("consumer list accepts only limit and offset")
+        limit, offset = payload.get("limit", 100), payload.get("offset", 0)
+        if not is_wire_integer(limit) or not 1 <= limit <= 1000 or not is_wire_integer(offset) or offset < 0:
+            raise ValueError("consumer list needs limit 1..1000 and a nonnegative offset")
         with self.store.connect(timeout=.1) as db:
-            row = db.execute(query, (consumer,)).fetchone()
+            db.execute("BEGIN")
+            total = db.execute("SELECT COUNT(*) FROM completion_consumers").fetchone()[0]
+            rows = db.execute("""SELECT name,cursor,
+                    (SELECT COUNT(*) FROM completion_events WHERE data IS NOT NULL AND sequence>c.cursor) AS pending
+                    FROM completion_consumers c ORDER BY name LIMIT ? OFFSET ?""", (limit, offset)).fetchall()
+        return {"consumers": [dict(row) for row in rows], "total": total, "limit": limit, "offset": offset,
+                "host_id": self.host_id}
+
+    def remove_consumer(self, payload: dict) -> dict:
+        if set(payload) != {"consumer"}:
+            raise ValueError("consumer remove needs only consumer")
+        consumer = _identifier(payload["consumer"], "consumer")
+        with self.store.transaction(timeout=.1) as db:
+            db.execute("DELETE FROM completion_consumers WHERE name=?", (consumer,))
+        return {"consumer": consumer, "removed": True, "host_id": self.host_id}
+
+    def next_completion(self, payload: dict) -> dict:
+        if set(payload) not in ({"consumer"}, {"consumer", "subscription_id"}):
+            raise ValueError("completion_next needs consumer and optional subscription_id")
+        consumer = _identifier(payload["consumer"], "consumer")
+        subscription = (_identifier(payload["subscription_id"], "subscription") if "subscription_id" in payload else
+                        self.subscribe({"consumer": consumer})["subscription_id"])
+
+        def pending():
+            with self.store.connect(timeout=.1) as db:
+                db.execute("BEGIN")
+                row = db.execute("SELECT cursor,subscription_id FROM completion_consumers WHERE name=?", (consumer,)).fetchone()
+                if row is None or row["subscription_id"] != subscription:
+                    raise ValueError("Completion consumer subscription was removed or replaced; start a new wait to resubscribe")
+                return db.execute("""SELECT sequence,data FROM completion_events
+                        WHERE data IS NOT NULL AND sequence>? ORDER BY sequence LIMIT 1""", (row["cursor"],)).fetchone()
+
+        row = pending()
         if row is None:
             self.reconcile(blocking=False, timeout=.1)
-            with self.store.connect(timeout=.1) as db:
-                row = db.execute(query, (consumer,)).fetchone()
+            row = pending()
         result = json.loads(row["data"]) if row else {"status": "pending"}
         if row:
             result["event"]["event_id"] = f"completion-{row['sequence']}"
