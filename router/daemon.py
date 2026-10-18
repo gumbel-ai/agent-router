@@ -463,6 +463,9 @@ class Controller:
                     "Lifecycle observation is queued but was not durably persisted before the acknowledgement timeout",
                 )
             return dict(outcome)
+        if operation == "correlation":
+            from router.correlation import export
+            return export(self.store, self.host.host_id, payload)
         if operation == "snapshot":
             if set(payload) - {"history_limit"}:
                 raise ValueError("Unknown snapshot option")
