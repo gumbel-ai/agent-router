@@ -940,7 +940,8 @@ class RuntimeTests(RuntimeHarness, unittest.TestCase):
         for task_id in tasks:
             self.mutate("cancel", {"task_id": task_id, "request_id": "stop-" + task_id})
         for task_id in tasks:
-            self.assertEqual(self.wait(task_id, {"cancelled", "interrupted"})["status"], "cancelled")
+            stopped = self.wait(task_id, {"cancelled", "interrupted"})
+            self.assertEqual(stopped["status"], "cancelled", stopped)
 
     def test_setup_creates_own_environment_and_runs_repository_tests(self):
         project_tests = self.repo / "tests"

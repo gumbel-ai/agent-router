@@ -12,6 +12,9 @@ the captured Git preparation stderr for each preparation attempt. Large files sh
 their last 64 KiB with an explicit truncation marker. Missing, empty, or unreadable
 artifacts are reported alongside the original task-state failure.
 
+The twelve-task admission test also includes the returned task record when a
+cancellation assertion fails, preserving the phase and failure reason in CI output.
+
 A deterministic branch-namespace conflict checks that a real Git error reaches the
 assertion. This verifies the diagnostic path; it does not establish the cause of the
 load-sensitive macOS failures tracked in issue #16. That cause remains NOT CHECKED.
