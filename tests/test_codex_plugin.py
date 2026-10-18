@@ -13,7 +13,7 @@ from router.codex_plugin import (
     expected_trust,
     hook_hash,
 )
-from router.setup import install_codex_plugin
+from router.setup import register_codex_marketplace
 
 ROOT = Path(__file__).resolve().parent.parent
 HOOKS = json.loads((ROOT / HOOKS_FILE).read_text())
@@ -118,23 +118,22 @@ class CodexPluginTests(unittest.TestCase):
                                         timeout=30, check=False)
                 self.assertEqual((result.returncode, result.stdout.strip()), (0, "{}"), result.stderr)
 
-    def test_setup_install_is_best_effort(self):
-        for codes, installed in (([0, 0], True), ([0, 1], False)):
+    def test_setup_registration_is_best_effort_and_never_enables_plugins(self):
+        for codes, installed in (([0], True), ([1], False)):
             results = [subprocess.CompletedProcess([], code) for code in codes]
             with self.subTest(codes=codes), patch("router.setup.shutil.which", return_value="/usr/bin/codex"), \
                     patch("router.setup.subprocess.run", side_effect=results) as command, \
                     patch("builtins.print") as output:
-                install_codex_plugin("owner/repo")
+                register_codex_marketplace("owner/repo")
             self.assertEqual([call.args[0] for call in command.call_args_list],
-                             [["codex", "plugin", "marketplace", "add", "owner/repo"],
-                              ["codex", "plugin", "add", PLUGIN_ID]])
-            self.assertEqual("/hooks" in output.call_args.args[0], installed)
+                             [["codex", "plugin", "marketplace", "add", "owner/repo"]])
+            self.assertEqual("registered" in output.call_args.args[0], installed)
         for failure in (subprocess.TimeoutExpired("codex", 120), OSError("bad interpreter")):
             with self.subTest(failure=failure), patch("router.setup.shutil.which", return_value="/usr/bin/codex"), \
                     patch("router.setup.subprocess.run", side_effect=failure), \
                     patch("builtins.print") as output:
-                install_codex_plugin("owner/repo")
-            self.assertIn("Install it later", output.call_args.args[0])
+                register_codex_marketplace("owner/repo")
+            self.assertIn("Register it later", output.call_args.args[0])
 
 
 if __name__ == "__main__":

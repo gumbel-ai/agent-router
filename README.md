@@ -31,15 +31,23 @@ Requires Git, uv, and Claude Code 2.1.292+ (sign in to run agents). Automatic ba
 uvx --python 3.14 --from git+https://github.com/gumbel-ai/agent-router router setup
 ```
 
-Approve the one-time user-scoped plugin and background-service installation. Restart already-open Claude sessions. If the Codex CLI is installed, setup also adds Router's Codex plugin; open Codex once and trust its hooks with `/hooks`. `router status` reports whether Codex observation is ready.
-
-Router observes only projects that opt in. Commit this marker at the project's root, so every clone, worktree, and machine opts in:
+Approve the one-time CLI and background-service installation. Setup registers the
+Claude and, when installed, Codex marketplaces. Enable observation separately in each
+Git project:
 
 ```sh
-echo '{"observe": true}' > .agent-router.json
+router enable
+git add .agent-router.json .claude/settings.json .codex/config.toml
 ```
 
-Then use ordinary `claude` or `codex` there; no launch flags are needed. Router records a session once any of its hook events comes from inside a marked project (the nearest marked ancestor of the session's working directory) and follows it from then on, even if it leaves. Sessions that never enter a marked project are not recorded. The marker must be a regular file containing exactly `{"observe": true}`; anything else fails observation visibly (the hook names the marker) instead of silently opting out. To stop observing a project, delete the marker; sessions already recorded are still followed. Sessions recorded before this rule existed keep their records and are still followed. Watch the observed projects in another terminal:
+`router enable` installs Claude's plugin at project scope and merges both clients'
+project configuration. Commit these files so clones and worktrees carry the opt-in.
+Start fresh Claude and Codex sessions. Codex loads project configuration only in
+trusted projects; refresh its plugins and trust Router's hooks manually with `/hooks`.
+Router never writes hook trust. See [project enablement](docs/project-enablement.md)
+for prerequisites, preservation rules and migration from older global installations.
+
+Then use ordinary `claude` or `codex` there; no launch flags are needed. Router records a session once any of its hook events comes from inside a marked project (the nearest marked ancestor of the session's working directory) and follows it from then on, even if it leaves. Sessions that never enter a marked project are not recorded. The marker must be a regular file containing exactly `{"observe": true}`; anything else fails observation visibly (the hook names the marker) instead of silently opting out. Removing the marker stops new admission; remove Router's client configuration entries too to prevent hook startup in fresh sessions. Sessions already recorded are still followed, including sessions recorded before marker admission existed. Watch the observed projects in another terminal:
 
 ```sh
 router status --watch
@@ -56,7 +64,7 @@ If a Codex shutdown stays unconfirmed, an operator must inspect and stop its rem
 The plugin is also installable through Claude's normal marketplace command after the Router runtime is installed:
 
 ```sh
-claude plugin install agent-router --marketplace gumbel-ai/agent-router --scope user
+claude plugin install agent-router --marketplace gumbel-ai/agent-router --scope project
 ```
 
 ## Fleet monitoring

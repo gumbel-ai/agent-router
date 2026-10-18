@@ -307,7 +307,8 @@ def main() -> None:
     daemon = commands.add_parser("daemon")
     daemon.add_argument("action", choices=["start", "stop"])
     commands.add_parser("plugin-path", help="Print the bundled Claude plugin directory")
-    setup = commands.add_parser("setup", help="Install the global Claude plugin and user background service")
+    commands.add_parser("enable", help="Enable observation in this Git project for Claude and Codex")
+    setup = commands.add_parser("setup", help="Install the user background service and register plugin marketplaces")
     setup.add_argument("--yes", action="store_true", help="Approve installation without prompting")
     setup.add_argument("--marketplace", default="gumbel-ai/agent-router", help="Official Claude marketplace source (or a local source for development)")
     uninstall = commands.add_parser("uninstall", help="Remove plugin, service and CLI, retaining private history")
@@ -331,7 +332,10 @@ def main() -> None:
     hook.add_argument("event", choices=["submit", "authorize", "observe"])
     args = parser.parse_args()
     try:
-        if args.command in {"setup", "init", "uninstall"}:
+        if args.command == "enable":
+            from router.project_enablement import enable
+            enable()
+        elif args.command in {"setup", "init", "uninstall"}:
             from router import setup as installation
             if args.command == "init":
                 installation.init(args)

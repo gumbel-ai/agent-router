@@ -5,6 +5,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import tomllib
 import unittest
 from argparse import Namespace
 from pathlib import Path
@@ -15,7 +16,7 @@ from router.config import load_settings
 from router.db import Store
 from router.paths import PROJECT_MARKER, PROJECT_MARKER_CONTENT
 from router.service import definition, start
-from router.setup import init, initialize, setup
+from router.setup import init, initialize, setup, uninstall
 from router.snapshot import git
 
 
@@ -26,7 +27,10 @@ class SetupTests(unittest.TestCase):
         self.root = Path(self.temp.name)
         self.environment = {key: value for key, value in os.environ.items() if not key.startswith("AGENT_ROUTER_")}
         self.environment.update(AGENT_ROUTER_STATE_DIR=str(self.root / "state"),
-                                AGENT_ROUTER_ENV_FILE=str(self.root / "missing.env"))
+                                AGENT_ROUTER_ENV_FILE=str(self.root / "missing.env"),
+                                HOME=str(self.root / "home"),
+                                CLAUDE_CONFIG_DIR=str(self.root / "home" / ".claude"),
+                                CODEX_HOME=str(self.root / "selected-codex"))
         self.env = patch.dict(os.environ, self.environment, clear=True)
         self.env.start()
         self.addCleanup(self.env.stop)
@@ -144,12 +148,12 @@ class SetupTests(unittest.TestCase):
                 patch("router.service.sys.platform", "darwin"), \
                 patch("router.setup.shutil.which", return_value="/usr/bin/tool"), \
                 patch("router.setup.run", side_effect=command), \
-                patch("router.setup.install_codex_plugin") as codex, \
+                patch("router.setup.register_codex_marketplace") as codex, \
                 patch("router.setup.start", return_value={"version": "0.2.0"}):
             setup(yes=True)
         codex.assert_called_once_with("gumbel-ai/agent-router")
-        self.assertEqual(calls, [["uv", "tool", "dir"], ["claude", "plugin", "install", "agent-router",
-                              "--marketplace", "gumbel-ai/agent-router", "--scope", "user"]])
+        self.assertEqual(calls, [["uv", "tool", "dir"], ["claude", "plugin", "marketplace", "add",
+                              "gumbel-ai/agent-router"]])
         pointer = self.root / "state" / "python-path"
         self.assertEqual(pointer.read_text().strip(), str(runtime / "bin" / "python"))
         self.assertEqual(pointer.stat().st_mode & 0o777, 0o600)
@@ -175,6 +179,73 @@ class SetupTests(unittest.TestCase):
                 patch("router.service.run") as command, self.assertRaisesRegex(ValueError, "active Router"):
             start(restart=True)
         command.assert_not_called()
+
+    def test_setup_migrates_only_router_global_entries_after_separate_confirmation(self):
+        tools = self.root / "tools"
+        runtime = tools / "agent-router"
+        runtime.mkdir(parents=True)
+        claude = Path(self.environment["CLAUDE_CONFIG_DIR"])
+        (claude / "plugins").mkdir(parents=True)
+        registry = claude / "plugins" / "installed_plugins.json"
+        user_settings = claude / "settings.json"
+        codex = Path(self.environment["CODEX_HOME"])
+        codex.mkdir()
+        config = codex / "config.toml"
+        unrelated = ('# preserve comment\n[plugins."example@fixture"]\nenabled = true\n[features]\nhooks = false\n'
+                     '[hooks.state."example@fixture:hooks.json:stop:0:0"]\ntrusted_hash = "fixture-state"\n')
+        history = codex / "history.jsonl"
+        history.write_text('{"session_id":"worker-a"}\n')
+        for tty, answer, scope, globally_enabled in ((True, "no", "user", True), (True, "yes", "user", True),
+                                                     (False, "yes", "user", True), (True, "yes", "project", False)):
+            with self.subTest(tty=tty, answer=answer, scope=scope):
+                registry.write_text(json.dumps({"version": 2, "plugins": {"agent-router@agent-router": [{"scope": scope}],
+                                                                          "example@fixture": [{"scope": "user"}]}}))
+                user_settings.write_text(json.dumps({"enabledPlugins": {"agent-router@agent-router": True,
+                                                                         "example@fixture": False}, "env": {"EXAMPLE": "keep"}}))
+                original = unrelated + '[plugins."agent-router@agent-router"]\nenabled = ' + str(globally_enabled).lower() + '\n'
+                config.write_text(original)
+                calls = []
+
+                def command(argv, commands=calls):
+                    commands.append(argv)
+                    return str(tools) if argv == ["uv", "tool", "dir"] else ""
+
+                with patch("router.setup.sys.prefix", str(runtime)), \
+                        patch("router.setup.sys.executable", str(runtime / "bin" / "python")), \
+                        patch("router.service.sys.platform", "darwin"), \
+                        patch("router.setup.shutil.which", return_value="/usr/bin/tool"), \
+                        patch("router.setup.run", side_effect=command), \
+                        patch("router.setup.register_codex_marketplace"), \
+                        patch("router.setup.start", return_value={"version": "0.4.0"}), \
+                        patch("sys.stdin.isatty", return_value=tty), patch("builtins.input", return_value=answer) as prompt:
+                    setup(yes=True)
+                removed = [argv for argv in calls if "uninstall" in argv]
+                if tty and answer == "yes":
+                    self.assertEqual(removed, [["claude", "plugin", "uninstall", "agent-router@agent-router",
+                                               "--scope", "user", "--keep-data"]] if scope == "user" else [])
+                    self.assertIs(tomllib.loads(config.read_text())["plugins"]["agent-router@agent-router"]["enabled"], False)
+                    self.assertEqual(json.loads(user_settings.read_text()), {"enabledPlugins": {"example@fixture": False},
+                                                                            "env": {"EXAMPLE": "keep"}})
+                else:
+                    self.assertEqual(removed, [])
+                    self.assertEqual(config.read_text(), original)
+                self.assertEqual(prompt.call_count, int(tty))
+                self.assertIn(unrelated, config.read_text())
+                self.assertEqual(history.read_text(), '{"session_id":"worker-a"}\n')
+
+    def test_uninstall_after_project_scoped_setup_needs_no_user_plugin(self):
+        calls = []
+
+        def command(argv):
+            calls.append(argv)
+            if argv[:3] == ["claude", "plugin", "uninstall"]:
+                raise ValueError("No user-scoped plugin is installed")
+            return ""
+
+        with patch("router.setup.require_idle"), patch("router.setup.stop"), \
+                patch("router.setup.shutil.which", return_value=None), patch("router.setup.run", side_effect=command):
+            uninstall(yes=True)
+        self.assertEqual(calls, [["uv", "tool", "uninstall", "agent-router"]])
 
     def test_observation_only_daemon_and_published_hooks_span_two_projects(self):
         state = self.root / "state"
