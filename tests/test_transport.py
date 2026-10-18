@@ -83,17 +83,22 @@ class ClientDeadlineTests(unittest.TestCase):
             clock[0] += seconds
 
         timer = SimpleNamespace(monotonic=lambda: clock[0], sleep=advance)
+        binding = {"consumer": "worker-a", "subscription_id": "subscription-a", "host_id": "host-a"}
         # Every cut before the newline is a lost reply, including a complete JSON value at EOF.
         for cut in range(len(reply)):
             clock[0] = 0.0
             lost, recovered = FragmentedSocket(), FragmentedSocket()
+            subscribed = FragmentedSocket()
+            subscribed.fragments = iter([(json.dumps({"ok": True, "result": binding}) + "\n").encode()])
             lost.fragments, recovered.fragments = iter([reply[:cut]]), iter([reply])
-            with self.subTest(cut=cut), patch("router.client.socket.socket", side_effect=[lost, recovered]), \
+            with self.subTest(cut=cut), patch("router.client.socket.socket", side_effect=[subscribed, lost, recovered]), \
                     patch("router.client.time", timer), patch("router.managed.time", timer), redirect_stderr(io.StringIO()):
                 self.assertEqual(wait("worker-a", 5), pending)
         malformed = FragmentedSocket()
+        subscribed = FragmentedSocket()
+        subscribed.fragments = iter([(json.dumps({"ok": True, "result": binding}) + "\n").encode()])
         malformed.fragments = iter([b'not-json\n'])
-        with patch("router.client.socket.socket", return_value=malformed), redirect_stderr(io.StringIO()):
+        with patch("router.client.socket.socket", side_effect=[subscribed, malformed]), redirect_stderr(io.StringIO()):
             self.assertEqual(wait("worker-a", 5)["status"], "unavailable")
 
 
@@ -160,6 +165,41 @@ class TransportTests(TransportHarness, unittest.TestCase):
     def completion_cli(self, *args):
         return subprocess.run([sys.executable, "-m", "router.cli", *args], env=self.environment,
                               capture_output=True, text=True, timeout=15, check=False)
+
+    def test_consumer_cli_removal_stops_wait_and_new_wait_resubscribes(self):
+        initial = self.completion_cli("consumer", "list")
+        self.assertEqual(initial.returncode, 0, initial.stderr)
+        self.assertEqual(json.loads(initial.stdout)["consumers"], [])
+        waiter = subprocess.Popen([sys.executable, "-m", "router.cli", "wait", "--consumer", "worker-a", "--timeout", "30"],
+                                  env=self.environment, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        try:
+            end = time.monotonic() + 15
+            while time.monotonic() < end:
+                listing = json.loads(self.completion_cli("consumer", "list").stdout)
+                if listing["consumers"]:
+                    break
+                time.sleep(.02)
+            self.assertEqual([row["name"] for row in listing["consumers"]], ["worker-a"])
+            removed = self.completion_cli("consumer", "remove", "worker-a")
+            self.assertEqual(removed.returncode, 0, removed.stderr)
+            self.assertTrue(json.loads(removed.stdout)["removed"])
+            self.assertEqual(json.loads(self.completion_cli("consumer", "remove", "worker-a").stdout),
+                             json.loads(removed.stdout))
+            output, errors = waiter.communicate(timeout=15)
+            self.assertEqual(waiter.returncode, 1)
+            self.assertEqual(json.loads(output), {"status": "unavailable", "consumer": "worker-a"})
+            self.assertIn("removed or replaced", errors)
+            self.assertEqual(json.loads(self.completion_cli("consumer", "list").stdout)["consumers"], [])
+            completed = subprocess.run([sys.executable, "-m", "router.cli", "run", "--", sys.executable, "-c", "pass"],
+                                       cwd=self.repo, env=self.environment, capture_output=True, timeout=15, check=False)
+            self.assertEqual(completed.returncode, 0)
+            event = self.completion_cli("wait", "--consumer", "worker-a", "--timeout", "5")
+            self.assertEqual(event.returncode, 0, event.stderr)
+            self.assertEqual(json.loads(event.stdout)["status"], "completed")
+        finally:
+            if waiter.poll() is None:
+                waiter.kill()
+            waiter.communicate()
 
     def test_locked_completion_delivery_reports_contention_and_wait_recovers(self):
         completed = subprocess.run([sys.executable, "-m", "router.cli", "run", "--", sys.executable, "-c", "pass"],

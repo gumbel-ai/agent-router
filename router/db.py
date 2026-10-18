@@ -61,7 +61,7 @@ class Store:
                 """CREATE INDEX IF NOT EXISTS completion_pending ON completion_events(sequence)
                     WHERE data IS NOT NULL""",
                 """CREATE TABLE IF NOT EXISTS completion_consumers (
-                    name TEXT PRIMARY KEY, cursor INTEGER NOT NULL DEFAULT 0)""",
+                    name TEXT PRIMARY KEY, cursor INTEGER NOT NULL DEFAULT 0, subscription_id TEXT)""",
                 """CREATE TABLE IF NOT EXISTS native_session_watermarks (
                     host_id TEXT NOT NULL, source TEXT NOT NULL, session_id TEXT NOT NULL,
                     ended_at INTEGER NOT NULL,
@@ -78,6 +78,9 @@ class Store:
         with self.transaction() as db:
             for statement in statements:
                 db.execute(statement)
+            if "subscription_id" not in {row[1] for row in db.execute("PRAGMA table_info(completion_consumers)")}:
+                db.execute("ALTER TABLE completion_consumers ADD COLUMN subscription_id TEXT")
+            db.execute("UPDATE completion_consumers SET subscription_id=lower(hex(randomblob(16))) WHERE subscription_id IS NULL")
             if "parent_agent_id" not in {row[1] for row in db.execute("PRAGMA table_info(authorizations)")}:
                 db.execute("ALTER TABLE authorizations ADD COLUMN parent_agent_id TEXT")
             observation_columns = [row[1] for row in db.execute("PRAGMA table_info(observations)")]

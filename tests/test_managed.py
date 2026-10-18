@@ -9,6 +9,7 @@ import threading
 import time
 import unittest
 from contextlib import redirect_stderr
+from itertools import chain, repeat
 from pathlib import Path
 from unittest.mock import patch
 
@@ -251,6 +252,68 @@ class ManagedRunTests(unittest.TestCase):
     def ack_completion(self, event, consumer="worker-a"):
         return self.control.handle("completion_ack", {"consumer": consumer, "event_id": event["event"]["event_id"]})
 
+    def test_consumer_removal_releases_retention_without_moving_other_cursors(self):
+        from router.managed import PRUNE_INTERVAL_MS, RETENTION_MS
+
+        self.next_completion("worker-a")
+        self.next_completion("worker-'b")
+        self.run_command("pass")
+        event = self.next_completion("worker-a")
+        self.ack_completion(event, "worker-a")
+        listing = self.control.handle("completion_consumer_list", {"limit": 1, "offset": 1})
+        self.assertEqual(listing["total"], 2)
+        self.assertEqual([(row["name"], row["pending"]) for row in listing["consumers"]], [("worker-a", 0)])
+        before = self.control.handle("completion_consumer_list", {})["consumers"]
+        cursor = next(row["cursor"] for row in before if row["name"] == "worker-a")
+        removed = self.control.handle("completion_consumer_remove", {"consumer": "worker-'b"})
+        self.assertEqual(self.control.handle("completion_consumer_remove", {"consumer": "worker-'b"}), removed)
+        with patch("router.managed._now", return_value=int(time.time() * 1000) + RETENTION_MS + PRUNE_INTERVAL_MS):
+            self.control.managed.reconcile()
+        remaining = self.control.handle("completion_consumer_list", {})["consumers"]
+        self.assertEqual([(row["name"], row["cursor"], row["pending"]) for row in remaining], [("worker-a", cursor, 0)])
+        with self.control.store.connect() as db:
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM managed_processes").fetchone()[0], 0)
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM completion_events WHERE data IS NOT NULL").fetchone()[0], 0)
+        for payload in ({"limit": 0}, {"limit": 1001}, {"offset": -1}, {"limit": True}, {"extra": 1}):
+            with self.subTest(payload=payload), self.assertRaises(ValueError):
+                self.control.handle("completion_consumer_list", payload)
+
+    def test_resubscription_replays_only_retained_backlog_and_fences_old_waits(self):
+        from router.managed import RETENTION_MS
+
+        original = self.control.handle("completion_subscribe", {"consumer": "worker-a"})
+        self.next_completion("worker-b")
+        self.run_command("pass")
+        expired = self.next_completion()
+        self.ack_completion(expired)
+        self.ack_completion(expired, "worker-b")
+        with patch("router.managed._now", return_value=int(time.time() * 1000) + RETENTION_MS + 1):
+            self.control.managed.reconcile()
+        self.run_command("pass")
+        retained = self.next_completion()
+        self.ack_completion(retained)
+        self.control.handle("completion_consumer_remove", {"consumer": "worker-a"})
+        replacement = self.control.handle("completion_subscribe", {"consumer": "worker-a"})
+        self.assertNotEqual(original["subscription_id"], replacement["subscription_id"])
+        with self.assertRaises(ValueError) as removed:
+            self.control.handle("completion_next", {"consumer": "worker-a", "subscription_id": original["subscription_id"]})
+        self.assertIn("removed or replaced", str(removed.exception))
+        self.assertEqual(self.next_completion()["event"], retained["event"])
+        self.assertEqual(self.next_completion("worker-b")["event"], retained["event"])
+        self.assertNotEqual(retained["event"]["event_id"], expired["event"]["event_id"])
+
+    def test_previous_consumer_schema_upgrades_without_replaying_acknowledged_events(self):
+        self.run_command("pass")
+        event = self.next_completion()
+        self.ack_completion(event)
+        with self.control.store.transaction() as db:
+            db.execute("ALTER TABLE completion_consumers DROP COLUMN subscription_id")
+        self.control = Controller(settings(self.state.parent / "repo"), {}, self.state)
+        binding = self.control.handle("completion_subscribe", {"consumer": "worker-a"})
+        self.assertEqual(self.next_completion()["status"], "pending")
+        self.control = Controller(settings(self.state.parent / "repo"), {}, self.state)
+        self.assertEqual(self.control.handle("completion_subscribe", {"consumer": "worker-a"}), binding)
+
     def test_completion_backlog_replays_until_acknowledged_across_restart(self):
         self.run_command("pass", label="same-label")
         self.run_command("raise SystemExit(2)", label="same-label")
@@ -367,7 +430,8 @@ class ManagedRunTests(unittest.TestCase):
                          {**nested, "host_id": None}]
         for broken in (None, [], {"status": "completed"}, {"status": []},
                        *({**envelope, "event": event} for event in broken_events)):
-            with self.subTest(broken=broken), patch("router.managed.request", return_value=broken):
+            binding = {"consumer": "worker-a", "subscription_id": "subscription-a", "host_id": "host-a"}
+            with self.subTest(broken=broken), patch("router.managed.request", side_effect=[binding, broken]):
                 self.assertEqual(wait("worker-a", 5)["status"], "unavailable")
 
     def test_wait_retries_transient_delivery_errors_within_its_deadline(self):
@@ -380,6 +444,7 @@ class ManagedRunTests(unittest.TestCase):
             clock[0] += seconds
 
         timer = SimpleNamespace(monotonic=lambda: clock[0], sleep=advance)
+        binding = {"consumer": "worker-a", "subscription_id": "subscription-a", "host_id": "host-a"}
         pending = {"status": "pending", "consumer": "worker-a", "host_id": "host-a"}
         completed = {**pending, "status": "completed", "event": {"host_id": "host-a", "event_id": "completion-1"}}
         for error in (TimeoutError("slow response"), ConnectionResetError("reply lost"),
@@ -389,7 +454,8 @@ class ManagedRunTests(unittest.TestCase):
                 diagnostics = io.StringIO()
                 with self.subTest(error=type(error).__name__, recovered=recovered), \
                         patch("router.managed.time", timer), redirect_stderr(diagnostics), \
-                        patch("router.managed.request", side_effect=[error, completed] if recovered else error):
+                        patch("router.managed.request", side_effect=[binding, error, completed] if recovered else
+                              chain([binding], repeat(error))):
                     result = wait("worker-a", 1)
                     self.assertEqual(result, completed if recovered else {"status": "unavailable", "consumer": "worker-a"})
                 self.assertIn(str(error), diagnostics.getvalue())
@@ -398,7 +464,7 @@ class ManagedRunTests(unittest.TestCase):
                     self.assertEqual(clock[0], 1)
         clock[0] = 0.0
         with patch("router.managed.time", timer), redirect_stderr(io.StringIO()), \
-                patch("router.managed.request", side_effect=[TimeoutError("slow"), pending, pending, pending]):
+                patch("router.managed.request", side_effect=[binding, TimeoutError("slow"), pending, pending, pending]):
             self.assertEqual(wait("worker-a", 1)["status"], "deadline")
         # An unreachable daemon fails promptly; delivery retries never launch or restart it.
         clock[0] = 0.0
@@ -410,7 +476,9 @@ class ManagedRunTests(unittest.TestCase):
         for reply in (pending, completed):
             clock[0] = 0.0
 
-            def at_deadline(*args, reply=reply, **kwargs):
+            def at_deadline(operation, *args, reply=reply, **kwargs):
+                if operation == "completion_subscribe":
+                    return binding
                 if clock[0] == 0:
                     clock[0] = .74
                     return pending
@@ -423,6 +491,11 @@ class ManagedRunTests(unittest.TestCase):
                     patch("router.managed.request", side_effect=at_deadline):
                 self.assertEqual(wait("worker-a", 1), completed if reply is completed else {
                     "status": "deadline", "consumer": "worker-a"})
+        # A lost admission reply must not silently recreate a concurrently removed subscription.
+        with patch("router.managed.time", timer), redirect_stderr(io.StringIO()), \
+                patch("router.managed.request", side_effect=[ConnectionResetError("admission reply lost"), binding]) as transport:
+            self.assertEqual(wait("worker-a", 1)["status"], "unavailable")
+            self.assertEqual(transport.call_count, 1)
 
     def test_upgrade_backfills_retained_terminal_records_without_replaying_acks(self):
         self.run_command("pass")

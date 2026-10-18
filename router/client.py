@@ -52,7 +52,8 @@ def request(operation: str, payload: dict, endpoint: Path | None = None, *, time
             raise ValueError("Invalid daemon response")
         response = json.loads(line)
         if not response.get("ok"):
-            if operation in {"completion_next", "completion_ack"} and response.get("retryable") is True:
+            if operation in {"completion_next", "completion_ack", "completion_subscribe",
+                             "completion_consumer_list", "completion_consumer_remove"} and response.get("retryable") is True:
                 raise CompletionBusy(response.get("error", "Completion database is busy; retry delivery"))
             raise ValueError(response.get("error", "Router request failed"))
         return response["result"]

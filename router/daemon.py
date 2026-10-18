@@ -412,6 +412,12 @@ class Controller:
             return self.managed.finish(payload)
         if operation == "completion_next":
             return self.managed.next_completion(payload)
+        if operation == "completion_subscribe":
+            return self.managed.subscribe(payload)
+        if operation == "completion_consumer_list":
+            return self.managed.list_consumers(payload)
+        if operation == "completion_consumer_remove":
+            return self.managed.remove_consumer(payload)
         if operation == "completion_ack":
             return self.managed.acknowledge(payload)
         if operation == "observe":
@@ -1171,7 +1177,8 @@ class Handler(socketserver.StreamRequestHandler):
                 result = self.server.control.handle(operation, payload)
             response = {"ok": True, "result": result}
         except sqlite3.OperationalError as error:
-            if operation in {"completion_next", "completion_ack"} and \
+            if operation in {"completion_next", "completion_ack", "completion_subscribe",
+                             "completion_consumer_list", "completion_consumer_remove"} and \
                     getattr(error, "sqlite_errorcode", 0) & 255 in {sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED}:
                 response = {"ok": False, "error": "Completion database is busy; retry the same delivery request",
                             "retryable": True}
