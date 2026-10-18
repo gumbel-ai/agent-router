@@ -208,6 +208,32 @@ class LifecycleScopeTests(unittest.TestCase):
         self.assertEqual(response["persistence"], {"session": "persisted", "native": "failed"})
         self.assertEqual(self.sessions()["known"]["status"], "stopped")
 
+    def test_a_malformed_component_keeps_its_valid_sibling(self):
+        at = int(time.time() * 1000)
+        with redirect_stderr(io.StringIO()):
+            response = self.control.handle("lifecycle_observe", {
+                "session": {"source": "claude", "session_id": "valid", "kind": "session_start", "observed_at": at,
+                            "cwd": str(self.project)},
+                "native": {"source": "claude", "session_id": [], "agent_id": "a", "kind": "start",
+                           "observed_at": at, "cwd": str(self.project)}})
+        self.assertEqual(response["persistence"], {"session": "persisted", "native": "failed"})
+        self.assertIn("valid", self.sessions())
+
+    def test_admission_keeps_the_writers_database_budget(self):
+        locked = sqlite3.connect(self.control.directory / "router.sqlite3", timeout=1)
+        self.addCleanup(locked.close)
+        locked.execute("BEGIN IMMEDIATE")  # Another writer holds the database.
+        started = time.monotonic()
+        with redirect_stderr(io.StringIO()):
+            response = self.control.handle("lifecycle_observe", {"session": {
+                "source": "claude", "session_id": "contended", "kind": "session_start",
+                "observed_at": int(time.time() * 1000), "cwd": str(self.project)}})
+        elapsed = time.monotonic() - started
+        locked.rollback()
+        self.assertEqual(response["persistence"], {"session": "failed"})
+        # The writer's one-second budget, not SQLite's ten-second default.
+        self.assertLess(elapsed, 5)
+
     def test_one_request_cannot_admit_another_sessions_event(self):
         at = int(time.time() * 1000)
         response = self.control.handle("lifecycle_observe", {

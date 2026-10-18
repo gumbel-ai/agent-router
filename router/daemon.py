@@ -190,16 +190,23 @@ class Controller:
                     return
                 payload, completed, outcome = work
                 admitted = set()
-                if not all(isinstance(payload[key], dict) for key in outcome["persistence"]):
-                    raise ValueError("Lifecycle observation components must be objects")
                 # Admission is per session: one request's components may name different sessions,
-                # and one session's scope error must not discard another's event.
+                # and one component's malformed identity or scope error must not discard another's.
                 sessions: dict[tuple, list[str]] = {}
                 for key in outcome["persistence"]:
-                    sessions.setdefault((payload[key].get("source"), payload[key].get("session_id")), []).append(key)
+                    event = payload[key]
+                    identity = (event.get("source"), event.get("session_id")) if isinstance(event, dict) else None
+                    if identity is None or not all(isinstance(part, str) for part in identity):
+                        outcome["persistence"][key] = "failed"
+                        LOGGER.warning("Lifecycle %s observation has no valid source and session_id", key)
+                        with self.lifecycle_health_lock:
+                            self.lifecycle_failures += 1
+                            self.lifecycle_problem_at = now_ms()
+                        continue
+                    sessions.setdefault(identity, []).append(key)
                 for keys in sessions.values():
                     try:
-                        in_scope = self.in_scope([payload[key] for key in keys])
+                        in_scope = self.in_scope([payload[key] for key in keys], self._lifecycle_write_timeout())
                     except (sqlite3.Error, ValueError, OSError) as error:
                         scope_error = str(error)
                         LOGGER.warning("Lifecycle observation project scope could not be checked: %s", error)
@@ -276,9 +283,10 @@ class Controller:
         deadline = self.lifecycle_stop_deadline
         remaining = max(0.0, deadline - time.monotonic()) if deadline is not None else 0.0
         # Share the remaining shutdown window across the queued work. Each
-        # item may contain two writes, so no single contended write consumes
-        # the entire hard stop budget. SQLite still gets a nonzero opportunity.
-        return max(.001, min(1.0, remaining / (pending * 2)))
+        # item may contain three writes (session admission and two components),
+        # so no single contended write consumes the entire hard stop budget.
+        # SQLite still gets a nonzero opportunity.
+        return max(.001, min(1.0, remaining / (pending * 3)))
 
     def stop_lifecycle_writer(self) -> None:
         with self.lifecycle_lock:
@@ -333,7 +341,7 @@ class Controller:
             return (self._lifecycle_generation,
                     self.lifecycle_pending + self.lifecycle_direct_active)
 
-    def in_scope(self, events: list[dict]) -> bool:
+    def in_scope(self, events: list[dict], timeout: float = 10) -> bool:
         """Record a session once it is seen inside an observed project (see observed_project).
 
         events are one session's. Admission is stored durably, so later events follow the
@@ -343,7 +351,7 @@ class Controller:
         """
         source, session_id = events[0].get("source"), events[0].get("session_id")
         key = (self.host.host_id, source, session_id)
-        with self.store.connect() as db:
+        with self.store.connect(timeout) as db:
             if (db.execute("SELECT 1 FROM observed_sessions WHERE host_id=? AND source=? AND session_id=?",
                            key).fetchone()
                     or db.execute("SELECT 1 FROM sessions WHERE host_id=? AND source=? AND session_id=?",
@@ -361,7 +369,7 @@ class Controller:
                 identifier(session_id, "session_id")
             except ValueError:
                 return True
-            with self.store.transaction() as db:
+            with self.store.transaction(timeout) as db:
                 db.execute("""INSERT INTO observed_sessions(host_id,source,session_id,admitted_at)
                         VALUES(?,?,?,?) ON CONFLICT DO NOTHING""", (*key, now_ms()))
         return True
