@@ -8,6 +8,7 @@ import threading
 import time
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from test_control import observe_every_session, settings
@@ -18,6 +19,8 @@ from router.cli import table
 from router.daemon import Controller, Runtime, serve
 from router.process import UncertainProcess, creation_identity, owned_state, stop_owned
 from router.snapshot import apply_delta, cleanup, git
+
+PREPARE_STDERR_LIMIT = 64 * 1024
 
 
 class RuntimeHarness:
@@ -59,9 +62,62 @@ class RuntimeHarness:
             if task["status"] in states:
                 return task
             time.sleep(0.04)
-        self.fail(f"Task did not reach {states}: {task}")
+        diagnostics = []
+        directory = task.get("artifact_dir")
+        paths = sorted(Path(directory).glob("attempt-*/prepare/*.stderr")) if directory else []
+        for path in paths:
+            try:
+                with path.open("rb") as stream:
+                    size = stream.seek(0, os.SEEK_END)
+                    stream.seek(max(0, size - PREPARE_STDERR_LIMIT))
+                    content = stream.read(PREPARE_STDERR_LIMIT).decode(errors="replace") or "[empty stderr]"
+                if size > PREPARE_STDERR_LIMIT:
+                    content = "[truncated; showing stderr tail]\n" + content
+            except OSError as error:
+                content = f"[stderr unavailable: {error}]"
+            diagnostics.append(f"{path.relative_to(directory)}:\n{content}")
+        evidence = "\n".join(diagnostics) if diagnostics else "[no prepare stderr artifacts available]"
+        self.fail(f"Task did not reach {states}: {task}\nGit prepare stderr:\n{evidence}")
 
 class RuntimeTests(RuntimeHarness, unittest.TestCase):
+    def test_wait_failure_includes_git_preparation_stderr(self):
+        # A real Git namespace conflict makes worktree branch creation fail deterministically.
+        git(self.repo, "branch", "agent")
+        task_id = self.start("batch-job")
+        task = self.wait(task_id, {"failed"})
+        self.assertEqual(task["phase"], "prepare")
+        stderr_path = Path(task["process"]["stderr"])
+        stderr = stderr_path.read_text()
+        self.assertIn("refs/heads/agent", stderr)
+        clock = [0.0]
+
+        def advance(_):
+            clock[0] = 2.0
+
+        timer = SimpleNamespace(monotonic=lambda: clock[0], sleep=advance)
+        for variant in ("available", "oversized", "missing", "unreadable"):
+            with self.subTest(variant=variant):
+                if variant == "oversized":
+                    stderr_path.write_text("prefix-marker\n" + "x" * 1_000_000 + "\ntail-marker")
+                elif variant == "missing":
+                    stderr_path.unlink()
+                elif variant == "unreadable":
+                    stderr_path.mkdir()
+                clock[0] = 0.0
+                with patch("test_runtime.time", timer), self.assertRaises(AssertionError) as failed:
+                    self.wait(task_id, {"running"}, seconds=1)
+                message = str(failed.exception)
+                self.assertIn("Git prepare failed", message)
+                if variant == "available":
+                    self.assertIn(stderr, message)
+                elif variant == "oversized":
+                    self.assertIn("tail-marker", message)
+                    self.assertNotIn("prefix-marker", message)
+                    self.assertIn("truncated", message)
+                    self.assertLess(len(message), 100_000)
+                else:
+                    self.assertIn("no prepare stderr artifacts" if variant == "missing" else "stderr unavailable", message)
+
     def seed_attempt_task(self, task_id: str, *, second_attempt: bool) -> dict:
         self.runtime.stop()
         started = int(time.time() * 1000) - 100
