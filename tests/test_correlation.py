@@ -58,21 +58,21 @@ class CorrelationTests(unittest.TestCase):
         self.router.sessions.observe({"source": "codex", "session_id": "session-a", "kind": "task_created",
                                       "task_id": "batch-job", "observed_at": self.at + 1,
                                       "task_subject": "fixture-private-content"})
-        instruction = self.router.handle("submit", {"session_id": "parent-session", "prompt_id": "prompt-a",
+        instruction = self.router.handle("submit", {"session_id": "parent  session", "prompt_id": "prompt-a",
                                                      "parent_cli": "claude"})["instruction_id"]
         invocation = {"request_version": "1", "request_id": "request-a", "instruction_id": instruction,
                       "executor": "opencode", "model": "test", "task": "fixture-private-content",
                       "parent_repo": str(self.project), "parent_worktree": str(self.project), "mode": "write"}
-        self.router.handle("authorize", {"session_id": "parent-session", "prompt_id": "prompt-a",
+        self.router.handle("authorize", {"session_id": "parent  session", "prompt_id": "prompt-a",
                                           "operation": "start", "invocation": invocation})
         task = self.router.handle("start", invocation)
         self.router.store.update(task["task_id"], lambda record: record.update(
-            child_session_id="child-session", attempt_number=1, attempts=1, attempt_started_at=self.at,
+            child_session_id="child  session", attempt_number=1, attempts=1, attempt_started_at=self.at,
             summary="fixture-private-content", tool_contents="fixture-private-content",
             secret="fixture-secret-value", cost=123, usage={"input_tokens": 123}))
         self.router.store.save_attempt(self.router.store.get(task["task_id"]))
-        managed = {"managed_id": "managed-batch-job", "label": "fixture-private-content", "session_id": "session-a",
-                   "agent_id": "worker-a", "attribution": "exact", "wrapper_pid": 1,
+        managed = {"managed_id": "managed-batch-job", "label": "fixture-private-content", "session_id": "session  a",
+                   "agent_id": "worker  a", "attribution": "exact", "wrapper_pid": 1,
                    "wrapper_identity": "fixture-identity", "pid": 2, "pgid": 2,
                    "executable": "codex", "argument_count": 1, "started_at": self.at}
         self.router.managed.start(managed)
@@ -95,14 +95,32 @@ class CorrelationTests(unittest.TestCase):
         self.assertEqual(records["agent"]["agent_id"], "worker-a")
         self.assertEqual(records["agent"]["parent_agent_id"], "parent-a")
         self.assertEqual(records["work_item"]["work_item_id"], "batch-job")
-        self.assertEqual(records["router_task"]["session_id"], "child-session")
-        self.assertEqual(records["router_task"]["parent_session_id"], "parent-session")
+        self.assertEqual(records["router_task"]["session_id"], "child  session")
+        self.assertEqual(records["router_task"]["parent_session_id"], "parent  session")
         self.assertEqual(records["router_task"]["parent_runtime"], "claude")
         self.assertEqual(records["router_task"]["router_task_id"], task["task_id"])
         self.assertEqual(records["attempt"]["attempt_number"], 1)
         self.assertIsNone(records["managed"].get("runtime"), "An executable or label cannot establish runtime")
         self.assertEqual(records["completion"]["event_id"], "completion-1")
+        self.assertFalse(result["partial"], result["errors"])
+        for kind in ("managed", "completion"):
+            self.assertEqual(records[kind]["session_id"], "session  a")
+            self.assertEqual(records[kind]["agent_id"], "worker  a")
         self.assertTrue(all(record["traced"] == "unknown" for record in result["records"]))
+        paged, cursor = [], None
+        for _ in range(len(result["records"])):
+            page = self.export(limit=1, cursor=cursor)
+            paged.extend(page["records"])
+            cursor = page["next_cursor"]
+        self.assertIsNone(cursor)
+        self.assertEqual(paged, result["records"])
+        with self.router.store.transaction() as db:
+            db.execute("UPDATE completion_events SET data=NULL")
+        tombstone = next(record for record in self.export()["records"] if record["kind"] == "completion")
+        self.assertEqual((tombstone["event_id"], tombstone["managed_id"], tombstone["lifecycle_event"]),
+                         ("completion-1", managed["managed_id"], "finished"))
+        self.assertIsNone(tombstone["status"])
+        self.assertIsNone(tombstone["finished_at"])
         with self.router.store.connect() as db:
             self.assertEqual([tuple(row) for row in db.execute("SELECT name,cursor,subscription_id FROM completion_consumers")],
                              [tuple(row) for row in before])

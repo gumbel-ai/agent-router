@@ -7,7 +7,6 @@ import json
 
 from router.db import now_ms
 from router.dispatch import canonical
-from router.native import identifier
 from router.validation import is_wire_integer
 
 MAX_BYTES = 1024 * 1024
@@ -26,6 +25,13 @@ EVENTS = frozenset({"session_start", "session_end", "prompt", "stop", "stop_fail
                     "tool_failure", "notification", "permission_request", "subagent_start", "subagent_stop",
                     "subagent_activity", "teammate_idle", "task_created", "task_completed", "finished", "uncertain",
                     "start", "launch", "result", "activity", "idle", "needs_input", "failed"})
+
+
+def identifier(value: object, name: str, limit: int = 240) -> str:
+    if (not isinstance(value, str) or not value or len(value) > limit or value != value.strip()
+            or any(not character.isprintable() for character in value)):
+        raise ValueError(f"Invalid correlation {name}")
+    return value
 
 
 def _position(token: object, scope: str) -> tuple[int, int]:

@@ -46,7 +46,12 @@ Kinds are `session`, `agent`, `work_item`, `router_task`, `attempt`, `managed` a
 known; its stored submission session is `parent_session_id`. Attempt identity is
 the tuple `(host_id, router_task_id, attempt_number)`. Current task and retained
 attempt records may overlap; they are separate kinds, not additional executions.
-An observation's generated row ID is not exported as a Router control-task ID.
+An `agent` record keeps its hosting session in both `session_id` and
+`parent_session_id`; `agent_id` is the observed child identity. For Codex, that
+agent ID is the child thread ID. A Claude agent ID does not establish a separate
+native session. Session-only joins locate the hosting session and do not establish
+child trace attribution. An observation's generated row ID is not exported as a
+Router control-task ID.
 Parent runtime requires the referenced submission to match the task's durable
 parent session. A contradictory link leaves runtime unknown with a partial
 diagnostic. Task and attempt rows without a stored host claim use the producing
@@ -63,6 +68,8 @@ Completion-row timestamps can also reflect imported upgrade evidence; only a
 known `finished_at` reports the retained command-end timestamp. Retained legacy
 rows are included without reapplying project admission to historical records.
 
+Identifiers keep their exact printable spelling, including repeated internal spaces;
+controls, surrounding whitespace and oversized values are rejected without rewriting.
 Missing metadata remains null. Durable database keys take precedence over conflicting
 JSON copies, with a partial diagnostic. Malformed values become unknown, malformed records
 are omitted, and bounded field-level diagnostics make the page partial without
