@@ -285,6 +285,10 @@ def main() -> None:
     consumer_list.add_argument("--offset", type=int, default=0)
     consumer_remove = consumer_commands.add_parser("remove")
     consumer_remove.add_argument("name")
+    correlation = commands.add_parser("correlation", help="Export bounded identifiers and lifecycle metadata without content")
+    correlation.add_argument("--json", action="store_true", required=True)
+    correlation.add_argument("--limit", type=int, default=100)
+    correlation.add_argument("--cursor")
     snapshot = commands.add_parser("snapshot", help="Print a bounded read-only local host snapshot")
     snapshot.add_argument("--json", action="store_true", required=True)
     snapshot.add_argument("--history-limit", type=int, default=100)
@@ -400,6 +404,11 @@ def main() -> None:
                                   if args.consumer_command == "list" else
                                   ("completion_consumer_remove", {"consumer": args.name}))
             print(json.dumps(request(operation, payload), separators=(",", ":")))
+        elif args.command == "correlation":
+            payload = {"limit": args.limit}
+            if args.cursor is not None:
+                payload["cursor"] = args.cursor
+            print(json.dumps(request("correlation", payload, timeout=15, deadline=True), separators=(",", ":")))
         elif args.command == "snapshot":
             print(json.dumps(request("snapshot", {"history_limit": args.history_limit}), separators=(",", ":")))
         elif args.command == "fleet":
@@ -463,6 +472,8 @@ def main() -> None:
     except (ValueError, OSError) as error:
         parser.exit(1, f"Agent Router: {error}\n")
     except KeyboardInterrupt:
+        if args.command == "correlation":
+            parser.exit(130, "Agent Router correlation export interrupted; no state changed.\n")
         if args.command == "ack":
             parser.exit(130, "Agent Router acknowledgment interrupted; commit state is unknown. "
                         "Retry the same consumer and event ID.\n")
