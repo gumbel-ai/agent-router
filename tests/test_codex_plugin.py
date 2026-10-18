@@ -14,6 +14,7 @@ from websockets.sync.server import unix_serve
 from router.codex_plugin import (
     HOOKS_FILE,
     PLUGIN_ID,
+    active_plugin_root,
     availability,
     expected_trust,
     hook_hash,
@@ -79,11 +80,19 @@ class CodexPluginTests(unittest.TestCase):
                     elif request["method"] == "hooks/list":
                         hooks = config.get("hooks")
                         state = options.get("state", hooks.get("state", {}) if isinstance(hooks, dict) else {})
-                        entries = [{"key": key, "pluginId": PLUGIN_ID, "enabled": entry.get("enabled", True),
-                                    "trustStatus": "trusted" if "trusted_hash" in entry else "untrusted",
-                                    "currentHash": entry.get("trusted_hash")} for key, entry in state.items()]
+                        root = active_plugin_root(home)
+                        declarations = json.loads((root / HOOKS_FILE).read_text())
+                        entries = []
+                        # Native inventory includes untrusted hooks, with their current
+                        # declaration hash independent of the saved trust preference.
+                        for key, current_hash in expected_trust(declarations).items():
+                            entry = state.get(key, {})
+                            status = ("untrusted" if "trusted_hash" not in entry else
+                                      "trusted" if entry["trusted_hash"] == current_hash else "modified")
+                            entries.append({"key": key, "pluginId": PLUGIN_ID, "enabled": entry.get("enabled", True),
+                                            "trustStatus": status, "currentHash": current_hash})
                         response = {"result": options.get("inventory", {
-                            "data": [{"cwd": requested, "hooks": entries, "errors": []}
+                            "data": [{"cwd": requested, "hooks": entries, "errors": [], "warnings": []}
                                      for requested in request["params"]["cwds"]]})}
                     else:
                         cwd = request["params"]["cwd"]
@@ -252,8 +261,9 @@ class CodexPluginTests(unittest.TestCase):
         self.install("0.9.0")
         trusted = {key: {"trusted_hash": value} for key, value in expected_trust(HOOKS).items()}
         self.configure(entries=trusted)
-        entry = {"key": next(iter(trusted)), "pluginId": PLUGIN_ID, "enabled": True,
-                 "trustStatus": "trusted", "currentHash": next(iter(trusted.values()))["trusted_hash"]}
+        complete = [{"key": key, "pluginId": PLUGIN_ID, "enabled": True, "trustStatus": "trusted",
+                     "currentHash": value["trusted_hash"]} for key, value in trusted.items()]
+        entry = complete[0]
         cases = [({"mode": mode}, detail) for mode, detail in
                  (("exit", "fixture transport unavailable"), ("timeout", "deadline"),
                   ("oversize", "1009"), ("invalid_json", "JSON"), ("error", "fixture method unavailable"))]
@@ -263,8 +273,19 @@ class CodexPluginTests(unittest.TestCase):
             ({"initialize": {"codexHome": str(self.home / "other-home")}}, "different Codex home"),
             ({"inventory": {"data": []}}, "inventory"),
             ({"inventory": {"data": [{"cwd": str(self.project), "hooks": [],
-                                      "errors": ["fixture hook load failure"]}]}}, "fixture hook load failure"),
-            ({"inventory": {"data": [{"cwd": str(self.project), "hooks": [entry, entry], "errors": []}]}}, "malformed"),
+                                      "errors": ["fixture hook load failure"], "warnings": []}]}}, "fixture hook load failure"),
+            ({"inventory": {"data": [{"cwd": str(self.project), "hooks": [entry, entry],
+                                      "errors": [], "warnings": []}]}}, "malformed"),
+            ({"inventory": {"data": [{"cwd": str(self.project), "hooks": [], "errors": [],
+                                      "warnings": ["fixture warning-only load failure"]}]}}, "fixture warning-only load failure"),
+            ({"inventory": {"data": [{"cwd": str(self.project), "hooks": [],
+                                      "errors": [], "warnings": []}]}}, "missing Router hooks"),
+            ({"inventory": {"data": [{"cwd": str(self.project), "hooks": complete,
+                                      "errors": [], "warnings": "not-a-list"}]}}, "malformed"),
+            ({"inventory": {"data": [{"cwd": str(self.project), "hooks": complete,
+                                      "errors": [], "warnings": [{}]}]}}, "malformed"),
+            ({"inventory": {"data": [{"cwd": str(self.project), "hooks": complete,
+                                      "errors": []}]}}, "malformed"),
         ]
         for options, detail in cases:
             with self.subTest(options=options):
@@ -274,9 +295,14 @@ class CodexPluginTests(unittest.TestCase):
                 self.assertIn(detail, result["detail"])
                 (self.home / "rpc.json").unlink()
                 self.assertEqual(availability(self.home)["state"], "ready")
+        inventory = {"data": [{"cwd": str(self.project), "hooks": complete, "errors": [],
+                                "warnings": ["fixture unrelated warning"]}]}
+        (self.home / "rpc.json").write_text(json.dumps({"inventory": inventory}))
+        self.assertEqual(availability(self.home)["state"], "ready")
         for hook in ({**entry, "trustStatus": "modified"}, {**entry, "currentHash": "sha256:other"}):
             with self.subTest(hook=hook):
-                inventory = {"data": [{"cwd": str(self.project), "hooks": [hook], "errors": []}]}
+                inventory = {"data": [{"cwd": str(self.project), "hooks": [hook, *complete[1:]],
+                                        "errors": [], "warnings": []}]}
                 (self.home / "rpc.json").write_text(json.dumps({"inventory": inventory}))
                 self.assertEqual(availability(self.home)["state"], "hooks_untrusted")
         (self.home / "rpc.json").unlink()

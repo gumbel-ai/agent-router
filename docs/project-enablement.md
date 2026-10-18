@@ -55,8 +55,11 @@ The probe starts no process, agent turn or daemon, refreshes no plugins and writ
 no hook trust. It uses Codex's native non-originating daemon-probe handshake, which
 preserves daemon-wide authentication policy and client identity. Socket aliases
 are resolved, including a long selected-home path pointing to a short native
-rendezvous socket. Start Codex normally before checking readiness. A missing or
-unreachable daemon reports `unknown`; Router does not start one as a fallback.
+rendezvous socket. An existing native control socket is required. Whether an
+ordinary Codex session creates that socket is **NOT CHECKED**; launching Codex is
+not a verified remedy for its absence. A missing or unreachable endpoint reports
+`unknown`; Router does not start a daemon as a fallback. The current generic
+startup advice in transport/protocol errors is tracked in [issue #35](https://github.com/gumbel-ai/agent-router/issues/35).
 The daemon's initialization reply must identify the selected home; an alias into
 another home's daemon reports `unknown` before its configuration or hooks are read.
 The native control socket/API was verified with Codex 0.163.0. Unsupported clients
@@ -65,9 +68,21 @@ deadline with a one MiB output bound; cleanup after cancellation allows up to on
 further second. A missing marker is
 `project_not_enabled`; untrusted hooks remain `hooks_untrusted`. Missing support,
 malformed replies, transport failures and deadlines report `unknown` with a reason.
+Missing native Router hooks report `unknown` with discovery warnings when supplied;
+complete Router hook evidence remains usable despite unrelated discovery warnings.
 Readiness describes configuration prerequisites, not proof that an existing
 session delivered events. Per-session overrides and an existing app-server's
 environment still require checking in that session.
+
+The isolated verification created the selected home's `app-server-control`
+directory, then ran Codex's native transport fixture explicitly:
+
+```sh
+codex app-server --listen "unix://${CODEX_HOME:-$HOME/.codex}/app-server-control/app-server-control.sock"
+```
+
+This tests the native API. It does not establish that ordinary interactive or
+exec sessions use this daemon, or that they delivered lifecycle hooks.
 
 ## Legacy global installations
 

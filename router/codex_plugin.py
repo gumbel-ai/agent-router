@@ -31,7 +31,7 @@ READINESS_TIMEOUT = 5
 READINESS_OUTPUT_LIMIT = 1024 * 1024
 
 
-async def _readiness_evidence(home: Path, cwd: Path) -> tuple[dict, dict]:
+async def _readiness_evidence(home: Path, cwd: Path) -> tuple[dict, dict, list[str]]:
     """Query the existing native daemon; never start one or refresh plugins."""
     # Native Codex can advertise long paths through short rendezvous aliases.
     endpoint = (home / "app-server-control" / "app-server-control.sock").resolve(strict=True)
@@ -84,7 +84,9 @@ async def _readiness_evidence(home: Path, cwd: Path) -> tuple[dict, dict]:
             data = (await receive(2)).get("data")
             if (not isinstance(data, list) or len(data) != 1 or not isinstance(data[0], dict)
                     or data[0].get("cwd") != str(cwd) or not isinstance(data[0].get("hooks"), list)
-                    or not isinstance(data[0].get("errors"), list)):
+                    or not isinstance(data[0].get("errors"), list)
+                    or not isinstance(data[0].get("warnings"), list)
+                    or not all(isinstance(warning, str) for warning in data[0]["warnings"])):
                 raise ValueError("Codex readiness hook inventory is missing or malformed")
             if data[0]["errors"]:
                 raise ValueError("Codex readiness hook inventory errors: " + json.dumps(data[0]["errors"])[:4096])
@@ -104,7 +106,7 @@ async def _readiness_evidence(home: Path, cwd: Path) -> tuple[dict, dict]:
                     if not isinstance(hook.get("currentHash"), str):
                         raise ValueError("Codex readiness trusted Router hook has no current hash")
                     state[key]["trusted_hash"] = hook["currentHash"]
-            return result, state
+            return result, state, data[0]["warnings"]
 
 
 def _snake(event: str) -> str:
@@ -226,7 +228,7 @@ def availability(codex_home: Path | None = None) -> dict:
     except OSError as error:
         return {"state": "unknown", "detail": f"Codex plugin cache unreadable: {error}"}
     try:
-        config, state = asyncio.run(_readiness_evidence(home, cwd))
+        config, state, warnings = asyncio.run(_readiness_evidence(home, cwd))
     except TimeoutError:
         return {"state": "unknown", "detail": "Codex readiness deadline exceeded; existing daemon did not reply"}
     except (OSError, ValueError, TypeError, WebSocketException) as error:
@@ -258,6 +260,12 @@ def availability(codex_home: Path | None = None) -> dict:
         return {"state": "unknown", "detail": f"Installed Codex plugin hooks unreadable: {error}"}
     if missing:
         return {"state": "unknown", "detail": "Installed Codex plugin lacks hooks for " + ", ".join(missing)}
+    missing_hooks = trust.keys() - state.keys()
+    if missing_hooks:
+        detail = f"Native Codex inventory is missing Router hooks ({len(missing_hooks)})"
+        if warnings:
+            detail += ": " + json.dumps(warnings)[:4096]
+        return {"state": "unknown", "detail": detail}
     untrusted, modified, disabled = [], [], []
     for key, expected in trust.items():
         entry = state.get(key) if isinstance(state, dict) else None

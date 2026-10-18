@@ -198,6 +198,13 @@ Long directory and socket aliases, including dangling aliases, were tested with 
 isolated socket fixture. Live OAuth behavior, enabled hook execution and observation
 after manual trust are **NOT CHECKED** in this verification.
 
+A separate isolated Codex 0.163.0 cache with a missing declared hook file reported
+`unknown` with its native discovery warning in enabled roots, subdirectories and
+worktrees. Configuration, daemon identity and the running daemon were preserved.
+Whether ordinary interactive or exec startup creates the required control socket
+is **NOT CHECKED**; this fixture did not exercise that client startup path. See the
+[explicit fixture setup](project-enablement.md#codex-prerequisites).
+
 ## Testing implications for item 4
 
 - Router-launched Codex children disable delegation and ignore user config

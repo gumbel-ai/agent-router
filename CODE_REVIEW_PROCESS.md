@@ -366,6 +366,9 @@ item before requesting review.
 
 **Native interfaces**
 
+- Validate every native inventory diagnostic channel and compare required entries
+  before classifying trust. Missing entries are incomplete evidence; warnings must
+  retain their cause without invalidating complete, unrelated evidence.
 - Size every ctypes output parameter from the C header, not by assumption. For example,
   `vm_size_t` is pointer-sized (`c_size_t`), not `c_uint32`. A mismatch writes past the
   buffer silently. Verify FFI calls against the operating system's own tool output
