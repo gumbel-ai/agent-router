@@ -373,6 +373,8 @@ def main() -> None:
             failure_code = 1
             try:
                 result = wait_managed(args.consumer, args.timeout)
+            except ValueError as error:
+                parser.error(str(error))
             except KeyboardInterrupt:
                 print("Agent Router completion wait interrupted; pending events remain unacknowledged", file=sys.stderr)
                 result = {"status": "unavailable", "consumer": args.consumer}
@@ -381,6 +383,12 @@ def main() -> None:
             if result["status"] == "unavailable":
                 sys.exit(failure_code)
         elif args.command == "ack":
+            from router.managed import _completion_sequence, _identifier
+            try:
+                _identifier(args.consumer, "consumer")
+                _completion_sequence(args.event_id)
+            except ValueError as error:
+                parser.error(str(error))
             print(json.dumps(request("completion_ack", {"consumer": args.consumer, "event_id": args.event_id}),
                              separators=(",", ":")))
         elif args.command == "consumer":
@@ -451,6 +459,9 @@ def main() -> None:
     except (ValueError, OSError) as error:
         parser.exit(1, f"Agent Router: {error}\n")
     except KeyboardInterrupt:
+        if args.command == "ack":
+            parser.exit(130, "Agent Router acknowledgment interrupted; commit state is unknown. "
+                        "Retry the same consumer and event ID.\n")
         return
 
 

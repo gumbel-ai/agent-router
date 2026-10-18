@@ -93,8 +93,7 @@ is immutable: late completion evidence creates a second event with a new ID, aft
 uncertain event. A failed process can also leave survivors; failure takes precedence in
 the top-level status and `group_outlived` preserves that uncertainty.
 
-The timeout must be finite, greater than zero, and at most 3600 seconds. `unavailable`
-exits with code 1; the other results exit with code 0. Invalid arguments are CLI errors.
+The timeout must be finite, greater than zero, and at most 3600 seconds.
 After subscription admission, database contention, slow responses, and disconnected replies are retried within that
 same deadline. Diagnostics go to stderr, leaving stdout as one JSON result. An unreachable
 daemon returns `unavailable` immediately. If delivery still fails at the deadline,
@@ -103,7 +102,8 @@ outcome, including when the deadline truncates the last poll. A validated event 
 returned even if validation finishes at the deadline. Already-pending events are read
 before reconciliation, so SQLite write contention does not block their delivery.
 A busy acknowledgment fails with a clear diagnostic: retry the same consumer
-and event ID. Ctrl-C prints `unavailable` JSON and an interruption diagnostic, and exits 130.
+and event ID. Ctrl-C during `router wait` prints `unavailable` JSON and an interruption
+diagnostic, and exits 130.
 A timeout, interrupted consumer, disconnected waiter, or unavailable Router never
 cancels, restarts, or duplicates a command. Retry delivery with the same consumer;
 do not relaunch a command merely because integration or delivery failed. A command
@@ -118,6 +118,22 @@ matches the work to be observed. Start failures before process creation are repo
 replies can be recovered from the existing completion spool, without launching again.
 
 This interface is local. Fleet waiting and acknowledgment are separate capabilities.
+
+## Completion CLI exit codes
+
+This table applies to `wait` and `ack`; other commands keep their existing exit behavior.
+
+| Exit code | `router wait` | `router ack` |
+| --- | --- | --- |
+| 0 | One JSON result: `completed`, `failed`, `uncertain`, or `deadline`. | Acknowledgment confirmed by JSON containing `acknowledged: true`. |
+| 1 | `unavailable` JSON, with a diagnostic on stderr. | Delivery failed or the daemon refused the acknowledgment; diagnostic on stderr. |
+| 2 | Invalid consumer, timeout, or command-line syntax; stderr, no result JSON. | Invalid consumer, event ID syntax, or command-line syntax; stderr, no result JSON. |
+| 130 | Interrupted while waiting: `unavailable` JSON and an interruption diagnostic. | Interrupted: commit state is unknown; diagnostic on stderr, no reliable result JSON. |
+
+An interrupted acknowledgment may already have committed, or may commit after the
+waiter disconnects. Do not infer rollback from exit 130 or empty stdout. Retry the
+same consumer and event ID; idempotent acknowledgment cannot skip the next pending
+event. The consumer must durably record its handling before any acknowledgment attempt.
 
 ## Managing consumers
 
