@@ -444,10 +444,13 @@ class ManagedProcesses:
         files = sorted(directory.glob("managed-*.json")) if directory.exists() else []
         starts = sorted(directory.glob("start-managed-*.json")) if directory.exists() else []
         with self.store.connect(timeout=timeout) as db:
-            running = db.execute("""SELECT data FROM managed_processes
-                    WHERE json_extract(data,'$.status')='running'""").fetchall()
+            running = [json.loads(row[0]) for row in db.execute("""SELECT data FROM managed_processes
+                    WHERE json_extract(data,'$.status')='running'""")]
         now = _now()
-        if not files and not starts and not running and now - self._pruned_at < PRUNE_INTERVAL_MS:
+        # Stable wrappers need no write between retention passes; new evidence bypasses this check.
+        if not files and not starts and now - self._pruned_at < PRUNE_INTERVAL_MS and all(
+                record.get("wrapper_identity") is not None
+                and self.identity(record["wrapper_pid"]) == record["wrapper_identity"] for record in running):
             return
         consumed, invalid = [], []
         with self.store.transaction(timeout=timeout) as db:
