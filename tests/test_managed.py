@@ -252,6 +252,48 @@ class ManagedRunTests(unittest.TestCase):
     def ack_completion(self, event, consumer="worker-a"):
         return self.control.handle("completion_ack", {"consumer": consumer, "event_id": event["event"]["event_id"]})
 
+    def test_running_polls_write_only_for_new_evidence_or_retention(self):
+        from router.managed import PRUNE_INTERVAL_MS
+
+        clock = [int(time.time() * 1000)]
+        for name in ("a", "b"):
+            self.control.handle("managed_start", {**self.start_payload("managed-" + name),
+                "wrapper_identity": "wrapper-a", "started_at": clock[0] - 1})
+        consumers = [{"consumer": name, "subscription_id": self.control.handle(
+            "completion_subscribe", {"consumer": name})["subscription_id"]} for name in ("worker-a", "worker-b")]
+        with patch("router.managed._now", side_effect=lambda: clock[0]), \
+                patch.object(self.control.managed, "identity", return_value="wrapper-a") as identity, \
+                patch.object(self.control.store, "transaction", wraps=self.control.store.transaction) as writes:
+            self.control.managed.reconcile()
+            self.assertEqual(writes.call_count, 1)
+            for _ in range(20):
+                for consumer in consumers:
+                    self.assertEqual(self.control.handle("completion_next", consumer)["status"], "pending")
+            self.assertEqual(writes.call_count, 1)
+            clock[0] += PRUNE_INTERVAL_MS - 1
+            self.control.managed.reconcile()
+            self.assertEqual(writes.call_count, 1)
+            clock[0] += 1
+            self.control.managed.reconcile()
+            self.assertEqual(writes.call_count, 2)
+            # Spool evidence bypasses the retention interval on the very next poll.
+            directory = completion_directory(self.state)
+            directory.mkdir(parents=True, exist_ok=True)
+            (directory / "managed-a.json").write_text(json.dumps({"managed_id": "managed-a",
+                "finished_at": clock[0], "elapsed_ms": 1, "exit_code": 0,
+                "max_process_rss_bytes": 1, "group_outlived": False}))
+            event = self.control.handle("completion_next", consumers[0])
+            self.assertEqual(event["status"], "completed")
+            self.assertEqual(writes.call_count, 3)
+            self.ack_completion(event)
+            self.assertEqual(writes.call_count, 4)
+            self.assertEqual(self.control.handle("completion_next", consumers[0])["status"], "pending")
+            self.assertEqual(writes.call_count, 4)
+            # A vanished wrapper is still reported immediately, even with no spool file.
+            identity.return_value = None
+            self.assertEqual(self.control.handle("completion_next", consumers[0])["status"], "uncertain")
+            self.assertEqual(writes.call_count, 5)
+
     def test_consumer_removal_releases_retention_without_moving_other_cursors(self):
         from router.managed import PRUNE_INTERVAL_MS, RETENTION_MS
 

@@ -13,8 +13,11 @@ JSON object with `status` equal to `completed`, `failed`, `uncertain`, `deadline
 checking the daemon with short requests rather than repeatedly asking the user for
 status. It opens no write transaction between checks and does not occupy a daemon
 connection between requests. No service is automatically started.
-Short reconciliation requests may open write transactions while a command is running;
-they do not span the wait's sleep. Reducing this polling work is tracked in issue #25.
+Empty polls inspect wrapper identities without a write transaction. Reconciliation
+opens a short write transaction only when spool evidence is present, a wrapper cannot
+be confirmed live, or the 60-second retention check is due. New completion evidence and
+vanished wrappers are handled on the next poll without waiting for that interval.
+These transactions do not span the wait's sleep; acknowledgment remains immediate.
 
 ## Subscription and acknowledgment
 
