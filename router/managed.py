@@ -58,7 +58,8 @@ def run(argv: list[str], label: str | None, session_id: str | None, agent_id: st
     # Router records only commands run inside an observed project; others still run, unrecorded.
     recorded = observed_project(os.getcwd()) is not None
     if not recorded:
-        print("Agent Router: not recording this command; it is outside every observed project",
+        print("Agent Router: not recording this command; it is outside every observed project; "
+              "no completion event will follow",
               file=sys.stderr)
     managed_id = "managed-" + uuid.uuid4().hex
     # Everything that can fail is gathered before launch, so a failure never leaves an
@@ -85,7 +86,8 @@ def run(argv: list[str], label: str | None, session_id: str | None, agent_id: st
     try:
         # A new session: the command has no controlling terminal, so a prompt fails instead of
         # stopping it in the background, and the group (pgid == pid) is the command's own.
-        child = subprocess.Popen(argv, stdin=subprocess.DEVNULL, start_new_session=True)
+        child = subprocess.Popen(argv, stdin=subprocess.DEVNULL, start_new_session=True,
+                                 env={**os.environ, "ROUTER_MANAGED_ID": managed_id})
         launched.append(child.pid)
         for signum in pending:
             forward(signum, None)

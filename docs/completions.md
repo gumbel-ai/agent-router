@@ -78,6 +78,15 @@ when launching (`router run --session SESSION_ID --agent AGENT_ID -- batch-job`)
 explicit attribution. If the command identity is unknown, keep that attribution unknown;
 do not treat the oldest event or a matching display label as proof of your command's result.
 
+`router run` sets `ROUTER_MANAGED_ID` in the wrapped command's environment. It matches
+that command's completion `event.managed_id`, including when evidence is replayed after
+a daemon restart. Each invocation replaces any inherited value with its own new ID;
+other environment entries are preserved. A launcher can durably record this ID to match
+its own event without importing Router code. An unrecorded run also receives an ID,
+but stderr explicitly says that no completion event will follow. The variable alone
+does not establish project admission or guarantee event delivery. For a detaching
+launcher, the ID still identifies the launcher rather than its detached job.
+
 ## Outcomes and deadlines
 
 | Status | Meaning |
