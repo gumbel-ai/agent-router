@@ -2,6 +2,7 @@
 
 import json
 import os
+import stat
 from pathlib import Path
 
 from dotenv import dotenv_values
@@ -72,10 +73,18 @@ def observed_project(cwd: str | None) -> Path | None:
     for directory in (path, *path.parents):
         marker = directory / PROJECT_MARKER
         if os.path.lexists(marker):
-            if not marker.is_file():
-                raise ValueError(f"{marker} must be a regular file")
-            with marker.open("rb") as file:
-                raw = file.read(MAX_PROJECT_MARKER_BYTES + 1)
+            # Check the file actually opened: a FIFO swapped in after a separate check would
+            # block a plain open forever. O_NONBLOCK never waits; regular files ignore it.
+            try:
+                descriptor = os.open(marker, os.O_RDONLY | os.O_NONBLOCK)
+            except FileNotFoundError as error:
+                raise ValueError(f"{marker} must be a regular file") from error
+            try:
+                if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+                    raise ValueError(f"{marker} must be a regular file")
+                raw = os.read(descriptor, MAX_PROJECT_MARKER_BYTES + 1)
+            finally:
+                os.close(descriptor)
             if len(raw) > MAX_PROJECT_MARKER_BYTES:
                 raise ValueError(f'{marker} must contain exactly {{"observe": true}}')
             try:

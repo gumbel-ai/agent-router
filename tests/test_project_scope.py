@@ -73,7 +73,8 @@ class MarkerLookupTests(unittest.TestCase):
 
     def test_a_marker_that_is_not_a_regular_file_is_an_error(self):
         for name, make in (("directory", lambda marker: marker.mkdir()),
-                           ("dangling", lambda marker: marker.symlink_to(self.root / "missing"))):
+                           ("dangling", lambda marker: marker.symlink_to(self.root / "missing")),
+                           ("fifo", os.mkfifo)):  # Opening it must not wait for a writer.
             with self.subTest(name=name):
                 project = self.root / name
                 project.mkdir()
