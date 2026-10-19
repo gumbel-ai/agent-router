@@ -38,8 +38,12 @@ the database namespace requirements below. Malformed
 managed IDs remain absent rather than blocking the stream. Labels are display
 text and are never used to establish identity. No command
 arguments, environment, output, working directory, or label appear in these events.
-`deadline` and `unavailable` results contain only `status` and `consumer`; they carry
-no event or host identity.
+By default, local `deadline` and `unavailable` results contain only `status` and
+`consumer`; they carry no event or host identity. Opting into
+`wait --include-subscription` adds the serving `host_id` and persisted
+`subscription_id` after subscription admission, including on a normal `deadline`.
+Neither form includes an event when none is delivered. Ctrl-C returns the minimal
+`unavailable` result without binding fields, even after admission, and exits 130.
 
 Delivery is ordered by durable insertion, one event per result. Reading never advances
 the persisted cursor. After **durably recording handling**, acknowledge that event:
@@ -265,7 +269,7 @@ This table applies to `wait` and `ack`; other commands keep their existing exit 
 | --- | --- | --- |
 | 0 | One JSON result: `completed`, `failed`, `uncertain`, or `deadline`. | Acknowledgment confirmed by JSON containing `acknowledged: true`. |
 | 1 | `unavailable` JSON, with a diagnostic on stderr. | Delivery failed or the daemon refused the acknowledgment; diagnostic on stderr. |
-| 2 | Invalid consumer, timeout, or command-line syntax; stderr, no result JSON. | Invalid consumer, event ID syntax, or command-line syntax; stderr, no result JSON. |
+| 2 | Invalid consumer, timeout, or command-line syntax; stderr, no result JSON. | Invalid consumer, event ID, host or subscription identity, binding flag combinations, or command-line syntax; stderr, no result JSON. |
 | 130 | Interrupted while waiting: `unavailable` JSON and an interruption diagnostic. | Interrupted: commit state is unknown; diagnostic on stderr, no reliable result JSON. |
 
 An interrupted acknowledgment may already have committed, or may commit after the
