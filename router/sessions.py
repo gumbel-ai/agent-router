@@ -44,7 +44,10 @@ class SessionObserver:
             for row in db.execute("SELECT data FROM sessions WHERE host_id=? AND source IN ('claude','codex')",
                                   (self.host_id,)):
                 record = json.loads(row[0])
-                if record["status"] in {"running", "idle"} or record.get("needs_input"):
+                codex_unknown = record["source"] == "codex" and record["status"] == "unknown"
+                if codex_unknown and record.get("restart_uncertain_until") is not None:
+                    continue  # Retain the original deadline after tool bookkeeping was cleared.
+                if record["status"] in {"running", "idle"} or record.get("needs_input") or codex_unknown:
                     # Work that would still count as active is unresolved, not stopped:
                     # until fresh evidence or this deadline, capacity cannot be exact.
                     deadlines = [(record.get("last_event_at") or 0) + STALE_AFTER_MS]
@@ -235,19 +238,47 @@ class SessionObserver:
         running_child = db.execute("""SELECT 1 FROM observations WHERE
                 json_extract(data,'$.host_id')=? AND json_extract(data,'$.source')='codex'
                 AND session_id=? AND json_extract(data,'$.status')='running'
-                AND json_extract(data,'$.last_event_at') BETWEEN ? AND ?
+                AND json_extract(data,'$.last_event_at')>=?
                 AND NOT (json_extract(data,'$.agent_id') IS ? AND json_extract(data,'$.state_at')<=?)
-                LIMIT 1""", (self.host_id, record["session_id"], checked_at - STALE_AFTER_MS, checked_at,
+                LIMIT 1""", (self.host_id, record["session_id"], checked_at - STALE_AFTER_MS,
                               stopping_agent, at)).fetchone() is not None
-        running = (self._has_active_tool(record, checked_at) or running_child
+        # The lifecycle writer persists the session before its native component.
+        # Include current child activity only when its own retained fences accept it;
+        # another child's later session event is not a fence for this child.
+        child = event.get("agent_id")
+        incoming_child = False
+        if child is not None and event["kind"] in {
+                "subagent_start", "subagent_activity", "tool_start", "tool_end", "tool_failure"}:
+            row = db.execute("""SELECT data FROM observations WHERE
+                    json_extract(data,'$.host_id')=? AND json_extract(data,'$.source')='codex'
+                    AND session_id=? AND json_extract(data,'$.agent_id')=?""",
+                             (self.host_id, record["session_id"], child)).fetchone()
+            prior = json.loads(row[0]) if row else {}
+            ended = db.execute("""SELECT ended_at FROM native_session_watermarks
+                    WHERE host_id=? AND source='codex' AND session_id=?""",
+                               (self.host_id, record["session_id"])).fetchone()
+            ended_at = max(prior.get("session_ended_at", -1), ended[0] if ended else -1)
+            resumed_at = record.get("root_started_at")
+            resumed = ended_at < 0 or not is_wire_integer(resumed_at) or at > resumed_at
+            terminal = prior.get("status") in {"stopped", "failed"}
+            reopened = resumed and prior.get("visibility_reason") == "Codex session ended"
+            incoming_child = (at >= checked_at - STALE_AFTER_MS and at >= prior.get("state_at", -1)
+                              and at > prior.get("result_at", -1) and at > ended_at and resumed
+                              and (not terminal or reopened or event["kind"] == "subagent_start"
+                                   and at > prior.get("state_at", -1)))
+        running = (self._has_active_tool(record, checked_at) or running_child or incoming_child
                    or record.get("root_turn_open") is True and not record.get("needs_input"))
-        if record.get("needs_input") and record["status"] == "idle":
-            running = False  # Keep newer waiting evidence; live tools still count as active.
-        # Missing root hooks cannot establish that the root turn stopped.
-        if running:
+        # Future stored child evidence is still live evidence: view() masks clock
+        # rollback, but catching up must not expose an incorrectly persisted idle.
+        # Waiting state does not complete live tools; the active predicate counts both.
+        if record.get("needs_input"):
+            record["status"] = "idle"
+        elif running:
             record["status"] = "running"
         elif record.get("root_turn_open") is False:
             record["status"] = "idle"
+        else:
+            record.update(status="unknown", visibility_reason="Root turn state was not observed")
         if record.get("visibility_reason") in {None, WAITING_REASON}:
             record["visibility_reason"] = WAITING_REASON if record.get("needs_input") else None
         return before != (record["status"], record.get("visibility_reason"))
@@ -334,17 +365,29 @@ class SessionObserver:
             tool_changed, tool_state_evidence = self._observe_tool(record, event, at)
             waiter_changed = self._observe_waiter(record, event, kind, at, tool_changed or tool_state_evidence)
             root_changed = self._observe_root_turn(record, event, kind, at, tool_state_evidence)
-            evidence_changed = tool_changed or waiter_changed or root_changed
+            root_open_rejected = (source == "codex" and kind in {"session_start", "prompt"}
+                                  and record.get("root_turn_open") is False
+                                  and at <= record.get("root_turn_at", -1))
+            codex_turn_event = source == "codex" and kind in {
+                "session_start", "prompt", "stop", "stop_failure", "subagent_stop",
+            }
+            # Reset order is independent of root-turn order. A later root tool may
+            # supersede a stop's turn state without superseding its older tool reset.
+            # Strict advancement also preserves same-time notices after a replayed reset.
+            reset_changed = (codex_turn_event and kind != "subagent_stop" and not root_open_rejected
+                             and at > record.get("tool_reset_at", -1))
+            if reset_changed:
+                self._reset_waiters(record, at)
+                self._reset_tools(record, at)
+                record["tool_reset_at"] = at
+            evidence_changed = tool_changed or waiter_changed or root_changed or reset_changed
             if waiter_changed and record.get("visibility_reason") in {None, WAITING_REASON}:
                 # Keep the reason consistent with the waiters whatever the arrival order.
                 record["visibility_reason"] = WAITING_REASON if record["needs_input"] else None
-            if at < record["last_event_at"]:
-                if (root_changed and source == "codex"
-                        and kind in {"session_start", "prompt", "stop", "stop_failure"}):
-                    self._reset_waiters(record, at)
-                    self._reset_tools(record, at)
-                    record["tool_reset_at"] = max(record.get("tool_reset_at", -1), at)
-                if root_changed or kind == "subagent_stop":
+            if (at < record["last_event_at"]
+                    or source == "codex" and record["status"] == "unknown"
+                    and record.get("restart_uncertain_until") is not None and at <= record["last_event_at"]):
+                if source == "codex":
                     evidence_changed |= self._reconcile_codex_turn(db, record, event, at)
                 if evidence_changed:
                     self._put_session(db, record)
@@ -354,6 +397,8 @@ class SessionObserver:
                 # it prevents a delayed start for the same tool from becoming live.
                 # It is not evidence that the session resumed after a prompt/stop
                 # reset, and must not refresh session liveness.
+                if source == "codex":
+                    evidence_changed |= self._reconcile_codex_turn(db, record, event, at)
                 if evidence_changed:
                     self._put_session(db, record)
                 return self.view(record, max(now_ms(), at))
@@ -361,10 +406,13 @@ class SessionObserver:
                     or at == record["last_event_at"] and record.get("last_event") == "session_end"
                     and kind != "session_end"
                     # A same-time tie must not reopen a turn that already ended.
-                    or at == record["last_event_at"] and record.get("last_event") in {"stop", "stop_failure"}
-                    and (kind in {"task_created", "task_completed", "subagent_start", "subagent_stop"}
-                         or source == "codex" and kind in {"session_start", "prompt"})):
-                if waiter_changed:
+                    or source != "codex" and at == record["last_event_at"]
+                    and record.get("last_event") in {"stop", "stop_failure"}
+                    and kind in {"task_created", "task_completed", "subagent_start", "subagent_stop"}
+                    or root_open_rejected):
+                if source == "codex":
+                    evidence_changed |= self._reconcile_codex_turn(db, record, event, at)
+                if evidence_changed:
                     self._put_session(db, record)
                 return self.view(record, max(now_ms(), at))
             record["last_event_at"] = at
@@ -383,8 +431,9 @@ class SessionObserver:
                     record["root_started_at"] = at
                 record.update(status="running", finished_at=None, visibility_reason=None,
                               activity="session " + (safe_text(event.get("start_source"), 240) or "start"))
-                self._reset_waiters(record, at)
-                self._reset_tools(record)
+                if source != "codex":
+                    self._reset_waiters(record, at)
+                    self._reset_tools(record)
                 record["started_at"] = min(record["started_at"], at)
             elif kind == "session_end":
                 record.update(status="stopped", finished_at=at, activity=None, visibility_reason=None)
@@ -402,8 +451,9 @@ class SessionObserver:
                               visibility_reason=reason)
             elif kind == "prompt":
                 record.update(status="running", finished_at=None, activity=kind, visibility_reason=None)
-                self._reset_waiters(record, at)
-                self._reset_tools(record)
+                if source != "codex":
+                    self._reset_waiters(record, at)
+                    self._reset_tools(record)
             elif kind in {"task_created", "task_completed",
                           "subagent_start", "subagent_stop"}:
                 activity = safe_text(event.get("activity"), 240) or kind
@@ -423,13 +473,15 @@ class SessionObserver:
                 live = isinstance(background, list) and any(isinstance(item, dict) and item.get("status") not in {"completed", "failed", "stopped"} for item in background)
                 record.update(status="running" if live else "idle", activity="background task" if live else None,
                               visibility_reason=None)
-                self._reset_waiters(record, at)
-                self._reset_tools(record)
+                if source != "codex":
+                    self._reset_waiters(record, at)
+                    self._reset_tools(record)
             elif kind == "stop_failure":
                 record.update(status="idle", activity="StopFailure",
                               visibility_reason="Claude reported that the turn failed")
-                self._reset_waiters(record, at)
-                self._reset_tools(record)
+                if source != "codex":
+                    self._reset_waiters(record, at)
+                    self._reset_tools(record)
             elif kind == "notification":
                 notification = safe_text(event.get("notification_type"), 240) or "notification"
                 needs_input = notification in WAITING_NOTIFICATIONS
@@ -461,7 +513,7 @@ class SessionObserver:
                 raise ValueError("Unsupported session observation")
             if kind in {"session_start", "session_end", "prompt", "stop", "stop_failure"}:
                 record["tool_reset_at"] = max(record.get("tool_reset_at", -1), at)
-            if root_changed or kind == "subagent_stop":
+            if source == "codex":
                 self._reconcile_codex_turn(db, record, event, at)
             self._put_session(db, record)
         return self.view(record, max(now_ms(), at))
@@ -666,12 +718,14 @@ class SessionObserver:
                     (json_extract(data,'$.tool_correlation_partial')=1 AND
                      COALESCE(json_extract(data,'$.tool_correlation_partial_until'),?)>=?) OR
                     (json_extract(data,'$.status')='unknown' AND
-                     json_extract(data,'$.restart_uncertain_until')>=?) OR
+                     (json_extract(data,'$.restart_uncertain_until')>=? OR
+                      (source='codex' AND json_extract(data,'$.last_event_at')>=?))) OR
                     -- Waiter history overflowed: a fresh session's waiting state is uncertain.
                     ((json_extract(data,'$.waiter_history_partial')=1 OR
                       COALESCE(json_extract(data,'$.waiter_clear_floor'),-1)>=0) AND
                      json_extract(data,'$.last_event_at')>=?))""",
-                                           (self.host_id, at, at, at, at, at - STALE_AFTER_MS)).fetchone()[0]
+                                           (self.host_id, at, at, at, at, at - STALE_AFTER_MS,
+                                            at - STALE_AFTER_MS)).fetchone()[0]
             # One predicate, so each session counts once: fresh running/waiting
             # work, or any unexpired tool (a reordered tool_start can leave a
             # live tool under a newer, fresh "idle" status).

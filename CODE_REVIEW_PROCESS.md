@@ -312,6 +312,11 @@ item before requesting review.
   same-timestamp, result-watermark, and session-end cases.
 - Watermarks must advance on metadata-only paths as well as state-changing paths.
 - Same-timestamp ties must not reopen a terminal or ended state.
+- Derive lifecycle status from retained entity evidence on delayed, tied, and replayed
+  paths. Use each entity's own watermark for terminal precedence and each reset's
+  watermark for monotonic clearing; an unrelated latest event is not an ordering fence.
+- Replaying a reset must preserve newer evidence, including a same-timestamp waiter
+  delivered after the original reset. Test both completion orders with live siblings.
 - When a history map is bounded (for example the last 128 events), ordering checks
   must use every retained timestamp for that entity, not only the bounded map.
   Otherwise eviction lets a delayed event clear state that is still live.
@@ -332,8 +337,15 @@ item before requesting review.
   label. A record reclassified `unknown` after a restart must keep capacity `unknown`
   until evidence arrives or the window in which it would have counted as active
   expires. A warning shown next to `available` is a contradiction, not a caveat.
+- Include already-unknown lifecycle records in restart admission tests. Preserve an
+  existing uncertainty deadline across repeated restarts and delayed or tied waiter
+  changes; derive new deadlines from retained evidence, never from restart time.
 - Use one threshold for a classification and for every alert or `partial` flag derived
   from it.
+- Fresh missing-root uncertainty must invalidate exact active totals and capacity,
+  then expire at the same freshness boundary. During clock rollback, retain future
+  live evidence in durable status; check the state again after the clock catches up
+  without delivering another event.
 
 **Ownership of nested data**
 
