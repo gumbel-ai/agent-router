@@ -31,9 +31,12 @@ Requires Git, uv, and Claude Code 2.1.292+ (sign in to run agents). Automatic ba
 uvx --python 3.14 --from git+https://github.com/gumbel-ai/agent-router router setup
 ```
 
-Approve the one-time CLI and background-service installation. Setup registers the
-Claude and, when installed, Codex marketplaces. Enable observation separately in each
-Git project:
+Approve the one-time CLI installation and marketplace registration. On macOS, setup
+also installs the background service. On Linux, setup leaves daemon startup manual:
+run `router daemon start` in a separate terminal and keep it running. An existing
+manual daemon must be stopped with `router daemon stop` before setup and restarted
+afterward. Setup registers the Claude and, when installed, Codex marketplaces.
+Enable observation separately in each Git project:
 
 ```sh
 router enable
