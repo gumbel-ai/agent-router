@@ -59,6 +59,25 @@ guess which project layer Codex would load. It checks the project marker and the
 selected home's installed hook declarations against the native hook inventory.
 Project configuration cannot grant user hook trust.
 
+For automation, `router status --codex --json` prints the same result as one JSON
+object, without contacting the Router daemon:
+
+```json
+{
+  "codex_observation": {
+    "state": "hooks_untrusted",
+    "detail": "10 Router hook(s) not trusted for the current version; open Codex and run /hooks"
+  }
+}
+```
+
+`state` is one of `ready`, `hooks_untrusted`, `hooks_disabled`, `plugin_not_installed`,
+`plugin_disabled`, `project_not_enabled`, `codex_not_installed` or `unknown`; only
+`ready` means a fresh session in this directory will be observed. The text view omits
+`codex_not_installed`; JSON reports it so the caller decides. The command exits 0 for
+every state. Plain `router status --json` remains the unchanged task and native-session
+list; it does not carry readiness.
+
 The probe starts no process, agent turn or daemon, refreshes no plugins and writes
 no hook trust. It uses Codex's native non-originating daemon-probe handshake, which
 preserves daemon-wide authentication policy and client identity. Socket aliases

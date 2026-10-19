@@ -1,12 +1,14 @@
 import asyncio
+import io
 import json
 import os
 import subprocess
+import sys
 import tempfile
 import threading
 import tomllib
 import unittest
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 
@@ -14,6 +16,7 @@ from websockets.asyncio.client import unix_connect
 from websockets.exceptions import ConnectionClosed
 from websockets.sync.server import unix_serve
 
+from router.cli import main as cli_main
 from router.codex_plugin import (
     HOOKS_FILE,
     PLUGIN_ID,
@@ -259,6 +262,40 @@ class CodexPluginTests(unittest.TestCase):
         self.assertTrue(all(call["home"] == str(self.home) and call["cwd"] == str(self.project) for call in calls))
         self.assertTrue(all(call["request"]["params"]["cwd"] == str(self.project)
                             for call in calls if call["request"]["method"] == "config/read"))
+
+    def test_status_codex_json_reports_readiness_without_the_daemon(self):
+        trusted = {key: {"trusted_hash": value} for key, value in expected_trust(HOOKS).items()}
+
+        def status(*flags):
+            output = io.StringIO()
+            with patch.object(sys, "argv", ["router", "status", *flags]), \
+                    patch.dict(os.environ, {"CODEX_HOME": str(self.home)}), \
+                    patch("router.cli.request", side_effect=AssertionError("daemon contacted")), \
+                    redirect_stdout(output), redirect_stderr(io.StringIO()):
+                cli_main()
+            return json.loads(output.getvalue())
+
+        self.configure(entries=trusted)
+        self.assertEqual(status("--codex", "--json")["codex_observation"]["state"], "plugin_not_installed")
+        self.install("0.9.0")
+        effective = tomllib.loads((self.home / "config.toml").read_text())
+        cases = [({}, trusted, "ready"), ({}, {}, "hooks_untrusted"),
+                 # A project-level override reaches JSON through Codex's effective configuration.
+                 ({"config": {**effective, "plugins": {PLUGIN_ID: {"enabled": False}}}}, trusted, "plugin_disabled")]
+        for options, entries, expected in cases:
+            with self.subTest(expected=expected):
+                self.configure(entries=entries)
+                (self.home / "rpc.json").write_text(json.dumps(options))
+                result = status("--codex", "--json")
+                self.assertEqual(result, {"codex_observation": availability(self.home)})
+                self.assertEqual(result["codex_observation"]["state"], expected)
+        with patch("router.codex_plugin.shutil.which", return_value=None):
+            self.assertEqual(status("--codex", "--json")["codex_observation"]["state"], "codex_not_installed")
+        for flags in (["--codex"], ["task-1", "--codex", "--json"], ["--codex", "--json", "--filter", "needs_decision"],
+                      ["--codex", "--json", "--watch"], ["--codex", "--json", "--native-offset", "100"]):
+            with self.subTest(flags=flags), self.assertRaises(SystemExit) as raised:
+                status(*flags)
+            self.assertEqual(raised.exception.code, 2)
 
     def test_readiness_bounds_protocol_failures_and_preserves_daemon(self):
         self.install("0.9.0")

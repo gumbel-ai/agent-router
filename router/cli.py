@@ -267,6 +267,8 @@ def main() -> None:
     status.add_argument("--json", action="store_true")
     status.add_argument("--watch", action="store_true")
     status.add_argument("--native-offset", type=int, default=0, help="Native observation page offset (100 per page)")
+    status.add_argument("--codex", action="store_true",
+                        help="With --json only: print Codex observation readiness for this directory, without the daemon")
     run = commands.add_parser("run", help="Run a command in its own process group and record completion evidence")
     run.add_argument("--label", help="Short name shown in status and fleet views")
     run.add_argument("--session", help="Launching Claude Code or Codex session ID")
@@ -505,6 +507,11 @@ def main() -> None:
                 if not getattr(args, "watch", False):
                     break
                 time.sleep(config.refresh_seconds)
+        elif args.command == "status" and args.codex:
+            # A separate document: plain `status --json` is a list whose shape stays unchanged.
+            if not args.json or args.task_id or args.filter or args.watch or args.native_offset:
+                parser.error("status --codex requires --json and no task ID, --filter, --watch or --native-offset")
+            print(json.dumps({"codex_observation": codex_availability()}, indent=2))
         elif args.command == "status":
             payload = {key: value for key, value in {"task_id": args.task_id, "filter": args.filter, "native_offset": args.native_offset}.items() if value}
             while True:
