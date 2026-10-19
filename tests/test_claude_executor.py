@@ -4,8 +4,10 @@ import copy
 import json
 import os
 import shlex
+import shutil
 import signal
 import sys
+import tempfile
 import threading
 import time
 import unittest
@@ -18,8 +20,10 @@ from test_runtime import RuntimeHarness
 from router import service
 from router.child import child_environment, executor_command
 from router.claude_executor import collect
-from router.daemon import PhaseStopped, Runtime
+from router.daemon import Controller, PhaseStopped, Runtime, public, visibility
+from router.db import Store
 from router.process import creation_identity, owned_state
+from router.validation import MAX_WIRE_INTEGER
 
 MODEL = "anthropic/claude-sonnet-4-6"
 PROFILE = {"tools": ["Read", "Edit", "Write", "Bash"], "allow": ["Read", "Edit", "Write", "Bash"]}
@@ -261,7 +265,7 @@ class ClaudeExecutorTests(RuntimeHarness, unittest.TestCase):
                     try:
                         if creation_identity(pid) == identity:
                             os.kill(pid, signal.SIGKILL)
-                    except ProcessLookupError:
+                    except (ProcessLookupError, FileNotFoundError):
                         pass
                 self.control.environment.pop("ROUTER_FIXTURE_VERSION_DIRECTORY")
 
@@ -314,8 +318,11 @@ class ClaudeExecutorTests(RuntimeHarness, unittest.TestCase):
                         self.runtime.stop()
                     self.assertFalse(self.control.store.get(task_id)["execution_stopped"])
                 finally:
-                    if creation_identity(pid) == identity:
-                        os.killpg(pid, signal.SIGTERM)
+                    try:
+                        if creation_identity(pid) == identity:
+                            os.killpg(pid, signal.SIGTERM)
+                    except (ProcessLookupError, FileNotFoundError):
+                        pass
                     deadline = time.monotonic() + 15
                     while time.monotonic() < deadline:
                         try:
@@ -356,10 +363,11 @@ class ClaudeExecutorTests(RuntimeHarness, unittest.TestCase):
                           ("--model",), ("fixture_executor.py",)):
             with self.subTest(arguments=arguments):
                 self.config.claude_command = ["claude", *arguments]
-                with self.assertRaisesRegex(ValueError, "one executable"):
-                    executor_command(self.config, {"executor": "claude", "invocation": {"task": "continue"},
-                                                   "child_session_id": "12345678-1234-4321-8765-123456789abc", "attempts": 0,
-                                                   "permission_profile": PROFILE, "resolved_model": MODEL})
+                resumed = executor_command(self.config, {"executor": "claude", "invocation": {"task": "continue"},
+                    "child_session_id": "12345678-1234-4321-8765-123456789abc", "attempts": 1,
+                    "permission_profile": PROFILE, "resolved_model": MODEL,
+                    "claude_executable": str(self.root / "claude-fixture"), "executor_version": "2.1.303"})
+                self.assertEqual(resumed[0], str(self.root / "claude-fixture"))
                 with self.assertRaisesRegex(ValueError, "one executable"):
                     self.runtime.validate({"invocation": {"executor": "claude", "model": "test",
                                                           "parent_worktree": str(self.repo), "parent_repo": str(self.repo)}})
@@ -367,7 +375,156 @@ class ClaudeExecutorTests(RuntimeHarness, unittest.TestCase):
             executor_command(self.config, {"executor": "claude", "invocation": {"task": "continue"}, "attempts": 1})
 
 
+class ClaudeAttemptBindingTests(unittest.TestCase):
+    def test_new_attempts_inspect_the_selected_path_and_recovery_keeps_its_binding(self):
+        with tempfile.TemporaryDirectory(prefix="router-claude-binding-") as directory:
+            root = Path(directory).resolve()
+            selected = root / "bin" / "claude"
+            alternate = root / "other" / "claude"
+            shadow = root / "worktree" / ".venv" / "bin" / "claude"
+            for executable in (selected, alternate, shadow):
+                executable.parent.mkdir(parents=True, exist_ok=True)
+                executable.write_text("fixture executable; never invoked")
+                executable.chmod(0o700)
+            link = root / "selected-link"
+            link.symlink_to(selected)
+            for command, search, reconfigure in ((["claude"], str(selected.parent), False),
+                    (["claude"], "bin", True), ([str(selected)], str(selected.parent), True),
+                    (["bin/claude"], str(selected.parent), False), ([str(link)], str(selected.parent), False),
+                    (None, str(selected.parent), False)):
+                for recovery in (None, "version", "setup", "legacy", "relative-binding", "missing-version"):
+                    with self.subTest(command=command, recovery=recovery, search=search):
+                        link.unlink()
+                        link.symlink_to(selected)
+                        version_output = root / "version.stdout"
+                        version_output.write_text("2.1.303 (Claude Code)\n")
+                        task = {"task_id": "task-fixture", "session_id": "parent", "status": "retrying",
+                                "executor": "claude", "attempts": 1, "attempt_number": 1,
+                                "executor_version": "2.1.303", "claude_executable": str(selected),
+                                "child_session_id": "12345678-1234-4321-8765-123456789abc",
+                                "resolved_model": MODEL, "permission_profile": PROFILE, "setup_done": True,
+                                "snapshot_commit": "snapshot", "worktree": str(root / "worktree"),
+                                "invocation": {"task": "batch-job", "parent_worktree": str(root)},
+                                "phase": "version" if recovery == "version" else "setup",
+                                "process": {"stdout": str(version_output)}, "execution_stopped": True}
+                        if recovery == "version":
+                            task.pop("executor_version")
+                        if recovery == "legacy":
+                            task.pop("claude_executable")
+                        elif recovery == "relative-binding":
+                            task["claude_executable"] = "claude"
+                        elif recovery == "missing-version":
+                            task.pop("executor_version")
+                        current = SimpleNamespace(claude_command=command if recovery is None else [str(alternate)],
+                                                  max_attempts=3, attempt_timeout_seconds=30)
+                        def update(task_id, change, task=task):
+                            change(task)
+                            return task.copy()
+                        runtime = Runtime.__new__(Runtime)
+                        runtime.store = SimpleNamespace(get=lambda task_id, task=task: task.copy(), update=update,
+                                                        update_with_attempt=update)
+                        runtime.control = SimpleNamespace(settings=current, environment={"PATH": search}, directory=root)
+                        phases = []
+                        def phase(task_id, name, argv, cwd, runtime=runtime, task=task, phases=phases,
+                                  version_output=version_output, reconfigure=reconfigure, current=current, **kwargs):
+                            environment = runtime.control.environment
+                            if name == "child":
+                                environment = child_environment(environment, task)
+                            executable = Path(argv[0]) if Path(argv[0]).is_absolute() else Path(
+                                shutil.which(argv[0], path=environment["PATH"]) or cwd / argv[0])
+                            phases.append((name, str(executable.resolve())))
+                            task.update(phase=name, process={"stdout": str(version_output)})
+                            if name == "version":
+                                if reconfigure:
+                                    current.claude_command = [str(alternate)]
+                                link.unlink()
+                                link.symlink_to(alternate)
+                            else:
+                                task.update(executor_completed=True, thread_observed=True)
+                            return {"exit_code": 0}
+                        runtime.phase = phase
+                        runtime.observe = lambda *args, **kwargs: {"exit_code": 0}
+                        result = {}
+                        runtime.finish = lambda task_id, outcome, reason, result=result, **kwargs: result.update(outcome=outcome, reason=reason)
+                        runtime.execute(task["task_id"], recovered=recovery is not None)
+                        if recovery in {"legacy", "relative-binding", "missing-version"} or command is None and recovery is None:
+                            self.assertEqual(result["outcome"], "failed")
+                            self.assertNotIn("child", [name for name, _ in phases])
+                            if command is None and recovery is None:
+                                self.assertIn("one executable", result["reason"])
+                                self.assertNotIn("executor_version", task)
+                                self.assertNotIn("claude_executable", task)
+                        else:
+                            self.assertEqual(result["outcome"], "completed", result)
+                            self.assertEqual([path for _, path in phases], [str(selected)] * len(phases))
+                            self.assertEqual([name for name, _ in phases], ["version", "child"] if recovery is None else ["child"])
+                            self.assertEqual(task["executor_version"], "2.1.303")
+
+
 class ClaudeAccountingTests(unittest.TestCase):
+    def test_persisted_accounting_projection_preserves_raw_history_and_cost(self):
+        buckets = ("input_tokens", "output_tokens", "cache_read_input_tokens", "cache_creation_input_tokens")
+        with tempfile.TemporaryDirectory(prefix="router-claude-accounting-") as directory:
+            database = Path(directory) / "router.sqlite3"
+            for bucket in buckets:
+                cases = [("published-overflow", 2 * MAX_WIRE_INTEGER), ("null", None), ("boolean", True),
+                         ("negative", -1), ("missing", 0), ("nested", {}), ("partial", 7)]
+                cases += [("aggregate", MAX_WIRE_INTEGER + edge) for edge in (-1, 0, 1)]
+                for index, (case, value) in enumerate(cases):
+                    with self.subTest(bucket=bucket, case=case, value=value):
+                        store = Store(database)
+                        task = {"task_id": f"task-{bucket}-{index}", "session_id": "parent", "executor": "claude",
+                                "status": "awaiting_review", "attempt_number": 1, "attempts": 1,
+                                "review_retries": 0, "continuations": 0, "resolved_model": MODEL,
+                                "invocation": {"task": "batch-job", "parent_worktree": "/tmp/example-project"},
+                                "usage": dict.fromkeys(buckets, 0), "usage_complete": True, "cost": .25}
+                        task["usage"][bucket] = value
+                        history = []
+                        expected = None
+                        complete = False
+                        if case == "missing":
+                            task["usage"].pop(bucket)
+                        elif case == "aggregate":
+                            prior = copy.deepcopy(task)
+                            prior["usage"][bucket] = MAX_WIRE_INTEGER - 1
+                            history.append(prior)
+                            task.update(attempt_number=2, attempts=2)
+                            task["usage"][bucket] = value - (MAX_WIRE_INTEGER - 1)
+                            if value <= MAX_WIRE_INTEGER:
+                                expected = {**dict.fromkeys(buckets, 0), bucket: value}
+                                complete = True
+                        elif case == "partial":
+                            prior = copy.deepcopy(task)
+                            history.append(prior)
+                            task.update(attempt_number=2, attempts=2, usage={}, usage_complete=False)
+                            expected = prior["usage"]
+                        with store.transaction() as db:
+                            store.put(db, task)
+                            for frame in history:
+                                store.save_attempt(frame, db)
+                            store.save_attempt(task, db)
+                        # Reopen persisted published-format frames, without rewriting their evidence.
+                        store = Store(database)
+                        before = (store.get(task["task_id"]), store.history(task["task_id"]))
+                        control = Controller.__new__(Controller)
+                        control.store = store
+                        control.settings = SimpleNamespace(max_attempts=1)
+                        control.native = SimpleNamespace(status=lambda **kwargs: [])
+                        views = (public(before[0], store=store), visibility(*before),
+                                 control.status({"task_id": task["task_id"]}),
+                                 next(row for row in control.status({}) if row["task_id"] == task["task_id"]),
+                                 next(row for row in control.status({"filter": "needs_decision"})
+                                      if row["task_id"] == task["task_id"]))
+                        for view in views:
+                            self.assertEqual(view["usage"], expected)
+                            self.assertIs(view["usage_complete"], complete)
+                            self.assertEqual(view["cost"], .5 if history else .25)
+                        for frame in views[0]["attempt_history"]:
+                            valid = case == "aggregate" or case == "partial" and frame["attempt_number"] == 1
+                            self.assertIs(frame["usage_complete"], valid)
+                            self.assertEqual(set(frame["usage"]), set(buckets) if valid else set())
+                        self.assertEqual(before, (store.get(task["task_id"]), store.history(task["task_id"])))
+
     def test_malformed_identity_and_model_evidence_fails_closed(self):
         session = "12345678-1234-4321-8765-123456789abc"
         for event in ({"type": []}, {"type": {}}, {"type": None},
@@ -387,15 +544,15 @@ class ClaudeAccountingTests(unittest.TestCase):
         event = {"type": "result", "session_id": session, "subtype": "success", "is_error": False,
                  "total_cost_usd": .5, "modelUsage": {"claude-sonnet-4-6": {
                      "inputTokens": 200, "outputTokens": 40, "cacheReadInputTokens": 80,
-                     "cacheCreationInputTokens": 20}}}
+                     "cacheCreationInputTokens": 20, "costUSD": 999}}}
+        counts = {"input_tokens": 100, "output_tokens": 20, "cache_read_input_tokens": 40, "cache_creation_input_tokens": 10}
         base = {"child_session_id": session, "resolved_model": MODEL,
-                "claude_baseline": {"usage": {"input_tokens": 100, "output_tokens": 20,
-                                              "cache_read_input_tokens": 40, "cache_creation_input_tokens": 10},
+                "claude_baseline": {"schema_version": 1, "models": {"claude-sonnet-4-6": counts},
                                     "cost": .25, "complete": True, "cost_complete": True}}
         task = copy.deepcopy(base)
         for _ in range(2):
             collect(task, event)
-        self.assertEqual(task["usage"], base["claude_baseline"]["usage"])
+        self.assertEqual(task["usage"], counts)
         self.assertEqual(task["cost"], .25)
         self.assertTrue(task["usage_complete"])
         for value in (None, True, -1, float("nan"), float("inf"), "100"):
@@ -413,7 +570,90 @@ class ClaudeAccountingTests(unittest.TestCase):
                     else:
                         self.assertFalse(task["usage_complete"])
                         self.assertEqual(task["usage"], {})
-        for baseline in ({"complete": False, "cost_complete": False},
+        selected = "claude-sonnet-4-6"
+        auxiliary = "claude-haiku-4-5"
+        counters = {"inputTokens": 100, "outputTokens": 20, "cacheReadInputTokens": 40, "cacheCreationInputTokens": 10}
+        prior = {**copy.deepcopy(base), "claude_baseline": {"schema_version": 1, "models": {}, "complete": True, "cost_complete": True}}
+        collect(prior, {**event, "modelUsage": {selected: counters, auxiliary: counters}})
+        for variant in ("missing-model", "decreased-model", "missing-bucket", "decreased-bucket"):
+            with self.subTest(continuity=variant):
+                current = {selected: {key: value * 3 for key, value in counters.items()}, auxiliary: counters.copy()}
+                if variant == "missing-model":
+                    current.pop(auxiliary)
+                elif variant == "decreased-model":
+                    current[auxiliary] = dict.fromkeys(counters, 0)
+                elif variant == "missing-bucket":
+                    current[auxiliary].pop("cacheReadInputTokens")
+                else:
+                    current[auxiliary]["cacheReadInputTokens"] -= 1
+                task = {**copy.deepcopy(base), "claude_baseline": prior["claude_total"]}
+                collect(task, {**event, "total_cost_usd": .75, "modelUsage": current})
+                self.assertFalse(task["usage_complete"])
+                self.assertEqual(task["usage"], {})
+                self.assertEqual(task["cost"], .25)
+        # A newly observed model is legitimate; its counters start from zero.
+        current = {selected: {key: value * 3 for key, value in counters.items()}, auxiliary: counters.copy(),
+                   "additional-model": counters.copy()}
+        task = {**copy.deepcopy(base), "claude_baseline": prior["claude_total"]}
+        collect(task, {**event, "total_cost_usd": .75, "modelUsage": current})
+        self.assertTrue(task["usage_complete"])
+        self.assertEqual(task["usage"]["input_tokens"], 300)
+        self.assertEqual(task["cost"], .25)
+        self.assertEqual(task["claude_total"]["schema_version"], 1)
+        # Cumulative totals, not just their per-model contributors or attempt deltas, must fit the wire.
+        for native_bucket, bucket in (("inputTokens", "input_tokens"), ("outputTokens", "output_tokens"),
+                ("cacheReadInputTokens", "cache_read_input_tokens"), ("cacheCreationInputTokens", "cache_creation_input_tokens")):
+            for edge in (-1, 0, 1):
+                for resumed in (False, True):
+                    with self.subTest(aggregate_bucket=bucket, edge=edge, resumed=resumed):
+                        left = dict.fromkeys(counters, 0)
+                        right = left.copy()
+                        first = {**copy.deepcopy(base), "claude_baseline": {"schema_version": 1, "models": {},
+                                 "complete": True, "cost_complete": True}}
+                        history = []
+                        if resumed:
+                            left[native_bucket] = MAX_WIRE_INTEGER - 1
+                            collect(first, {**event, "total_cost_usd": .25, "modelUsage": {selected: left, auxiliary: right}})
+                            self.assertTrue(first["usage_complete"])
+                            history = [{**first, "attempt_number": 1}]
+                            right[native_bucket] = edge + 1
+                            baseline = first["claude_total"]
+                        else:
+                            left[native_bucket] = MAX_WIRE_INTEGER // 2
+                            right[native_bucket] = MAX_WIRE_INTEGER - left[native_bucket] + edge
+                            baseline = first["claude_baseline"]
+                        task = {**copy.deepcopy(base), "claude_baseline": baseline, "attempt_number": 2 if resumed else 1}
+                        collect(task, {**event, "modelUsage": {selected: left, auxiliary: right}})
+                        self.assertEqual(task["usage_complete"], edge <= 0)
+                        self.assertEqual(task["cost"], .25 if resumed else .5)
+                        if edge > 0:
+                            self.assertEqual(task["usage"], {})
+                        view = public({**task, "session_id": "parent", "status": "awaiting_review", "executor": "claude",
+                            "invocation": {"task": "batch-job", "parent_worktree": "/tmp/example-project"}}, history=history)
+                        self.assertEqual(view["usage_complete"], edge <= 0)
+                        if edge <= 0:
+                            self.assertEqual(view["usage"][bucket], MAX_WIRE_INTEGER + edge)
+                        elif view["usage"] is not None:
+                            self.assertLessEqual(view["usage"][bucket], MAX_WIRE_INTEGER)
+                        self.assertEqual(view["cost"], .5)
+        # Previously published aggregate-only baselines cannot establish per-model continuity.
+        for baseline in ({"usage": counts, "complete": True, "cost": .25, "cost_complete": True},
+                         {"schema_version": 2, "models": {}, "complete": True, "cost": .25, "cost_complete": True}):
+            with self.subTest(upgrade=baseline):
+                task = {**copy.deepcopy(base), "claude_baseline": baseline}
+                collect(task, event)
+                self.assertFalse(task["usage_complete"])
+                self.assertEqual(task["usage"], {})
+                self.assertEqual(task["cost"], .25)
+                self.assertEqual(task["claude_total"]["schema_version"], 1)
+        view_task = {**task, "session_id": "parent", "status": "awaiting_review", "executor": "claude",
+                     "claude_executable": "/tmp/worker-a", "invocation": {"task": "batch-job", "parent_worktree": "/tmp/example-project"}}
+        view = public(view_task, history=[view_task])
+        for internal in ("claude_baseline", "claude_total", "claude_executable"):
+            self.assertNotIn(internal, view)
+            self.assertNotIn(internal, view["attempt_history"][0])
+            self.assertIn(internal, view_task)
+        for baseline in (None, [], {"complete": False, "cost_complete": False},
                          {"usage": {"input_tokens": 201}, "cost": .51}):
             task = {**copy.deepcopy(base), "claude_baseline": baseline}
             collect(task, event)

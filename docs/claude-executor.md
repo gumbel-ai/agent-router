@@ -25,7 +25,14 @@ executable; interpreter/script prefixes and native option prefixes are refused
 before any phase. This prevents configured arguments from consuming or hiding
 Router's version and permission options. A wrapper must forward Router's arguments
 unchanged, preserve normal native authentication, and never independently start
-provider work. Router cannot validate an operator-owned wrapper's implementation.
+provider work. Each new attempt resolves the operator-selected executable using
+Router's PATH and the parent working directory, follows symlinks, and persists that
+absolute path before inspection. Inspection and child execution use that path;
+worktree PATH entries and setup-created shadows cannot substitute another CLI.
+Every new attempt repeats inspection, including after restart or configuration
+changes. Recovery of an already-running phase uses that attempt's persisted path
+and version rather than the current command setting. A legacy in-progress attempt
+without a binding is refused before launching another provider child; it is never guessed. Router cannot validate an operator-owned wrapper's implementation.
 Cancellation and restart use that same recorded ownership. Uncertain ownership
 retains the task reservation and requires operator inspection. CLI help
 was inspected on 2.1.303; authenticated execution remains **NOT CHECKED** in the
@@ -84,9 +91,26 @@ identity and accounting. It takes tokens from `result.modelUsage`, including cac
 read/write buckets, and cost from `result.total_cost_usd`. It does not add assistant
 message usage or per-model costs to that aggregate. Repeated results replace the
 same attempt's values. Resume results carry session totals on the supported CLI;
-Router subtracts the prior attempt's persisted baseline before the existing task
-aggregation adds attempts. Missing, nonfinite, negative, decreased, or incomplete
-values remain unavailable; a crash result is not reported as zero cost.
+Router stores version-1 internal baselines containing at most 32 models, bounded
+model identifiers, and four integer token buckets per model. Each bucket's
+cumulative sum across models, including persisted baselines, must fit the shared
+wire integer bound (`2**63 - 1`); checking only an attempt delta is insufficient.
+It validates every retained model and bucket before summing their deltas: another model's growth
+cannot hide a missing or decreased bucket. A newly observed model starts at zero.
+The existing task aggregation then adds attempt deltas. Previously published
+aggregate-only baselines are upgraded to the versioned representation with token
+continuity unknown; Router never invents their per-model history. Independently
+valid native aggregate cost deltas remain usable and are never added to per-model
+costs. Missing, nonfinite, negative, decreased, or incomplete values remain
+unavailable; a crash result is not reported as zero cost. These internal maps and
+executable bindings are omitted from public task output and attempt history.
+
+Retained completed attempts are validated again when read, including records from
+older versions: each frame must contain the four bounded integer token buckets,
+and their combined total must fit the same bound. Invalid frames contribute no
+usage; valid prior partial usage can remain visible with `usage_complete: false`.
+An overflowing combined total is unavailable. This temporary public projection
+also covers attempt history and never rewrites stored evidence or aggregate cost.
 
 These costs are Claude CLI estimates, not billed spend. No prompts, credentials,
 or process environments enter accounting metadata. Existing private stdout/stderr

@@ -1,8 +1,13 @@
 """Explicit Claude CLI permissions and cumulative structured result accounting."""
 
 import math
+import os
+import shutil
 import uuid
 from pathlib import Path
+
+from router.native import identifier
+from router.validation import MAX_WIRE_INTEGER
 
 TOOLS = frozenset({"Read", "Edit", "Write", "Bash", "Glob", "Grep", "NotebookEdit"})
 TOKEN_FIELDS = {"inputTokens": "input_tokens", "outputTokens": "output_tokens",
@@ -25,9 +30,56 @@ def validate(model: str, permission: object) -> dict:
     return permission
 
 
-def validate_command(command: list[str]) -> None:
-    if len(command) != 1:
+def validate_command(command: list[str] | None) -> None:
+    if command is None or len(command) != 1:
         raise ValueError("Claude requires one executable path without configured arguments; use an operator forwarding wrapper")
+
+
+def resolve_executable(command: list[str], environment: dict[str, str], cwd: Path) -> str:
+    validate_command(command)
+    search = os.pathsep.join(str(cwd / entry) if not Path(entry).is_absolute() else entry
+                             for entry in os.get_exec_path(environment))
+    selected = str(cwd / command[0]) if os.path.dirname(command[0]) else command[0]
+    located = shutil.which(selected, path=search)
+    if located is None:
+        raise ValueError("Configured Claude executable is unavailable; no fallback")
+    try:
+        return str(Path(located).resolve(strict=True))
+    except (OSError, RuntimeError) as error:
+        raise ValueError("Cannot resolve configured Claude executable; no fallback") from error
+
+
+def model_counters(value: object, fields: dict[str, str]) -> dict | None:
+    if not isinstance(value, dict) or len(value) > 32:
+        return None
+    result = {}
+    totals = dict.fromkeys(fields.values(), 0)
+    for model, usage in value.items():
+        if not isinstance(model, str) or len(model) > 240:
+            return None
+        try:
+            identifier(model, "Claude usage model")
+        except (ValueError, TypeError):
+            return None
+        if not isinstance(usage, dict):
+            return None
+        counts = {}
+        for source, target in fields.items():
+            count = usage.get(source)
+            if type(count) is not int or not 0 <= count <= MAX_WIRE_INTEGER - totals[target]:
+                return None
+            totals[target] += count
+            counts[target] = count
+        result[model] = counts
+    return result
+
+
+def public_usage(frame: dict) -> dict:
+    usage = frame.get("usage")
+    valid = (isinstance(usage, dict) and set(usage) == set(TOKEN_FIELDS.values())
+             and all(type(value) is int and 0 <= value <= MAX_WIRE_INTEGER for value in usage.values()))
+    return {"usage": dict(usage) if valid else {},
+            "usage_complete": valid and frame.get("usage_complete") is True}
 
 
 def validate_persistence(environment: dict[str, str]) -> None:
@@ -89,33 +141,36 @@ def collect(task: dict, event: dict) -> None:
             task["execution_error"] = True
         if isinstance(event.get("result"), str):
             task["summary"] = event["result"][-8000:]
-        raw = event.get("modelUsage")
-        complete = isinstance(raw, dict) and bool(raw) and len(raw) <= 32 and event.get("subtype") != "error_during_execution"
-        if complete and model not in raw and event.get("subtype") == "success":
+        models = model_counters(event.get("modelUsage"), TOKEN_FIELDS)
+        complete = models is not None and bool(models) and event.get("subtype") != "error_during_execution"
+        if complete and model not in models and event.get("subtype") == "success":
             task["execution_error"] = True
-        totals = dict.fromkeys(TOKEN_FIELDS.values(), 0)
+        baseline = task.get("claude_baseline", {"schema_version": 1, "models": {}, "complete": True})
+        if not isinstance(baseline, dict):
+            baseline = {"complete": False, "cost_complete": False}
+        previous = (model_counters(baseline.get("models"), {key: key for key in TOKEN_FIELDS.values()})
+                    if type(baseline.get("schema_version")) is int and baseline["schema_version"] == 1 else None)
+        complete = complete and previous is not None and baseline.get("complete") is True
+        deltas = dict.fromkeys(TOKEN_FIELDS.values(), 0)
         if complete:
-            for usage in raw.values():
-                for source, target in TOKEN_FIELDS.items():
-                    value = usage.get(source) if isinstance(usage, dict) else None
-                    if type(value) is not int or not 0 <= value <= 2**63 - 1:
-                        complete = False
-                    else:
-                        totals[target] += value
-        baseline = task.get("claude_baseline", {})
-        previous = baseline.get("usage", {})
-        deltas = {key: value - previous.get(key, 0) for key, value in totals.items()}
-        complete = complete and all(value >= 0 for value in deltas.values()) and baseline.get("complete", True)
+            complete = previous.keys() <= models.keys()
+            for observed, counts in models.items():
+                for key, value in counts.items():
+                    change = value - previous.get(observed, {}).get(key, 0)
+                    complete = complete and change >= 0
+                    deltas[key] += change
         task["usage_complete"] = complete
         task["usage"] = deltas if complete else {}
         cost = event.get("total_cost_usd")
-        valid_cost = type(cost) in {int, float} and 0 <= cost <= 1_000_000_000_000 and math.isfinite(cost) and cost >= baseline.get("cost", 0)
-        valid_cost = valid_cost and baseline.get("cost_complete", True) and event.get("subtype") != "error_during_execution"
-        task["claude_total"] = {"usage": totals, "complete": complete, "cost_complete": valid_cost}
+        previous_cost = baseline.get("cost", 0)
+        valid_cost = type(previous_cost) in {int, float} and 0 <= previous_cost <= 1_000_000_000_000
+        valid_cost = valid_cost and type(cost) in {int, float} and previous_cost <= cost <= 1_000_000_000_000 and math.isfinite(cost)
+        valid_cost = valid_cost and baseline.get("cost_complete", True) is True and event.get("subtype") != "error_during_execution"
+        task["claude_total"] = {"schema_version": 1, "models": models or {}, "complete": complete, "cost_complete": valid_cost}
         task["cost_note"] = "Claude CLI session-total estimate minus prior attempt; not billed spend"
         if valid_cost:
             task["claude_total"]["cost"] = cost
-            task["cost"] = cost - baseline.get("cost", 0)
+            task["cost"] = cost - previous_cost
             task["cost_source"] = "executor_reported"
         else:
             task.pop("cost", None)

@@ -18,8 +18,13 @@ from pathlib import Path
 from router.capacity import CapacitySampler
 from router.child import child_environment, executor_command, launch
 from router.claude_executor import collect as collect_claude
+from router.claude_executor import public_usage as claude_public_usage
+from router.claude_executor import (
+    resolve_executable,
+    validate_command,
+    validate_persistence,
+)
 from router.claude_executor import validate as validate_claude
-from router.claude_executor import validate_command, validate_persistence
 from router.claude_executor import version as claude_version
 from router.client import CompletionRefused
 from router.codex import collect as collect_codex
@@ -87,11 +92,15 @@ def required_text(payload: dict, key: str) -> str:
 def public(task: dict, store: Store | None = None, history: list[dict] | None = None) -> dict:
     result = {key: value for key, value in task.items() if key not in {
         "session_id", "invocation", "feedback", "permission_profile", "setup_command", "cleanup_requested", "token_prices",
-        "codex_usage_baseline", "codex_usage_total", "codex_baseline_complete", "claude_baseline", "claude_total"}}
+        "codex_usage_baseline", "codex_usage_total", "codex_baseline_complete", "claude_baseline", "claude_total", "claude_executable"}}
     attempt_history = store.history(task["task_id"]) if history is None and store is not None else history or []
     result.update(visibility(task, attempt_history))
     if store is not None or history is not None:
-        result["attempt_history"] = attempt_history
+        if task.get("executor") == "claude":
+            attempt_history = [{**frame, **claude_public_usage(frame)} for frame in attempt_history]
+        result["attempt_history"] = [{key: value for key, value in frame.items()
+                                      if key not in {"claude_baseline", "claude_total", "claude_executable"}}
+                                     for frame in attempt_history]
     return result
 
 
@@ -104,6 +113,8 @@ def visibility(task: dict, history: list[dict]) -> dict:
     if "attempt_number" in task:
         attempts[task["attempt_number"]] = current
     frames = list(attempts.values()) or [current]
+    if task.get("executor") == "claude":
+        frames = [{**frame, **claude_public_usage(frame)} for frame in frames]
     cost = sum(frame["cost"] for frame in frames) if all(frame.get("cost") is not None for frame in frames) else None
     elapsed = sum(frame.get("duration_ms", 0) for frame in frames) if any("duration_ms" in frame for frame in frames) else None
     usage = {}
@@ -115,6 +126,10 @@ def visibility(task: dict, history: list[dict]) -> dict:
                 destination[key] = destination.get(key, 0) + value
     for frame in frames:
         add_usage(usage, frame.get("usage", {}))
+    complete = all(frame.get("usage_complete", bool(frame.get("usage"))) for frame in frames)
+    if task.get("executor") == "claude":
+        accounting = claude_public_usage({"usage": usage, "usage_complete": complete})
+        usage, complete = accounting["usage"], accounting["usage_complete"]
     return {"owner": "router", "control_mode": "control", "parent_session_id": task["session_id"],
             "parent_agent_id": task.get("parent_agent_id"), "task": task["invocation"]["task"], "cwd": task["invocation"]["parent_worktree"],
             "started_at": task.get("attempt_started_at"),
@@ -126,7 +141,7 @@ def visibility(task: dict, history: list[dict]) -> dict:
             "price_date": task.get("price_date"), "price_source": task.get("price_source"),
             "price_overrides_used": task.get("price_overrides_used", []), "price_sources": {},
             "usage": usage or None, "usage_source": "executor_reported" if usage else "unavailable",
-            "usage_complete": all(frame.get("usage_complete", bool(frame.get("usage"))) for frame in frames),
+            "usage_complete": complete,
             "cleanup_pending": bool(task.get("cleanup_pending", False)), "cleanup_error": task.get("cleanup_error"),
             "shutdown_unconfirmed": bool(task.get("shutdown_unconfirmed", False)),
             "activity": task.get("executor_activity", task.get("phase")), "visibility_reason": None, "runtime_partial": False}
@@ -1037,8 +1052,10 @@ class Runtime:
                     if current["attempts"] >= self.control.settings.max_attempts:
                         raise ValueError("Launch ceiling exhausted")
                     if current["executor"] == "claude":
-                        current["claude_baseline"] = current.get("claude_total", {"complete": not current["attempts"],
-                                                                                 "cost_complete": not current["attempts"]})
+                        current["claude_baseline"] = current.get("claude_total", {"schema_version": 1, "models": {},
+                            "complete": not current["attempts"], "cost_complete": not current["attempts"]})
+                        current.pop("executor_version", None)
+                        current.pop("claude_executable", None)
                     if current["executor"] == "codex":
                         current["codex_usage_baseline"] = current.get("codex_usage_total", {})
                         current["codex_baseline_complete"] = not current["attempts"] or current.get("usage_complete", False)
@@ -1049,6 +1066,10 @@ class Runtime:
                     for key in ("final_tree", "patch", "execution_outcome", "failure_reason", "exit_code", "last_event_at", "summary", "cost", "usage", "usage_complete", "cost_note", "cost_source", "executor_completed", "thread_observed", "executor_activity", "execution_error", "event_offset", "process", "phase", "phase_started_at"):
                         current.pop(key, None)
                 self.store.update(task_id, begin)
+                if task["executor"] == "claude":
+                    executable = resolve_executable(self.control.settings.claude_command, self.control.environment,
+                                                    Path(task["invocation"]["parent_worktree"]))
+                    self.store.update(task_id, lambda t: t.update(claude_executable=executable))
             else:
                 task = self.store.get(task_id)
                 phase = task["phase"]
@@ -1073,8 +1094,12 @@ class Runtime:
                     self.finish(task_id, outcome, reason, already_captured=phase == "capture")
                     return
             task = self.store.get(task_id)
+            if task["executor"] == "claude":
+                executable = task.get("claude_executable")
+                if not isinstance(executable, str) or not Path(executable).is_absolute() or recovered and not task.get("executor_version"):
+                    raise ValueError("Claude attempt lacks its inspected executable/version binding; refusing recovered launch")
             if task["executor"] == "claude" and not task.get("executor_version"):
-                result = self.phase(task_id, "version", [*self.control.settings.claude_command, "--version"],
+                result = self.phase(task_id, "version", [task["claude_executable"], "--version"],
                                     Path(task["invocation"]["parent_worktree"]))
                 task = self.store.get(task_id)
                 version = claude_version(Path(task["process"]["stdout"]), result["exit_code"])

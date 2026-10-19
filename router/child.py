@@ -8,7 +8,7 @@ import uuid
 from collections.abc import Callable
 from pathlib import Path
 
-from router.claude_executor import validate_command, validate_persistence
+from router.claude_executor import validate_persistence
 from router.config import Settings
 from router.process import creation_identity
 
@@ -63,9 +63,11 @@ def executor_command(settings: Settings, task: dict) -> list[str]:
         session = task.get("child_session_id")
         if not session:
             raise ValueError("Claude session ID unavailable; cannot resume or silently replace this child")
-        validate_command(settings.claude_command)
+        executable = task.get("claude_executable")
+        if not isinstance(executable, str) or not Path(executable).is_absolute() or not task.get("executor_version"):
+            raise ValueError("Claude attempt lacks an inspected executable/version binding; refusing unverified child")
         profile = task["permission_profile"]
-        return [*settings.claude_command, "--print", "--output-format", "stream-json", "--verbose",
+        return [executable, "--print", "--output-format", "stream-json", "--verbose",
                 "--safe-mode", "--setting-sources", "", "--permission-mode", "dontAsk", "--permission-prompts", "none",
                 "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}', "--disable-slash-commands",
                 "--tools", ",".join(profile["tools"]), "--settings", json.dumps({"permissions": {"allow": profile["allow"]}, "fallbackModel": [], "switchModelsOnFlag": False}),
