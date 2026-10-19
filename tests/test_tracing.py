@@ -131,6 +131,29 @@ class TracingTests(RuntimeHarness, unittest.TestCase):
         self.assertFalse(validated["tracing"]["available"])
         self.assertIn("credentials are unavailable", validated["tracing"]["reason"])
 
+    def test_remote_start_uses_serving_repository_tracing_selection(self):
+        config = self.configure("opencode")
+        config["tracing"] = "requested"
+        self.set_credentials(True)
+        task = {"task_id": "task-remote-traced", "parent_tracing_requested": True, "invocation": {
+            "executor": "opencode", "model": "test", "parent_repo": str(self.repo), "parent_worktree": str(self.repo)}}
+        validated = self.runtime.validate(task)
+        self.assertEqual(validated["tracing"], self.expected_tracing({**task, **validated}, True))
+
+    def test_remote_start_without_serving_selection_is_explicitly_unavailable(self):
+        for executor in ("opencode", "codex", "claude"):
+            with self.subTest(executor=executor):
+                config = self.configure(executor)
+                config.pop("tracing", None)
+                self.set_credentials(True)
+                task = {"task_id": f"task-remote-{executor}", "parent_tracing_requested": True, "invocation": {
+                    "executor": executor, "model": "test", "parent_repo": str(self.repo),
+                    "parent_worktree": str(self.repo)}}
+                tracing = self.runtime.validate(task)["tracing"]
+                self.assertEqual(tracing["requested"], True)
+                self.assertIs(tracing["available"], False)
+                self.assertIn("no tracing selection", tracing["reason"])
+
     def test_reloaded_repository_opt_out_disables_stale_tracing(self):
         config = self.configure("opencode")
         config["tracing"] = "requested"
