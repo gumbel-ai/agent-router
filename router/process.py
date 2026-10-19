@@ -68,16 +68,33 @@ def owned_state(record: dict) -> str:
     return "uncertain"
 
 
+def _unsignalable(record: dict) -> bool:
+    try:
+        os.killpg(record["pgid"], 0)
+    except PermissionError:
+        return True
+    except ProcessLookupError:
+        pass
+    return False
+
+
 def supervised_state(record: dict, process: subprocess.Popen | None) -> str:
     if process is not None:
         process.poll()
     state = owned_state(record)
+    if state == "uncertain" and process is not None and process.poll() is None and _unsignalable(record):
+        # Darwin skips zombie and exiting members when signalling a group, so a
+        # group whose leader is exiting reports EPERM before the leader becomes
+        # reapable. A live leader shares our credentials and is signalable, and
+        # while unreaped its PID and group cannot be reused: it is still owned.
+        return "exiting"
     if state == "uncertain" and process is not None:
-        # Exit can occur between poll() and the probe. On Darwin an exiting
-        # direct-child leader can yield EPERM until it becomes reapable. While
-        # unreaped, its PID and group cannot be reused, so it is still owned.
-        if process.poll() is None:
-            return "exiting"
+        # Exit can occur between poll() and the probe. On Darwin an unreaped
+        # direct-child leader can yield EPERM; reap it before judging liveness.
+        try:
+            process.wait(timeout=0.05)
+        except subprocess.TimeoutExpired:
+            return state
         state = owned_state(record)
     if state == "uncertain" and record.get("disposable") and Path(record["completion"]).exists():
         # The disposable gate kills its whole group after recording completion.

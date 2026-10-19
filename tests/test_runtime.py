@@ -104,17 +104,19 @@ class ExitingLeader:
             if timeout is not None and timeout < remaining:
                 time.sleep(timeout)
                 raise subprocess.TimeoutExpired("leader", timeout)
-            time.sleep(remaining)
+            time.sleep(max(0, remaining))
         return self.process.wait(timeout)
 
 
 def exiting_leaders(test):
-    """Patch the group probe so modeled leaders read as uncertain while exiting."""
-    leaders = {}
-    def probe(record):
-        leader = leaders.get(record["pid"])
-        return "uncertain" if leader is not None and leader.exiting() else owned_state(record)
-    patcher = patch("router.process.owned_state", side_effect=probe)
+    """Patch the group signal probe: Darwin reports EPERM for a group whose leader is exiting."""
+    leaders, killpg = {}, os.killpg
+    def probe(pgid, signal_number):
+        leader = leaders.get(pgid)
+        if signal_number == 0 and leader is not None and leader.exiting():
+            raise PermissionError(1, "Operation not permitted")
+        return killpg(pgid, signal_number)
+    patcher = patch("router.process.os.killpg", side_effect=probe)
     patcher.start()
     test.addCleanup(patcher.stop)
     return leaders
