@@ -123,7 +123,7 @@ class RemoteChildProtocolTests(unittest.TestCase):
                 pass
 
             def start(self, **_kwargs):
-                raise ValueError("request_id must be a bounded non-empty string")
+                raise failure
 
         def export(_root, _task_id, artifact, _paths):
             artifact.mkdir(parents=True)
@@ -133,9 +133,21 @@ class RemoteChildProtocolTests(unittest.TestCase):
         runtime = Runtime.__new__(Runtime)
         runtime.store = Store()
         config = SimpleNamespace(hosts=(FleetHost("worker", "ssh", target="example"),), ssh_timeout_seconds=1)
-        with patch("router.fleet.load_fleet_config", return_value=config), \
-                patch("router.remote_child.RemoteChildTransport", Transport), \
-                patch("router.remote_snapshot.export_snapshot", export):
+        for failure in (ValueError("request_id must be a bounded non-empty string"),
+                        remote_child.RemoteChildError("spawn_failed", "no ssh")):
+            task.update(status="preparing", execution_stopped=True)
+            artifact = directory / "remote-snapshot"
+            if artifact.exists():
+                (artifact / "snapshot.bundle").unlink()
+                artifact.rmdir()
+            with patch("router.fleet.load_fleet_config", return_value=config), \
+                    patch("router.remote_child.RemoteChildTransport", Transport), \
+                    patch("router.remote_snapshot.export_snapshot", export):
+                runtime.execute_remote("task-a")
+            self.assertEqual(task["status"], "failed")
+            self.assertTrue(task["execution_stopped"])
+        task.update(status="preparing", execution_stopped=True)
+        with patch("router.fleet.load_fleet_config", side_effect=ValueError("Invalid fleet TOML")):
             runtime.execute_remote("task-a")
         self.assertEqual(task["status"], "failed")
         self.assertTrue(task["execution_stopped"])

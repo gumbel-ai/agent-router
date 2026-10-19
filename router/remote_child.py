@@ -224,7 +224,7 @@ def _exchange(host: FleetHost, timeout: float, operation: str, payload: dict) ->
                 elif len(diagnostic) < 65536:
                     diagnostic.extend(chunk[:65536 - len(diagnostic)])
         process.wait(timeout=max(.001, deadline - time.monotonic()))
-        completed = True
+        completed = process.returncode == 0  # failed exits still clean up the owned group
     except RemoteChildError:
         raise
     except (OSError, subprocess.TimeoutExpired) as error:

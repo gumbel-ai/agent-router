@@ -799,7 +799,8 @@ class Controller:
                 if task.get("remote_host"):
                     self.forward_remote(task, operation, payload)
                 task.update(cancel_requested=True, cancel_requested_at=now_ms())
-                if task["status"] in {"created", "retrying", "awaiting_review", "blocked", "failed", "cancelled"} and task["execution_stopped"]:
+                if task["status"] in {"created", "retrying", "awaiting_review", "blocked", "failed", "cancelled"} and task["execution_stopped"] \
+                        and not task.get("remote_task_id"):  # a sent remote task waits for remote confirmation
                     task["status"] = "cancelled"
                 else:
                     task["status"] = "cancelling"
@@ -1114,6 +1115,15 @@ class Runtime:
                 # user/plugin configuration disabled, so credentials are stripped.
                 tracing = {"tracing": {"requested": True, "available": False,
                                         "reason": TRACING_UNAVAILABLE[executor]}}
+        credential_file = Path(self.control.environment.get("AGENT_ROUTER_ENV_FILE", "~/.agent-router/.env")).expanduser().resolve()
+        if credential_file.is_relative_to(root):
+            relative = str(credential_file.relative_to(root))
+            if git(root, "ls-files", "--", relative).strip():
+                raise ValueError("The provider env file must not be tracked")
+            ignored = subprocess.run(["git", "-C", str(root), "check-ignore", "--quiet", "--", relative],
+                                     env=strip_langfuse_environment(os.environ), check=False)
+            if ignored.returncode != 0:
+                raise ValueError("The provider env file must be ignored when inside the repository")
         if invocation.get("host"):
             from router.fleet import DEFAULT_CONFIG, load_fleet_config
             hosts = [host for host in load_fleet_config(DEFAULT_CONFIG).hosts if host.name == invocation["host"]]
@@ -1132,15 +1142,6 @@ class Runtime:
                 raise ValueError("Project requires an explicit Codex sandbox; run router init --executor codex")
             if not model.startswith("openai/") or not model.removeprefix("openai/").strip():
                 raise ValueError("Codex requires an exact openai/model ID; no provider fallback")
-        credential_file = Path(self.control.environment.get("AGENT_ROUTER_ENV_FILE", "~/.agent-router/.env")).expanduser().resolve()
-        if credential_file.is_relative_to(root):
-            relative = str(credential_file.relative_to(root))
-            if git(root, "ls-files", "--", relative).strip():
-                raise ValueError("The provider env file must not be tracked")
-            ignored = subprocess.run(["git", "-C", str(root), "check-ignore", "--quiet", "--", relative],
-                                     env=strip_langfuse_environment(os.environ), check=False)
-            if ignored.returncode != 0:
-                raise ValueError("The provider env file must be ignored when inside the repository")
         if executor == "claude":
             validate_command(self.control.settings.claude_command)
             validate_persistence(self.control.environment)
@@ -1488,9 +1489,18 @@ class Runtime:
 
         task = self.store.get(task_id)
         invocation = task["invocation"]
-        config = load_fleet_config(DEFAULT_CONFIG)
-        hosts = [host for host in config.hosts if host.name == task["remote_host"]]
+        try:
+            config = load_fleet_config(DEFAULT_CONFIG)
+            hosts = [host for host in config.hosts if host.name == task["remote_host"]]
+        except ValueError:
+            hosts = []
         if len(hosts) != 1:
+            if not task.get("remote_task_id") and task["execution_stopped"]:
+                # Known-unsent start: nothing can be running remotely.
+                self.store.update_with_attempt(task_id, lambda current: current.update(
+                    status="cancelled" if current.get("cancel_requested") else "failed", execution_stopped=True,
+                    failure_reason="Remote host configuration is unavailable; start was not sent"))
+                return
             self.store.update_with_attempt(task_id, lambda current: current.update(
                 status="interrupted", execution_stopped=False,
                 failure_reason="Remote host configuration is unavailable; execution outcome is unknown"))
@@ -1518,8 +1528,13 @@ class Runtime:
                                              invocation=invocation, resolved_model=task["resolved_model"],
                                              remote_repo=task["remote_repo"], remote_worktree=task["remote_worktree"],
                                              snapshot_receipt=receipt, snapshot_bundle=bundle)
-                except RemoteChildError:
-                    raise
+                except RemoteChildError as error:
+                    if error.code != "spawn_failed":
+                        raise
+                    # SSH never started, so nothing was sent.
+                    self.store.update_with_attempt(task_id, lambda current: current.update(
+                        status="failed", execution_stopped=True, failure_reason="Remote transport could not start"))
+                    return
                 except ValueError as error:
                     # Plain ValueError is raised only before SSH is spawned: nothing was sent.
                     reason = f"Remote start refused before sending: {error}"
