@@ -271,6 +271,7 @@ def main() -> None:
     run.add_argument("--label", help="Short name shown in status and fleet views")
     run.add_argument("--session", help="Launching Claude Code or Codex session ID")
     run.add_argument("--agent", help="Launching agent ID (with --session: exact attribution)")
+    run.add_argument("--work-item-id", help="Explicit caller work-item identity; never inferred from the label")
     run.add_argument("argv", nargs=argparse.REMAINDER, help="-- command [arguments]")
     wait = commands.add_parser("wait", help="Wait for the oldest unacknowledged managed-command completion")
     wait.add_argument("--consumer", required=True)
@@ -400,7 +401,7 @@ def main() -> None:
         elif args.command == "run":
             from router.managed import run as run_managed
             argv = args.argv[1:] if args.argv[:1] == ["--"] else args.argv
-            sys.exit(run_managed(argv, args.label, args.session, args.agent, state_dir()))
+            sys.exit(run_managed(argv, args.label, args.session, args.agent, state_dir(), work_item_id=args.work_item_id))
         elif args.command == "wait":
             from router.managed import wait as wait_managed
             failure_code = 1

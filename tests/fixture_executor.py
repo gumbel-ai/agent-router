@@ -8,6 +8,25 @@ import sys
 import time
 from pathlib import Path
 
+
+def publish_pid(path, pid):
+    temporary = path.with_suffix(".tmp")
+    gate = os.environ.get("ROUTER_FIXTURE_PID_GATE")
+    with temporary.open("w") as stream:
+        if gate:
+            gate = Path(gate)
+            (gate / (path.name + ".pending")).touch()
+            deadline = time.monotonic() + 15
+            while not (gate / "release").exists():
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("fixture PID publication was not released")
+                time.sleep(.02)
+        json.dump(pid, stream)
+    temporary.replace(path)
+    if gate:
+        (gate / (path.name + ".published")).touch()
+
+
 if sys.argv[1:] == ["--version"]:
     version_directory = os.environ.get("ROUTER_FIXTURE_VERSION_DIRECTORY")
     if version_directory:
@@ -17,10 +36,19 @@ if sys.argv[1:] == ["--version"]:
         helper = subprocess.Popen([sys.executable, "-c",
                                    ("import signal,time,sys; from pathlib import Path; "
                                     "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
-                                    "Path(sys.argv[1]).touch(); time.sleep(60)"), str(ready)])
-        while not ready.exists():
-            time.sleep(.04)
-        Path(version_directory, "helper.pid").write_text(str(helper.pid))
+                                    "Path(sys.argv[1]).touch(); deadline=time.monotonic()+60; "
+                                    "exec('while not Path(sys.argv[2]).exists() and time.monotonic()<deadline: time.sleep(.02)')"),
+                                   str(ready), str(Path(version_directory, "helper.stop"))])
+        published = False
+        try:
+            while not ready.exists():
+                time.sleep(.04)
+            publish_pid(Path(version_directory, "helper.pid"), helper.pid)
+            published = True
+        finally:
+            if not published and helper.poll() is None:
+                helper.kill()
+                helper.wait(timeout=5)
         if os.environ.get("ROUTER_FIXTURE_VERSION_MODE") == "wait":
             while not Path(version_directory, "release").exists():
                 time.sleep(.04)
@@ -60,11 +88,19 @@ previous.setdefault("commands", []).append(sys.argv[1:])
 if not persistence_disabled:
     record.write_text(json.dumps(previous))
 Path("result.txt").write_text("corrected\n" if "Parent feedback" in prompt else "first\n")
+initialization_gate = os.environ.get("ROUTER_FIXTURE_INITIALIZATION_GATE")
+if initialization_gate:
+    initialization_gate = Path(initialization_gate)
+    (initialization_gate / "pending").touch()
+    deadline = time.monotonic() + 15
+    while not (initialization_gate / "release").exists():
+        if time.monotonic() >= deadline:
+            raise TimeoutError("fixture initialization was not released")
+        time.sleep(.02)
 if codex or claude:
     if "ignore interrupt" in prompt:
         signal.signal(signal.SIGINT, signal.SIG_IGN)
         signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
-        Path("interrupt-ready").touch()
     else:
         signal.signal(signal.SIGINT, interrupt)
 if claude:
@@ -78,9 +114,21 @@ if Path(".venv/bin/python").exists():
     subprocess.run([str(Path(".venv/bin/python").absolute()), "-m", "unittest", "discover", "-s", "tests"], check=True)
 if "hang" in prompt:
     separate_group = claude or codex and "ignore interrupt" not in prompt
-    sleeper = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"], start_new_session=separate_group)
-    if separate_group:
-        Path("sleeper.pid").write_text(str(sleeper.pid))
+    published = False
+    try:
+        sleeper = subprocess.Popen([sys.executable, "-c",
+                                    ("import time; from pathlib import Path; deadline=time.monotonic()+60; "
+                                     "exec('while not Path(\"foreground.stop\").exists() and time.monotonic()<deadline: time.sleep(.02)')")],
+                                   start_new_session=separate_group)
+        if separate_group:
+            publish_pid(Path("sleeper.pid"), sleeper.pid)
+        published = True
+    finally:
+        if not published and sleeper is not None and sleeper.poll() is None:
+            sleeper.terminate()
+            sleeper.wait(timeout=5)
+    if "ignore interrupt" in prompt:
+        Path("interrupt-ready").touch()
     if "crash" in prompt:
         os.kill(os.getpid(), signal.SIGKILL)
     if "silent" not in prompt:

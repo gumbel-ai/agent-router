@@ -30,6 +30,7 @@ from router.client import CompletionRefused
 from router.codex import collect as collect_codex
 from router.codex import price_metadata
 from router.config import Settings
+from router.correlation import identifier as correlation_identifier
 from router.db import Store, now_ms
 from router.dispatch import MUTATIONS, canonical
 from router.fleet_snapshot import AlertHistory
@@ -593,6 +594,8 @@ class Controller:
                         "executor": payload["executor"], "requested_model": payload["model"],
                         "review_history": [], "created_at": now_ms(), "execution_stopped": True,
                         "max_attempts": self.settings.max_attempts}
+                if "work_item_id" in payload:
+                    task["work_item_id"] = payload["work_item_id"]
             elif operation == "review":
                 self.review(task, payload)
             elif operation == "cancel":
@@ -614,11 +617,13 @@ class Controller:
 
     @staticmethod
     def envelope(payload: dict) -> None:
-        allowed = {"request_version", "request_id", "instruction_id", "executor", "model", "task", "parent_repo", "parent_worktree", "mode", "context"}
+        allowed = {"request_version", "request_id", "instruction_id", "executor", "model", "task", "parent_repo", "parent_worktree", "mode", "context", "work_item_id"}
         if set(payload) - allowed:
             raise ValueError("Unknown invocation field; operator limits are not task inputs")
-        for key in allowed - {"context"}:
+        for key in allowed - {"context", "work_item_id"}:
             required_text(payload, key)
+        if "work_item_id" in payload:
+            correlation_identifier(payload["work_item_id"], "work_item_id")
         if payload["request_version"] != "1" or payload["mode"] != "write":
             raise ValueError("Only request_version 1 and write mode are supported")
         if any(not Path(payload[key]).is_absolute() for key in ("parent_repo", "parent_worktree")):
@@ -693,7 +698,7 @@ class Controller:
             tasks = [task for task in tasks if task["status"] in DECISIONS or task.get("cleanup_error") is not None or
                      (task["status"] == "awaiting_review" and task["attempts"] >= self.settings.max_attempts)]
         keys = {"task_id", "status", "attempts", "review_retries", "continuations", "last_event_at",
-                "executor", "requested_model", "resolved_model", "failure_reason", "execution_outcome", "max_attempts", "worktree"}
+                "executor", "requested_model", "resolved_model", "failure_reason", "execution_outcome", "max_attempts", "worktree", "work_item_id"}
         rows = []
         for task in tasks:
             row = {key: value for key, value in task.items() if key in keys}
@@ -746,6 +751,7 @@ class Controller:
                 "last_event_at": task["updated_at"], "cleanup_pending": view["cleanup_pending"],
                 "cleanup_failed": task.get("cleanup_error") is not None,
                 "shutdown_unconfirmed": view["shutdown_unconfirmed"],
+                **({"work_item_id": task["work_item_id"]} if "work_item_id" in task else {}),
             })
         return records
 

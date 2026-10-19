@@ -401,6 +401,10 @@ item before requesting review.
 - A disappeared process can raise `ProcessLookupError` when signaled or
   `FileNotFoundError` when reading Linux `/proc`. Cleanup must handle both while
   preserving ownership checks and surfacing permission or malformed-state errors.
+- Publish fixture PID payloads atomically, after signal handlers and foreground
+  groups are initialized. Output/session files are not readiness. Register cleanup
+  before publication, PID parsing, identity probes and group assertions; cleanup
+  must also account for foreground groups outside the launcher group.
 - Keep failure state independent of diagnostic text. An exception or sanitized stderr
   can have an empty message; it must still trigger failed delivery and owned-process
   cleanup, with a nonempty diagnostic fallback.

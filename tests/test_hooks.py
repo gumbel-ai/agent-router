@@ -32,23 +32,27 @@ class HookTests(TransportHarness, unittest.TestCase):
         return value
 
     def test_offline_submission_and_nonliteral_dispatch(self):
-        event = {"session_id": "host", "prompt_id": "turn", "cwd": str(self.repo), "prompt": "never persist this body"}
-        unconfigured = {**event, "session_id": "unconfigured", "cwd": str(self.root / "other-project")}
-        self.assertEqual(self.hook(unconfigured, "submit"), {})
-        self.assertEqual(request("submit", {"session_id": "unconfigured", "prompt_id": "turn",
-                                           "cwd": unconfigured["cwd"]}, self.endpoint), {"instruction_id": None})
-        submission = self.hook(event, "submit")
-        self.assertIn("ROUTER_INSTRUCTION_ID=", submission["hookSpecificOutput"]["additionalContext"])
-        ordinary = self.hook({**event, "tool_name": "Bash", "tool_input": {"command": "git status"}}, "authorize")
-        self.assertEqual(ordinary, {})
-        refused = self.hook({**event, "tool_name": "Bash", "tool_input": {
-            "command": 'router start --json "{\\"task\\":\\"$(printf changed)\\"}"'}}, "authorize")
-        self.assertEqual(refused["hookSpecificOutput"]["permissionDecision"], "deny")
+        for source, prompt_key, prefix in (("claude", "prompt_id", ""), ("codex", "turn_id", "codex-")):
+            with self.subTest(source=source):
+                event = {"session_id": source + "-host", prompt_key: "turn", "cwd": str(self.repo),
+                         "hook_event_name": "UserPromptSubmit", "prompt": "never persist this body"}
+                unconfigured = {**event, "session_id": source + "-unconfigured", "cwd": str(self.root / "other-project")}
+                self.assertEqual(self.hook(unconfigured, prefix + "submit"), {})
+                self.assertEqual(request("submit", {"session_id": unconfigured["session_id"], "prompt_id": "turn",
+                                                   "cwd": unconfigured["cwd"]}, self.endpoint), {"instruction_id": None})
+                submission = self.hook(event, prefix + "submit")
+                self.assertIn("ROUTER_INSTRUCTION_ID=", submission["hookSpecificOutput"]["additionalContext"])
+                shell = {**event, "hook_event_name": "PreToolUse", "tool_name": "Bash"}
+                self.assertEqual(self.hook({**shell, "tool_input": {"command": "git status"}}, prefix + "authorize"), {})
+                refused = self.hook({**shell, "tool_input": {
+                    "command": 'router start --json "{\\"task\\":\\"$(printf changed)\\"}"'}}, prefix + "authorize")
+                self.assertEqual(refused["hookSpecificOutput"]["permissionDecision"], "deny")
         request("daemon_stop", {}, self.endpoint)
         self.daemons[-1].wait(timeout=15)
-        offline = self.hook(event, "submit")
-        self.assertEqual(offline, {})
-        self.assertEqual(self.hook(unconfigured, "submit"), {})
+        for prompt_key, prefix in (("prompt_id", ""), ("turn_id", "codex-")):
+            event = {"session_id": "offline", prompt_key: "turn", "cwd": str(self.repo), "hook_event_name": "UserPromptSubmit"}
+            self.assertEqual(self.hook(event, prefix + "submit"), {})
+            self.assertEqual(self.hook({**event, "cwd": str(self.root / "other-project")}, prefix + "submit"), {})
 
     def test_native_hooks_preserve_parent_and_allow_offline_native_work(self):
         event = {"session_id": "native-host", "prompt_id": "turn", "cwd": str(self.repo),
@@ -127,13 +131,37 @@ class HookTests(TransportHarness, unittest.TestCase):
 
     def test_locked_observation_database_is_best_effort_and_fast(self):
         database = self.root / "state" / "router.sqlite3"
-        with closing(sqlite3.connect(database, timeout=.1)) as locked, locked:
-            locked.execute("BEGIN IMMEDIATE")
-            started = time.monotonic()
-            self.assertEqual(self.hook({"hook_event_name": "SessionStart", "session_id": "locked",
-                                        "cwd": str(self.repo)}, "observe"), {})
-            elapsed = time.monotonic() - started
-        self.assertLess(elapsed, .3)
+        ready = self.root / "observer.ready"
+        command = [sys.executable, "-c", ("from pathlib import Path\n"
+                   "from router.observer_hook import main\n"
+                   f"Path({str(ready)!r}).touch()\nmain()\n")]
+        startup = time.monotonic()
+        process = subprocess.Popen(command, env=self.environment, stdin=subprocess.PIPE,
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        try:
+            # Measure hook handling under contention separately from interpreter startup/imports.
+            deadline = time.monotonic() + 15
+            while not ready.exists() and time.monotonic() < deadline:
+                if process.poll() is not None:
+                    output, error = process.communicate(timeout=15)
+                    self.fail(f"Observer exited before readiness: {process.returncode}; {output!r}; {error!r}")
+                time.sleep(.01)
+            self.assertTrue(ready.exists(), "Observer did not become ready within 15 seconds")
+            startup = time.monotonic() - startup
+            with closing(sqlite3.connect(database, timeout=.1)) as locked, locked:
+                locked.execute("BEGIN IMMEDIATE")
+                started = time.monotonic()
+                output, error = process.communicate(json.dumps({
+                    "hook_event_name": "SessionStart", "session_id": "locked", "cwd": str(self.repo),
+                }), timeout=15)
+                self.assertEqual(process.returncode, 0, error)
+                self.assertEqual(json.loads(output), {})
+                elapsed = time.monotonic() - started
+            self.assertLess(elapsed, .3, f"Observer handling: {elapsed:.3f}s; startup: {startup:.3f}s")
+        finally:
+            if process.poll() is None:
+                process.kill()
+            process.communicate(timeout=15)
         deadline = time.monotonic() + 2
         while time.monotonic() < deadline:
             if "locked" in {item["session_id"] for item in request("snapshot", {}, self.endpoint)["sessions"]}:

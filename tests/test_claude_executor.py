@@ -11,9 +11,10 @@ import tempfile
 import threading
 import time
 import unittest
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from test_runtime import RuntimeHarness
 
@@ -22,7 +23,7 @@ from router.child import child_environment, executor_command
 from router.claude_executor import collect
 from router.daemon import Controller, PhaseStopped, Runtime, public, visibility
 from router.db import Store
-from router.process import creation_identity, owned_state
+from router.process import creation_identity, owned_state, stop_owned
 from router.validation import MAX_WIRE_INTEGER
 
 MODEL = "anthropic/claude-sonnet-4-6"
@@ -38,6 +39,98 @@ class ClaudeExecutorTests(RuntimeHarness, unittest.TestCase):
         self.config.claude_command = [str(wrapper)]
         self.config.models["test"] = MODEL
         self.config.repositories[str(self.repo.resolve())]["claude_permissions"] = json.dumps(PROFILE)
+
+    def fixture_marker(self, path):
+        deadline = time.monotonic() + 15
+        while not path.exists() and time.monotonic() < deadline:
+            time.sleep(.04)
+        self.assertTrue(path.exists(), f"Fixture did not publish {path.name}")
+
+    def fixture_pid(self, path, ownership):
+        self.fixture_marker(path)
+        pid = json.loads(path.read_text())
+        self.assertIs(type(pid), int)
+        self.assertGreater(pid, 0)
+        ownership["pid"] = pid
+        ownership["identity"] = creation_identity(pid)
+        self.assertEqual(os.getpgid(pid), ownership.get("pgid", pid))
+        return pid, ownership["identity"]
+
+    @contextmanager
+    def fixture_cleanup(self, directory=None):
+        ownership = {}
+        completed = cleaned = False
+        gate = self.control.environment.get("ROUTER_FIXTURE_PID_GATE")
+        initialization_gate = self.control.environment.get("ROUTER_FIXTURE_INITIALIZATION_GATE")
+
+        def cleanup():
+            nonlocal cleaned
+            if cleaned:
+                return
+            task = self.control.store.get(ownership["task_id"]) if "task_id" in ownership else {}
+            worktree = Path(task["worktree"]) if task.get("worktree") else None
+            pid_file = directory / "helper.pid" if directory is not None else worktree / "sleeper.pid" if worktree else None
+            record = task.get("process")
+            with self.runtime.lock:
+                process = self.runtime.processes.get(task.get("task_id"))
+            try:
+                if gate and pid_file and (Path(gate) / (pid_file.name + ".pending")).exists():
+                    (Path(gate) / "release").touch()
+                    self.fixture_marker(Path(gate) / (pid_file.name + ".published"))
+                if pid_file and pid_file.exists() and "identity" not in ownership:
+                    if directory is not None and record:
+                        ownership["pgid"] = record["pgid"]
+                    try:
+                        self.fixture_pid(pid_file, ownership)
+                    except (ProcessLookupError, FileNotFoundError):
+                        pass
+            finally:
+                # Persistent release also covers failures before PID/identity acquisition.
+                if initialization_gate:
+                    (Path(initialization_gate) / "release").touch()
+                if directory is not None:
+                    (directory / "helper.stop").touch()
+                if worktree is not None and directory is None:
+                    (worktree / "foreground.stop").touch()
+                if not completed:
+                    self.runtime.stop()
+                if record and owned_state(record) == "live":
+                    stop_owned(record, process if process is not None and process.pid == record["pid"] else None)
+                if process is not None:
+                    process.wait(timeout=5)
+            if "identity" in ownership:
+                pid = ownership["pid"]
+                try:
+                    if creation_identity(pid) == ownership["identity"]:
+                        if directory is None:
+                            self.assertEqual(os.getpgid(pid), pid)
+                            os.killpg(pid, signal.SIGTERM)
+                        else:
+                            os.kill(pid, signal.SIGKILL)
+                except (ProcessLookupError, FileNotFoundError):
+                    pass
+                deadline = time.monotonic() + 15
+                while time.monotonic() < deadline:
+                    try:
+                        os.kill(pid, 0)
+                    except ProcessLookupError:
+                        break
+                    time.sleep(.04)
+                else:
+                    self.fail("Owned fixture did not stop after inspection cleanup")
+            if record:
+                deadline = time.monotonic() + 15
+                while owned_state(record) != "stopped" and time.monotonic() < deadline:
+                    time.sleep(.04)
+                self.assertEqual(owned_state(record), "stopped", "Owned fixture group survived cleanup")
+            cleaned = True
+
+        self.addCleanup(cleanup)  # Rescue an isolated cleanup reversal after its failure assertion.
+        try:
+            yield ownership
+            completed = True
+        finally:
+            cleanup()
 
     def test_fresh_and_resumed_child_preserve_model_worktree_and_accounting(self):
         self.enable()
@@ -127,21 +220,30 @@ class ClaudeExecutorTests(RuntimeHarness, unittest.TestCase):
 
     def test_timeout_keeps_the_owned_worktree_without_relaunch(self):
         self.enable()
-        task_id = self.start("silent hang", executor="claude")
-        running = self.wait(task_id, {"running"})
-        result_path = Path(running["worktree"]) / "result.txt"
-        deadline = time.monotonic() + 15
-        while not result_path.exists() and time.monotonic() < deadline:
-            time.sleep(.04)
-        self.assertTrue(result_path.exists(), "Child did not publish its ready work")
-        # Expire an already-running child; interpreter/Git startup is not the deadline under test.
-        with patch("router.daemon.now_ms", return_value=running["deadline_at"] + 1):
-            task = self.wait(task_id, {"failed", "interrupted"})
-        self.assertEqual(task["status"], "failed", task)
-        self.assertEqual(task["failure_reason"], "router-timeout")
-        self.assertTrue(task["execution_stopped"])
-        self.assertEqual(task["attempts"], 1)
-        self.assertEqual((Path(task["worktree"]) / "result.txt").read_text(), "first\n")
+        gate = self.root / "initialization"
+        gate.mkdir()
+        self.control.environment["ROUTER_FIXTURE_INITIALIZATION_GATE"] = str(gate)
+        with self.fixture_cleanup() as ownership:
+            task_id = ownership["task_id"] = self.start("silent hang", executor="claude")
+            running = self.wait(task_id, {"running"})
+            self.fixture_marker(gate / "pending")
+            self.assertTrue((Path(running["worktree"]) / "result.txt").exists())
+            ready_pid = self.fixture_pid
+            def release_initialization(path, owner):
+                (gate / "release").touch()
+                return ready_pid(path, owner)
+            with patch.object(self, "fixture_pid", side_effect=release_initialization):
+                pid, _ = self.fixture_pid(Path(running["worktree"]) / "sleeper.pid", ownership)
+            # PID publication follows handler installation and foreground group creation.
+            with patch("router.daemon.now_ms", return_value=running["deadline_at"] + 1):
+                task = self.wait(task_id, {"failed", "interrupted"})
+            self.assertEqual(task["status"], "failed", task)
+            self.assertEqual(task["failure_reason"], "router-timeout")
+            self.assertTrue(task["execution_stopped"])
+            self.assertEqual(task["attempts"], 1)
+            self.assertEqual((Path(task["worktree"]) / "result.txt").read_text(), "first\n")
+            with self.assertRaises(ProcessLookupError):
+                os.kill(pid, 0)
 
     def test_phase_deadlines_are_enforced_before_gate_release(self):
         base = int(time.time() * 1000) - 20_000
@@ -193,32 +295,55 @@ class ClaudeExecutorTests(RuntimeHarness, unittest.TestCase):
         probe = patch("router.process.owned_state", side_effect=finishing_group)
         probe.start()
         self.addCleanup(probe.stop)
-        for index, outcome in enumerate(("invalid", "success", "deadline", "cancel", "restart")):
+        outcomes = ("invalid", "success", "deadline", "cancel", "restart", "read-failure", "identity-failure", "group-failure")
+        for index, outcome in enumerate(outcomes):
             with self.subTest(outcome=outcome):
                 directory = self.root / f"version-{index}"
                 directory.mkdir()
                 self.control.environment.update(ROUTER_FIXTURE_VERSION_DIRECTORY=str(directory),
                                                 ROUTER_FIXTURE_VERSION_MODE="wait",
                                                 ROUTER_FIXTURE_CLAUDE_VERSION="invalid" if outcome == "invalid" else "2.1.303")
-                if outcome == "restart":
-                    with patch.object(self.runtime, "observe", side_effect=SystemExit("synthetic daemon loss")):
-                        task_id = self.start("must not launch", f"wrapper-{index}", executor="claude")
-                        deadline = time.monotonic() + 15
-                        while time.monotonic() < deadline:
-                            task = self.control.store.get(task_id)
-                            if task.get("phase") == "version" and task_id not in self.runtime.workers:
-                                break
-                            time.sleep(.04)
-                else:
-                    task_id = self.start("must not launch", f"wrapper-{index}", executor="claude")
-                deadline = time.monotonic() + 15
-                while not (directory / "helper.pid").exists() and time.monotonic() < deadline:
-                    time.sleep(.04)
-                self.assertTrue((directory / "helper.pid").exists())
-                pid = int((directory / "helper.pid").read_text())
-                identity = creation_identity(pid)
-                try:
+                expected = {"read-failure": OSError("injected PID read failure"),
+                            "identity-failure": PermissionError("injected identity failure"),
+                            "group-failure": AssertionError("injected group failure")}
+                fault = outcome in expected
+                sentinel = expected[outcome] if fault else None
+                if fault:
+                    gate = directory / "publication"
+                    gate.mkdir()
+                    self.control.environment["ROUTER_FIXTURE_PID_GATE"] = str(gate)
+                reached = False
+                with (self.assertRaises(type(sentinel)) if fault else nullcontext()) as caught, self.fixture_cleanup(directory) as ownership:
+                    if outcome in {"restart", "read-failure", "identity-failure", "group-failure"}:
+                        with patch.object(self.runtime, "observe", side_effect=SystemExit("synthetic daemon loss")):
+                            task_id = ownership["task_id"] = self.start("must not launch", f"wrapper-{index}", executor="claude")
+                            deadline = time.monotonic() + 15
+                            while time.monotonic() < deadline:
+                                task = self.control.store.get(task_id)
+                                if task.get("phase") == "version" and task_id not in self.runtime.workers:
+                                    break
+                                time.sleep(.04)
+                    else:
+                        task_id = ownership["task_id"] = self.start("must not launch", f"wrapper-{index}", executor="claude")
+                    if fault:
+                        self.fixture_marker(gate / "helper.pid.pending")
+                        self.assertFalse((directory / "helper.pid").exists(), "PID became visible before publication completed")
+                        (gate / "release").touch()
+                        self.fixture_marker(gate / "helper.pid.published")
+                    self.fixture_marker(directory / "helper.pid")
                     task = self.control.store.get(task_id)
+                    ownership["pgid"] = task["process"]["pgid"]
+                    failure = (patch.object(self, "fixture_pid", side_effect=sentinel)
+                               if outcome == "read-failure" else
+                               patch("test_claude_executor.creation_identity", side_effect=sentinel)
+                               if outcome == "identity-failure" else
+                               patch("test_claude_executor.os", SimpleNamespace(getpgid=Mock(side_effect=sentinel)))
+                               if outcome == "group-failure" else nullcontext())
+                    reached = True
+                    with failure:
+                        pid, _ = self.fixture_pid(directory / "helper.pid", ownership)
+                    if fault:
+                        self.fail("Injected fixture acquisition failure was not raised")
                     self.assertEqual(task["phase"], "version", task)
                     self.assertFalse(task["execution_stopped"])
                     self.assertEqual(task["attempts"], 0)
@@ -261,32 +386,61 @@ class ClaudeExecutorTests(RuntimeHarness, unittest.TestCase):
                         os.kill(pid, 0)
                     self.assertTrue(task["execution_stopped"], task)
                     self.assertEqual((directory / "launches").read_text().splitlines(), ["version"])
-                finally:
-                    try:
-                        if creation_identity(pid) == identity:
-                            os.kill(pid, signal.SIGKILL)
-                    except (ProcessLookupError, FileNotFoundError):
-                        pass
+                if fault:
+                    self.assertIs(caught.exception, sentinel)
+                    self.assertTrue(reached, "Startup failed before the injected acquisition boundary")
+                    self.assertIn("identity", ownership, "Cleanup did not recover the fixture's creation identity")
+                    self.assertEqual(owned_state(task["process"]), "stopped")
+                    self.runtime = Runtime(self.control)
+                    self.runtime.start()
+                    self.addCleanup(self.runtime.stop)
                 self.control.environment.pop("ROUTER_FIXTURE_VERSION_DIRECTORY")
+                self.control.environment.pop("ROUTER_FIXTURE_PID_GATE", None)
 
     def test_unconfirmed_foreground_shutdown_reserves_capacity_across_restart(self):
         self.enable()
         self.config.concurrency_cap = 1
-        for index, prompt in enumerate(("crash hang", "ignore interrupt hang")):
-            with self.subTest(prompt=prompt):
-                task_id = self.start(prompt, f"foreground-{index}", executor="claude")
-                deadline = time.monotonic() + 15
-                while time.monotonic() < deadline:
-                    task = self.control.store.get(task_id)
-                    pid_file = Path(task["worktree"]) / "sleeper.pid" if task.get("worktree") else None
-                    if pid_file and pid_file.exists():
-                        break
-                    time.sleep(.04)
-                self.assertTrue(pid_file and pid_file.exists(), task)
-                pid = int(pid_file.read_text())
-                identity = creation_identity(pid)
-                self.assertEqual(os.getpgid(pid), pid)
-                try:
+        cases = [("crash hang", None), ("ignore interrupt hang", None)]
+        cases += [("crash hang", fault) for fault in ("read", "identity", "group")]
+        for index, (prompt, fault) in enumerate(cases):
+            with self.subTest(prompt=prompt, fault=fault):
+                if fault:
+                    gate = self.root / f"foreground-publication-{index}"
+                    gate.mkdir()
+                    self.control.environment["ROUTER_FIXTURE_PID_GATE"] = str(gate)
+                expected = {"read": OSError("injected PID read failure"),
+                            "identity": PermissionError("injected identity failure"),
+                            "group": AssertionError("injected group failure")}
+                sentinel = expected[fault] if fault else None
+                reached = False
+                with (self.assertRaises(type(sentinel)) if fault else nullcontext()) as caught, self.fixture_cleanup() as ownership:
+                    task_id = ownership["task_id"] = self.start(prompt, f"foreground-{index}", executor="claude")
+                    deadline = time.monotonic() + 15
+                    while time.monotonic() < deadline:
+                        task = self.control.store.get(task_id)
+                        pid_file = Path(task["worktree"]) / "sleeper.pid" if task.get("worktree") else None
+                        if pid_file and ((gate / "sleeper.pid.pending").exists() if fault else pid_file.exists()):
+                            break
+                        time.sleep(.04)
+                    self.assertTrue(pid_file and task.get("worktree"), task)
+                    if fault:
+                        self.fixture_marker(gate / "sleeper.pid.pending")
+                        self.assertFalse(pid_file.exists(), "PID became visible before publication completed")
+                        (gate / "release").touch()
+                        self.fixture_marker(gate / "sleeper.pid.published")
+                    if fault:
+                        task = self.wait(task_id, {"interrupted"})
+                    failure = (patch.object(self, "fixture_pid", side_effect=sentinel)
+                               if fault == "read" else
+                               patch("test_claude_executor.creation_identity", side_effect=sentinel)
+                               if fault == "identity" else
+                               patch("test_claude_executor.os", SimpleNamespace(getpgid=Mock(side_effect=sentinel)))
+                               if fault == "group" else nullcontext())
+                    reached = True
+                    with failure:
+                        pid, identity = self.fixture_pid(pid_file, ownership)
+                    if fault:
+                        self.fail("Injected fixture acquisition failure was not raised")
                     if "ignore interrupt" in prompt:
                         with patch("router.daemon.now_ms", return_value=task["deadline_at"] + 1):
                             task = self.wait(task_id, {"failed", "interrupted"})
@@ -317,21 +471,14 @@ class ClaudeExecutorTests(RuntimeHarness, unittest.TestCase):
                         self.assertEqual(self.control.store.get(queued)["attempts"], 0)
                         self.runtime.stop()
                     self.assertFalse(self.control.store.get(task_id)["execution_stopped"])
-                finally:
-                    try:
-                        if creation_identity(pid) == identity:
-                            os.killpg(pid, signal.SIGTERM)
-                    except (ProcessLookupError, FileNotFoundError):
-                        pass
-                    deadline = time.monotonic() + 15
-                    while time.monotonic() < deadline:
-                        try:
-                            os.kill(pid, 0)
-                        except ProcessLookupError:
-                            break
-                        time.sleep(.04)
-                    else:
-                        self.fail("Foreground fixture did not stop after explicit inspection cleanup")
+                if fault:
+                    self.assertIs(caught.exception, sentinel)
+                    self.assertTrue(reached, "Startup failed before the injected acquisition boundary")
+                    self.assertIn("identity", ownership, "Cleanup did not recover the fixture's creation identity")
+                    pid = ownership["pid"]
+                    with self.assertRaises(ProcessLookupError):
+                        os.kill(pid, 0)
+                    self.control.environment.pop("ROUTER_FIXTURE_PID_GATE")
                 self.runtime.stop()
                 reason = "Inspected and stopped the separate foreground command"
                 with patch("router.service.state_dir", return_value=self.root / "state"), \

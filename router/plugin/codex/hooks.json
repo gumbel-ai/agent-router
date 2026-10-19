@@ -1,5 +1,5 @@
 {
-  "description": "Agent Router lifecycle observation (identifiers and lifecycle only; no content)",
+  "description": "Agent Router lifecycle observation and explicit parent delegation",
   "hooks": {
     "SessionStart": [
       {
@@ -32,6 +32,15 @@
             "timeout": 2
           }
         ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh \"${PLUGIN_ROOT}/router/plugin/codex/hook.sh\" submit",
+            "timeout": 20
+          }
+        ]
       }
     ],
     "PreToolUse": [
@@ -41,6 +50,16 @@
             "type": "command",
             "command": "sh \"${PLUGIN_ROOT}/router/plugin/codex/hook.sh\"",
             "timeout": 2
+          }
+        ]
+      },
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh \"${PLUGIN_ROOT}/router/plugin/codex/hook.sh\" authorize",
+            "timeout": 20
           }
         ]
       }

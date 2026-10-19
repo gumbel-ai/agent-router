@@ -17,6 +17,7 @@ import uuid
 from pathlib import Path
 
 from router.client import CompletionBusy, CompletionRefused, request
+from router.correlation import identifier
 from router.dispatch import canonical
 from router.paths import observed_project
 from router.processes import parent_and_identity
@@ -46,10 +47,13 @@ def completion_directory(state: Path) -> Path:
     return state / "managed"
 
 
-def run(argv: list[str], label: str | None, session_id: str | None, agent_id: str | None, state: Path) -> int:
+def run(argv: list[str], label: str | None, session_id: str | None, agent_id: str | None, state: Path,
+        *, work_item_id: str | None = None) -> int:
     """Run argv to completion and return its exit status (128 + signal when signalled)."""
     if not argv:
         raise ValueError("router run needs a command after --")
+    if work_item_id is not None:
+        identifier(work_item_id, "work_item_id")
     for name, value in (("session", session_id), ("agent", agent_id)):
         if value is not None:
             _identifier(value, name)
@@ -68,6 +72,8 @@ def run(argv: list[str], label: str | None, session_id: str | None, agent_id: st
                 "attribution": _attribution(session_id, agent_id), "wrapper_pid": os.getpid(),
                 "wrapper_identity": _identity(os.getpid()), "executable": Path(argv[0]).name,
                 "argument_count": len(argv) - 1, "cwd": os.getcwd()}
+    if work_item_id is not None:
+        metadata["work_item_id"] = work_item_id
     started_at, started = _now(), time.monotonic()
     launched: list[int] = []  # The command's PID (its group), once it exists.
     pending: list[int] = []
@@ -166,6 +172,7 @@ def _report(operation: str, payload: dict) -> bool:
 
 # Field -> kind. Text is bounded; integers must fit the wire; flags must be real booleans.
 START_FIELDS = {"managed_id": "id", "label": "text", "session_id": "identifier", "agent_id": "identifier",
+                "work_item_id": "identifier",
                 "attribution": "attribution", "pid": "pid", "pgid": "pid", "wrapper_pid": "pid",
                 "wrapper_identity": "text", "executable": "text", "argument_count": "count",
                 "cwd": "path", "started_at": "count"}
@@ -185,6 +192,9 @@ def _checked(payload: object, fields: dict[str, str]) -> dict:
     checked = {}
     for key, value in payload.items():
         kind = fields[key]
+        if key == "work_item_id":
+            checked[key] = identifier(value, "work_item_id")
+            continue
         if kind == "start":
             checked[key] = _checked(value, START_FIELDS)
             continue
@@ -304,7 +314,7 @@ class ManagedProcesses:
 
     def _completion(self, db, record: dict) -> None:
         fields = {"host_id", "managed_id", "session_id", "agent_id", "attribution", "status",
-                  "exit_code", "signal", "finished_at", "uncertain_at", "group_outlived"}
+                  "exit_code", "signal", "finished_at", "uncertain_at", "group_outlived", "work_item_id"}
         event = {key: value for key, value in record.items() if key in fields}
         if "group_outlived" not in event and isinstance(record.get("shutdown_uncertain"), bool):
             event["group_outlived"] = record["shutdown_uncertain"]
