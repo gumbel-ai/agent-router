@@ -34,6 +34,27 @@ def identifier(value: object, name: str, limit: int = 240) -> str:
     return value
 
 
+def validate_metadata(record: dict) -> list[str]:
+    """Replace invalid scalar metadata with null and return only field names."""
+    invalid = []
+    for field in ("host_id", *IDENTITIES):
+        if record[field] is not None:
+            try:
+                record[field] = identifier(record[field], field, 128 if field == "host_id" else 240)
+            except (ValueError, TypeError):
+                record[field] = None
+                invalid.append(field)
+    for field in NUMBERS:
+        if record[field] is not None and not is_wire_integer(record[field]):
+            record[field] = None
+            invalid.append(field)
+    for field, allowed in (("status", STATUSES), ("lifecycle_event", EVENTS)):
+        if record[field] is not None and (not isinstance(record[field], str) or record[field] not in allowed):
+            record[field] = None
+            invalid.append(field)
+    return invalid
+
+
 def _position(token: object, scope: str) -> tuple[int, int]:
     if token is None:
         return 0, 0
@@ -108,21 +129,7 @@ def _record(kind: str, row, data: dict, host_id: str) -> tuple[dict, list[str]]:
         authoritative = {"host_id": row["host_id"], "managed_id": row["managed_id"], "event_id": result["event_id"]}
     invalid.extend(field for field, value in authoritative.items() if data.get(field) is not None
                    and (type(data[field]) is not type(value) or data[field] != value))
-    for field in ("host_id", *IDENTITIES):
-        if result[field] is not None:
-            try:
-                result[field] = identifier(result[field], field, 128 if field == "host_id" else 240)
-            except (ValueError, TypeError):
-                result[field] = None
-                invalid.append(field)
-    for field in NUMBERS:
-        if result[field] is not None and not is_wire_integer(result[field]):
-            result[field] = None
-            invalid.append(field)
-    for field, allowed in (("status", STATUSES), ("lifecycle_event", EVENTS)):
-        if result[field] is not None and (not isinstance(result[field], str) or result[field] not in allowed):
-            result[field] = None
-            invalid.append(field)
+    invalid.extend(validate_metadata(result))
     return result, invalid
 
 
