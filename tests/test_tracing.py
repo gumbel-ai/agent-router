@@ -18,7 +18,9 @@ CLAUDE_PROFILE = {"tools": ["Read", "Edit", "Write"], "allow": ["Read", "Edit", 
 class TracingTests(RuntimeHarness, unittest.TestCase):
     def configure(self, executor):
         config = self.config.repositories[str(self.repo.resolve())]
-        if executor == "codex":
+        if executor == "opencode":
+            self.config.models["test"] = "provider/exact"
+        elif executor == "codex":
             self.config.codex_command = self.config.opencode_command
             self.config.models["test"] = "openai/gpt-5.3-codex"
             config["codex_sandbox"] = "workspace-write"
@@ -33,7 +35,7 @@ class TracingTests(RuntimeHarness, unittest.TestCase):
         return config
 
     def test_requested_tracing_is_recorded_unavailable_and_keeps_native_counters(self):
-        for executor in ("codex", "claude"):
+        for executor in ("opencode", "codex", "claude"):
             with self.subTest(executor=executor):
                 config = self.configure(executor)
                 config.pop("tracing", None)
@@ -45,8 +47,9 @@ class TracingTests(RuntimeHarness, unittest.TestCase):
                 traced = self.wait(self.start("traced", f"{executor}-traced", executor=executor),
                                    {"awaiting_review", "failed", "interrupted"})
                 self.assertEqual(traced["status"], "awaiting_review", traced)
-                self.assertEqual(traced["tracing"], {"requested": True, "available": False,
-                                                     "reason": TRACING_UNAVAILABLE[executor]})
+                expected = {"requested": True, "available": False, "reason": TRACING_UNAVAILABLE[executor]}
+                self.assertEqual(traced["tracing"], expected)
+                self.assertEqual(traced["attempt_history"][0]["tracing"], expected)
                 for key in ("usage", "usage_complete", "cost", "cost_source"):
                     self.assertEqual(traced[key], plain[key], key)
 
