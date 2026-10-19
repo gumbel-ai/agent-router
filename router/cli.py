@@ -350,6 +350,8 @@ def main() -> None:
     fleet_host.add_argument("--json", action="store_true")
     fleet_host.add_argument("--strict", action="store_true")
     fleet_host.add_argument("--config", type=Path)
+    remote = commands.add_parser("remote", help="Serve one authenticated remote-child JSON request over SSH")
+    remote.add_argument("--json", action="store_true", required=True)
     fleet_wait = fleet_commands.add_parser("wait", help="Wait once on each configured completion host")
     fleet_wait.add_argument("--consumer", required=True)
     fleet_wait.add_argument("--timeout", type=float, required=True)
@@ -473,6 +475,25 @@ def main() -> None:
                 settings, environment = load_settings()
                 directory = state_dir()
                 serve(settings, environment, directory, socket_path())
+        elif args.command == "remote":
+            if not args.json:
+                parser.error("remote requires --json")
+            raw = sys.stdin.buffer.read(12 * 1024 * 1024 + 1)
+            if len(raw) > 12 * 1024 * 1024:
+                parser.error("Remote child request exceeds its wire bound")
+            try:
+                message = json.loads(raw)
+            except (ValueError, UnicodeError, RecursionError) as error:
+                parser.error(f"Invalid remote child request: {error}")
+            if not isinstance(message, dict) or set(message) != {"operation", "payload"}:
+                parser.error("Invalid remote child request envelope")
+            operations = {"start": "remote_start", "status": "remote_status",
+                          "review": "remote_review", "cancel": "remote_cancel", "close": "remote_close"}
+            operation = operations.get(message.get("operation"))
+            if operation is None or not isinstance(message.get("payload"), dict):
+                parser.error("Unsupported remote child operation")
+            result = request(operation, message["payload"], timeout=60, deadline=True)
+            print(json.dumps({"ok": True, "result": result}, separators=(",", ":")), flush=True)
         elif args.command == "run":
             from router.managed import run as run_managed
             argv = args.argv[1:] if args.argv[:1] == ["--"] else args.argv
