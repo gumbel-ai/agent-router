@@ -54,6 +54,7 @@ class SessionObserver:
                     if is_wire_integer(record.get("tool_active_until")):
                         deadlines.append(record["tool_active_until"])
                     record["restart_uncertain_until"] = min(MAX_WIRE_INTEGER, max(deadlines))
+                    record.pop("codex_liveness", None)
                     record.update(status="unknown", needs_input=False,
                                   visibility_reason="Router restarted; awaiting session lifecycle evidence",
                                   inflight_tools=[], tool_event_at={}, tool_finished_at={}, waiting_agents=[],
@@ -232,16 +233,16 @@ class SessionObserver:
         if (record["source"] != "codex" or record["status"] == "stopped"
                 or record["status"] == "unknown" and record.get("restart_uncertain_until") is not None):
             return False
-        before = record["status"], record.get("visibility_reason")
+        before = record["status"], record.get("visibility_reason"), record.get("codex_liveness")
         checked_at = now_ms()
         stopping_agent = event.get("agent_id") if event["kind"] == "subagent_stop" else None
-        running_child = db.execute("""SELECT 1 FROM observations WHERE
+        child_at = db.execute("""SELECT MAX(json_extract(data,'$.last_event_at')) FROM observations WHERE
                 json_extract(data,'$.host_id')=? AND json_extract(data,'$.source')='codex'
                 AND session_id=? AND json_extract(data,'$.status')='running'
                 AND json_extract(data,'$.last_event_at')>=?
-                AND NOT (json_extract(data,'$.agent_id') IS ? AND json_extract(data,'$.state_at')<=?)
-                LIMIT 1""", (self.host_id, record["session_id"], checked_at - STALE_AFTER_MS,
-                              stopping_agent, at)).fetchone() is not None
+                AND NOT (json_extract(data,'$.agent_id') IS ? AND json_extract(data,'$.state_at')<=?)""",
+                              (self.host_id, record["session_id"], checked_at - STALE_AFTER_MS,
+                               stopping_agent, at)).fetchone()[0]
         # The lifecycle writer persists the session before its native component.
         # Include current child activity only when its own retained fences accept it;
         # another child's later session event is not a fence for this child.
@@ -266,7 +267,18 @@ class SessionObserver:
                               and at > prior.get("result_at", -1) and at > ended_at and resumed
                               and (not terminal or reopened or event["kind"] == "subagent_start"
                                    and at > prior.get("state_at", -1)))
-        running = (self._has_active_tool(record, checked_at) or running_child or incoming_child
+        live_tool = self._has_active_tool(record, checked_at)
+        deadlines = [min(MAX_WIRE_INTEGER, value + STALE_AFTER_MS)
+                     for value in (child_at, at if incoming_child else None) if is_wire_integer(value)]
+        tool_until = record.get("tool_active_until")
+        if live_tool and not is_wire_integer(tool_until):
+            # Legacy tools without a retained deadline cannot establish an exact expiry.
+            record.pop("codex_liveness", None)
+        else:
+            if live_tool:
+                deadlines.append(tool_until)
+            record["codex_liveness"] = {"version": 1, "until": max(deadlines, default=None)}
+        running = (live_tool or child_at is not None or incoming_child
                    or record.get("root_turn_open") is True and not record.get("needs_input"))
         # Future stored child evidence is still live evidence: view() masks clock
         # rollback, but catching up must not expose an incorrectly persisted idle.
@@ -284,7 +296,7 @@ class SessionObserver:
             record["visibility_reason"] = None
         if record.get("visibility_reason") in {None, WAITING_REASON}:
             record["visibility_reason"] = WAITING_REASON if record.get("needs_input") else None
-        return before != (record["status"], record.get("visibility_reason"))
+        return before != (record["status"], record.get("visibility_reason"), record.get("codex_liveness"))
 
     @staticmethod
     def _waiter_history_partial(record: dict) -> bool:
@@ -446,6 +458,7 @@ class SessionObserver:
                     self._reset_tools(record)
                 record["started_at"] = min(record["started_at"], at)
             elif kind == "session_end":
+                record.pop("codex_liveness", None)
                 record.update(status="stopped", finished_at=at, activity=None, visibility_reason=None)
                 self._reset_waiters(record, MAX_WIRE_INTEGER)  # A finished session has no waiters.
                 self._reset_tools(record)
@@ -660,6 +673,24 @@ class SessionObserver:
                    (self.host_id, session["source"], session["session_id"], task_id, canonical(task)))
 
     @staticmethod
+    def _codex_turn_status(record: dict, at: int) -> tuple[str, str | None]:
+        """Age derived liveness by its support, independently of unrelated events."""
+        status = record["status"]
+        if (record["source"] != "codex" or status != "running" or record.get("needs_input")
+                or record.get("root_turn_open") is True):
+            return status, None
+        support = record.get("codex_liveness")
+        if (not isinstance(support, dict) or not is_wire_integer(support.get("version"))
+                or support["version"] != 1 or "until" not in support
+                or support["until"] is not None and not is_wire_integer(support["until"])):
+            return "unknown", "Supporting lifecycle evidence is unavailable; awaiting session lifecycle evidence"
+        if support["until"] is not None and at <= support["until"]:
+            return "running", None
+        if record.get("root_turn_open") is False:
+            return "idle", None
+        return "unknown", "Root turn state was not observed"
+
+    @staticmethod
     def view(record: dict, at: int | None = None) -> dict:
         for key in ("host_id", "source", "session_id", "parent_session_id"):
             if record.get(key) is not None:
@@ -671,10 +702,13 @@ class SessionObserver:
             "waiter_history_partial", "waiter_clear_floor", "waiter_evicted_at", "root_turn_open", "root_turn_at",
             "tool_reset_at", "tool_active_until", "tool_overflow_until", "tool_overflow_active",
             "active_tool_times", "tool_correlation_partial", "tool_correlation_partial_until",
-            "tool_terminal_floor", "tool_history_partial", "restart_uncertain_until", "root_started_at",
+            "tool_terminal_floor", "tool_history_partial", "restart_uncertain_until", "root_started_at", "codex_liveness",
             "process_chain", "process_candidate", "process_root",
         }}
         result = sanitize_structure(result)
+        result["status"], reason = SessionObserver._codex_turn_status(record, at)
+        if reason and result.get("visibility_reason") in {None, "Root turn state was not observed"}:
+            result["visibility_reason"] = reason
         clock_rollback = record["last_event_at"] > at
         result["observation_age_ms"] = age
         active_times = record.get("active_tool_times")
@@ -712,40 +746,57 @@ class SessionObserver:
         """Return the bounded fleet page and active total from one read snapshot."""
         at = now_ms()
         cutoff = at - RECENT_HISTORY_MS
+        # Project the same supporting-evidence expiry as view() before counting
+        # every record. Display limits must not change aggregate liveness.
+        projection = """WITH current AS (SELECT source,data,CASE
+                WHEN source='codex' AND json_extract(data,'$.status')='running'
+                 AND json_type(data,'$.root_turn_open') IS NOT 'true'
+                 AND COALESCE(json_extract(data,'$.needs_input'),0)!=1 THEN CASE
+                    WHEN json_type(data,'$.codex_liveness.version')='integer'
+                     AND json_extract(data,'$.codex_liveness.version')=1
+                     AND (json_type(data,'$.codex_liveness.until')='null' OR
+                          (json_type(data,'$.codex_liveness.until')='integer'
+                           AND json_extract(data,'$.codex_liveness.until') BETWEEN 0 AND ?))
+                    THEN CASE WHEN json_extract(data,'$.codex_liveness.until')>=? THEN 'running'
+                              WHEN json_type(data,'$.root_turn_open')='false' THEN 'idle'
+                              ELSE 'unknown' END
+                    ELSE 'unknown' END
+                ELSE json_extract(data,'$.status') END AS status FROM sessions WHERE host_id=?) """
+        projected_at = (MAX_WIRE_INTEGER, at, self.host_id)
         with self.store.connect() as db:
             db.execute("BEGIN")
             records = [json.loads(row[0]) for row in db.execute(
-                """SELECT data FROM sessions WHERE host_id=? AND
-                    (json_extract(data,'$.status') IN ('running','idle','unknown') OR
+                projection + """SELECT data FROM current WHERE
+                    (status IN ('running','idle','unknown') OR
                      json_extract(data,'$.needs_input')=1 OR json_extract(data,'$.last_event_at')>=?)
                     ORDER BY CASE WHEN json_extract(data,'$.needs_input')=1 THEN 0
-                        WHEN json_extract(data,'$.status')='unknown' THEN 1 ELSE 2 END,
+                        WHEN status='unknown' THEN 1 ELSE 2 END,
                         json_extract(data,'$.last_event_at') DESC LIMIT ?""",
-                (self.host_id, cutoff, limit))]
-            future_or_partial = db.execute("""SELECT COUNT(*) FROM sessions WHERE host_id=? AND (
+                (*projected_at, cutoff, limit))]
+            future_or_partial = db.execute(projection + """SELECT COUNT(*) FROM current WHERE (
                     json_extract(data,'$.last_event_at')>? OR
                     json_extract(data,'$.tool_overflow_active')=1 OR
                     (json_extract(data,'$.tool_correlation_partial')=1 AND
                      COALESCE(json_extract(data,'$.tool_correlation_partial_until'),?)>=?) OR
-                    (json_extract(data,'$.status')='unknown' AND
+                    (status='unknown' AND
                      (json_extract(data,'$.restart_uncertain_until')>=? OR
                       (source='codex' AND json_extract(data,'$.last_event_at')>=?))) OR
                     -- Waiter history overflowed: a fresh session's waiting state is uncertain.
                     ((json_extract(data,'$.waiter_history_partial')=1 OR
                       COALESCE(json_extract(data,'$.waiter_clear_floor'),-1)>=0) AND
                      json_extract(data,'$.last_event_at')>=?))""",
-                                           (self.host_id, at, at, at, at, at - STALE_AFTER_MS,
+                                           (*projected_at, at, at, at, at, at - STALE_AFTER_MS,
                                             at - STALE_AFTER_MS)).fetchone()[0]
             # One predicate, so each session counts once: fresh running/waiting
             # work, or any unexpired tool (a reordered tool_start can leave a
             # live tool under a newer, fresh "idle" status).
-            active_sessions = db.execute("""SELECT COUNT(*) FROM sessions WHERE host_id=? AND (
-                    ((json_extract(data,'$.status')='running' OR json_extract(data,'$.needs_input')=1) AND
+            active_sessions = db.execute(projection + """SELECT COUNT(*) FROM current WHERE (
+                    ((status='running' OR json_extract(data,'$.needs_input')=1) AND
                      json_extract(data,'$.last_event_at') BETWEEN ? AND ?) OR
-                    (json_extract(data,'$.status') IN ('running','idle','unknown') AND
+                    (status IN ('running','idle','unknown') AND
                      json_extract(data,'$.last_event_at')<=? AND
                      json_extract(data,'$.tool_active_until')>=?))""",
-                                         (self.host_id, at - STALE_AFTER_MS, at, at, at)).fetchone()[0]
+                                         (*projected_at, at - STALE_AFTER_MS, at, at, at)).fetchone()[0]
         active = None if future_or_partial else active_sessions
         return [self.view(record, at) for record in records], active
 

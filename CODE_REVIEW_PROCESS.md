@@ -346,6 +346,10 @@ item before requesting review.
   resolved cause must not clear unrelated uncertainty or fence a later unknown state.
 - Use one threshold for a classification and for every alert or `partial` flag derived
   from it.
+- A cached state derived from another entity must expire with that entity's evidence,
+  not a newer unrelated event. Check silent expiry without another hook, replay
+  equivalence, and the same read-time predicate in rendering and complete totals,
+  including empty and truncated display pages.
 - Fresh missing-root uncertainty must invalidate exact active totals and capacity,
   then expire at the same freshness boundary. During clock rollback, retain future
   live evidence in durable status; check the state again after the clock catches up

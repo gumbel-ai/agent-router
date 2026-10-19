@@ -11,15 +11,19 @@ import time
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from test_control import observe_every_session, settings
 
 from router import observer_hook
+from router.capacity import CapacitySampler
 from router.cli import fleet_table, sessions_table
 from router.daemon import Controller
-from router.native import STALE_AFTER_MS
-from router.sessions import MAX_INFLIGHT_AGE_MS
+from router.db import Store
+from router.fleet_snapshot import compose
+from router.native import STALE_AFTER_MS, NativeObserver
+from router.sessions import MAX_INFLIGHT_AGE_MS, SessionObserver
 
 SESSION = "019a0000-0000-7000-8000-000000000001"
 CHILD = "019a0000-0000-7000-8000-000000000002"
@@ -251,6 +255,101 @@ class CodexObservationTests(unittest.TestCase):
                     self.assertEqual(snapshot["capacity"]["active_claude_sessions"], int(child_running))
                     self.assertEqual(snapshot["capacity"]["active_agents"], int(child_running))
                 self.clock = latest + 100
+
+    def test_child_support_expires_without_another_hook(self):
+        expiry = STALE_AFTER_MS + 10
+        cases = {
+            "closed": {"checks": ((expiry - 2, "unknown", None, None), (expiry - 1, "running", 1, 1),
+                                   (expiry, "running", 1, 1), (expiry + 1, "idle", 0, 0)), "replay": True},
+            "multiple children": {"extra": (("SubagentStart", 15, {"agent_id": "worker-c"}),),
+                                  "checks": ((expiry + 1, "running", 1, 1), (expiry + 5, "running", 1, 1),
+                                             (expiry + 6, "idle", 0, 0)), "replay": True},
+            "missing child start": {"child_start": False, "checks": ((expiry + 1, "idle", 0, 0),), "replay": True},
+            "missing root": {"root": None, "checks": ((expiry + 1, "unknown", None, 0),)},
+            "open root": {"root": "open", "checks": ((expiry + 1, "running", 1, 0),)},
+            "waiting": {"extra": (("PermissionRequest", 30, {"agent_id": "worker-c"}),),
+                        "checks": ((expiry + 1, "idle", 1, 1),)},
+            "live tool": {"extra": (("PreToolUse", 30, {"agent_id": "worker-c", "tool_use_id": "long-tool"}),),
+                          "checks": ((expiry + 1, "running", 1, 1), (expiry + 21, "running", 1, 0))},
+            "restart": {"restart": True, "checks": ((expiry + 1, "unknown", None, None),)},
+            "session end": {"end": True, "checks": ((expiry + 1, "stopped", 0, 0),)},
+            "legacy": {"format": None, "checks": ((expiry + 1, "unknown", None, 0),)},
+            "unsupported format": {"format": {"version": 2, "until": 0},
+                                   "checks": ((expiry + 1, "unknown", None, 0),)},
+        }
+        with tempfile.TemporaryDirectory(prefix="ar-codex-support-") as temporary:
+            for name, case in cases.items():
+                store = Store(Path(temporary) / name / "router.sqlite3", "host-a")
+                sessions, native = SessionObserver(store, "host-a"), NativeObserver(store, "host-a")
+                capacity = CapacitySampler(store.path.parent)
+                host = SimpleNamespace(view=lambda at: {"host_id": "host-a", "hostname": "example-host"})
+                controller = SimpleNamespace(sessions=sessions, native=native, capacity=capacity, host=host)
+                start = int(time.time() * 1000) - 2 * STALE_AFTER_MS
+                clock = [start + expiry - 1]
+
+                def send(session, agent, sessions=sessions, native=native):
+                    if session:
+                        sessions.observe(session)
+                    if agent:
+                        native.observe(agent)
+                    return {}
+
+                def hook(kind, offset, *, start=start, **fields):
+                    with patch("router.observer_hook.time.time", return_value=(start + offset) / 1000):
+                        observer_hook.observe_codex(payload(kind, **fields))
+
+                def snapshot(limit=100, capacity=capacity, controller=controller, clock=clock):
+                    capacity._latest = {"logical_cpus": 8, "load_1m": 0, "cpu_busy_pct": 0,
+                                        "memory_available_bytes": 32 * 1024**3,
+                                        "disk_available_bytes": 64 * 1024**3,
+                                        "observed_at": clock[0] - 100, "partial": False}
+                    with patch("router.capacity.time.time", return_value=clock[0] / 1000):
+                        return compose(controller, history_limit=limit)
+
+                with self.subTest(name=name), patch("router.sessions.now_ms", side_effect=lambda clock=clock: clock[0]), \
+                        patch("router.native.now_ms", side_effect=lambda clock=clock: clock[0]), \
+                        patch("router.observer_hook.send", side_effect=send):
+                    if case.get("root", "closed") is not None:
+                        hook("SessionStart", 0)
+                    hook("SubagentStart", 10, agent_id="worker-a")
+                    if case.get("root", "closed") == "closed":
+                        hook("Stop", 20)
+                    for kind, offset, fields in case.get("extra", ()):
+                        hook(kind, offset, **fields)
+                    if case.get("child_start", True):
+                        hook("SubagentStart", STALE_AFTER_MS - 100, agent_id="worker-b")
+                    hook("SubagentStop", expiry - 1, agent_id="worker-b")
+                    if case.get("restart"):
+                        sessions.reconcile_restart()
+                        native.reconcile_restart()
+                    if case.get("end"):
+                        hook("SessionEnd", expiry - 1)
+                    if "format" in case:
+                        with store.transaction() as db:
+                            row = json.loads(db.execute("SELECT data FROM sessions").fetchone()[0])
+                            row.pop("codex_liveness", None)
+                            if case["format"] is not None:
+                                row["codex_liveness"] = case["format"]
+                            sessions._put_session(db, row)
+                    for offset, status, total, agents in case["checks"]:
+                        clock[0] = start + offset
+                        result = snapshot()
+                        row, sample = result["sessions"][0], result["capacity"]
+                        self.assertEqual((row["status"], sample["active_claude_sessions"], sample["active_agents"]),
+                                         (status, total, agents))
+                        expected = "unknown" if None in (total, agents) else "busy" if total or agents else "available"
+                        self.assertEqual(sample["capacity_state"], expected)
+                        self.assertNotIn("codex_liveness", row)
+                        self.assertEqual(sessions.fleet_records(0), ([], total))
+                    if case.get("replay"):
+                        before = snapshot()
+                        hook("Stop", 20)
+                        self.assertEqual(snapshot(), before)
+                        sessions.observe({"source": "codex", "session_id": "newer-row", "kind": "session_end",
+                                          "observed_at": clock[0]})
+                        truncated = snapshot(1)
+                        self.assertEqual(truncated["sessions"][0]["session_id"], "newer-row")
+                        self.assertEqual(truncated["capacity"]["active_claude_sessions"], 0)
 
     def test_missing_root_uncertainty_reaches_capacity_until_freshness_expires(self):
         for waited in (False, True):

@@ -120,6 +120,15 @@ This namespace is shared with the Langfuse correlation bridge (TODO item 9): run
   evidence clears its missing-root warning. Fresh accepted lifecycle evidence retires
   the prior restart fence; later missing-root uncertainty remains independent, and a
   later restart derives its deadline from the newer retained evidence.
+  Child-derived running state expires when its supporting children and tools expire,
+  even without another hook. An unrelated completion cannot extend that support. A
+  closed root then becomes idle; a missing root remains unknown within normal
+  freshness bounds. Rendering and all-record active totals apply the same expiry,
+  independently of display limits, without writing during reads. The existing session
+  record stores this support as private versioned bookkeeping. Older records without
+  it, or records with an unsupported version, conservatively report unknown when
+  child-derived running state cannot be verified; fresh accepted evidence restores
+  the bookkeeping. It is excluded from public session and correlation projections.
 
 ## Gaps (shown as unavailable, never inferred)
 
