@@ -509,6 +509,7 @@ class Controller:
             if not self.settings.delegation_enabled and (operation == "remote_start" or
                     operation == "remote_review" and payload.get("outcome") in {"rejected", "continue"}):
                 raise ValueError("External delegation is not configured; run router init in the project")
+            # Held through import so maintenance cannot exit mid-admission.
             with self.lifecycle_lock:
                 if self.draining:
                     raise ValueError("Router is stopping for maintenance; retry after it restarts")
@@ -1029,7 +1030,8 @@ class Runtime:
                 if task.get("remote_host") and not task.get("remote_task_id") and task["execution_stopped"]:
                     # The start was never claimed as sent; nothing can be running remotely.
                     self.store.update(task["task_id"], lambda t: t.update(
-                        status="failed", execution_stopped=True, failure_reason="Remote start was not sent before restart"))
+                        status="cancelled" if t.get("cancel_requested") else "failed", execution_stopped=True,
+                        failure_reason="Remote start was not sent before restart"))
                 elif task.get("remote_host"):
                     # Remote liveness is read from the serving Router, not local process evidence.
                     self.spawn(task, recovered=True)

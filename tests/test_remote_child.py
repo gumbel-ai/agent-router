@@ -269,6 +269,11 @@ class RemoteChildProtocolTests(unittest.TestCase):
         spawn.assert_not_called()
         self.assertEqual(task["status"], "failed")
         self.assertTrue(task["execution_stopped"])
+        task.update(status="cancelling", cancel_requested=True)
+        with patch.object(Runtime, "spawn"), patch.object(Runtime, "schedule"):
+            runtime.start()
+            runtime.scheduler.join(1)
+        self.assertEqual(task["status"], "cancelled")
 
     def test_remote_cancelling_and_recovery_reconcile_remotely(self):
         for status, recovered in (("cancelling", False), ("running", True)):
