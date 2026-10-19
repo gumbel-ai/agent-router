@@ -37,6 +37,21 @@ class RemoteChildProtocolTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "bytes"):
             remote_child._start_payload(self.payload(snapshot_base64=base64.b64encode(b"abcd").decode()))
 
+    def test_transport_start_keeps_snapshot_base64_on_wire(self):
+        transport = remote_child.RemoteChildTransport(
+            FleetHost("worker", "ssh", target="example"), 1
+        )
+        with patch("router.remote_child._exchange", return_value={"status": "created"}) as exchange:
+            result = transport.start(
+                session_id="session-a", request_id="request-a", invocation=self.invocation,
+                remote_repo="/srv/project", remote_worktree="/srv/project",
+                snapshot_receipt=self.receipt, snapshot_bundle=b"abc",
+            )
+        self.assertEqual(result, {"status": "created"})
+        payload = exchange.call_args.args[3]
+        self.assertEqual(payload["snapshot_base64"], base64.b64encode(b"abc").decode())
+        self.assertNotIn("snapshot_bytes", payload)
+
     def test_remote_request_parser_rejects_duplicate_and_nonfinite_fields(self):
         with self.assertRaisesRegex(ValueError, "duplicate"):
             remote_child.parse_request(b'{"operation":"status","operation":"start","payload":{}}')

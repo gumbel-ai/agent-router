@@ -242,7 +242,11 @@ class RemoteChildTransport:
                    "remote_repo": remote_repo, "remote_worktree": remote_worktree,
                    "snapshot_receipt": snapshot_receipt,
                    "snapshot_base64": base64.b64encode(snapshot_bundle).decode("ascii")}
-        return _exchange(self.host, self.timeout, "start", _start_payload(payload))
+        # Validate and decode locally, but keep the wire payload base64 encoded.
+        # Passing the decoded ``snapshot_bytes`` result to ``canonical`` would
+        # fail before the SSH request is sent because bytes are not JSON values.
+        _start_payload(payload)
+        return _exchange(self.host, self.timeout, "start", payload)
 
     def status(self, session_id: str, request_id: str) -> dict:
         return _exchange(self.host, self.timeout, "status", _control_payload("status", {
