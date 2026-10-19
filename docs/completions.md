@@ -237,7 +237,7 @@ Router adds no trust bypass and never starts a remote daemon.
 | `exit_failed` | SSH or the remote CLI exited unsuccessfully; `exit_code` is included. |
 | `deadline` | SSH collection exceeded its overall budget; the managed command is unaffected and acknowledgment outcome is unknown. |
 | `transport_deadline` | A local acknowledgment reply exceeded its deadline. |
-| `transport_failed` | The transport failed; local transport errors may include `errno`. |
+| `transport_failed` | The transport failed; local and SSH reader OS errors include numeric `errno` when known. |
 | `cleanup_failed` | The SSH reader did not exit after collection. |
 | `interrupted` | An owned SSH reader was interrupted during collection. |
 | `duplicate_host_id` | More than one selected result claims the same serving host. |

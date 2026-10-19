@@ -1,3 +1,4 @@
+import errno
 import io
 import json
 import os
@@ -378,7 +379,34 @@ main()
             ssh_stdout(config.hosts[0], 15, ['wait'])
         self.assertEqual(caught.exception.code, 'transport_failed')
         self.assertTrue(str(caught.exception))
+        self.assertIsNone(caught.exception.errno)
         self.assertIsNotNone(processes[-1].poll())
+        read = os.read
+        reader_fds = set()
+        def read_failure(fd, size):
+            if fd in reader_fds:
+                raise OSError(errno.EIO, 'fixture-private-value')
+            return read(fd, size)
+        for boundary, failure, expected_errno in [
+                ('set_blocking', OSError(errno.EBADF, 'fixture-private-value'), errno.EBADF),
+                ('read', read_failure, errno.EIO)]:
+            reader_fds.clear()
+            start = launch('import os,time;os.write(1,b"x");time.sleep(30)')
+            def start_reader(command, start=start, **options):
+                process = start(command, **options)
+                reader_fds.update((process.stdout.fileno(), process.stderr.fileno()))
+                return process
+            with self.subTest(boundary=boundary, errno=expected_errno), \
+                    patch('router.fleet.subprocess.Popen', side_effect=start_reader), \
+                    patch('router.fleet.os.' + boundary, side_effect=failure):
+                result = query_completions(config, 'batch-job', 15)
+                expected = {'code': 'transport_failed'}
+                if expected_errno is not None:
+                    expected['errno'] = expected_errno
+                self.assertEqual(result['hosts'][0]['error'], expected)
+                self.assertFalse(result['hosts'][0]['ok'])
+                self.assertNotIn('fixture-private-value', canonical(result))
+                self.assertIsNotNone(processes[-1].poll())
         with patch('router.fleet.subprocess.Popen', side_effect=launch('import time;time.sleep(30)')), \
                 patch('router.fleet.time.monotonic', side_effect=[0, 16]), \
                 patch('router.fleet._kill_remaining_group'), self.assertRaises(SSHQueryError) as caught:
