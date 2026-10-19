@@ -62,12 +62,12 @@ def _result(raw: bytes, consumer: str, ack: dict | None = None) -> dict:
     _completion_sequence(source.get("event_id"))
     event = {"event_id": source["event_id"], "host_id": _identifier(source.get("host_id"), "event host")}
     invalid = []
-    for key in ("managed_id", "session_id", "agent_id", "attribution", "finished_at", "uncertain_at"):
+    for key in ("managed_id", "session_id", "agent_id", "work_item_id", "attribution", "finished_at", "uncertain_at"):
         if key not in source:
             continue
         item = source[key]
         valid = (item is None or
-                 key in {"managed_id", "session_id", "agent_id"} and _valid_identifier(item) or
+                 key in {"managed_id", "session_id", "agent_id", "work_item_id"} and _valid_identifier(item) or
                  key == "attribution" and isinstance(item, str) and item in {"host", "session", "exact"} or
                  key in {"finished_at", "uncertain_at"} and is_wire_integer(item))
         if valid:

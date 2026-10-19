@@ -27,7 +27,8 @@ class FleetCompletionTests(unittest.TestCase):
         self.event = {'status': 'completed', 'consumer': 'batch-job', 'host_id': 'host-b', 'subscription_id': 'subscription-b',
                       'event': {'event_id': 'completion-1', 'host_id': 'producing-host',
                                 'managed_id': 'managed-job', 'status': 'exited', 'exit_code': 0,
-                                'group_outlived': False, 'session_id': 'session  a', 'agent_id': 'worker  a'}}
+                                'group_outlived': False, 'session_id': 'session  a', 'agent_id': 'worker  a',
+                                'work_item_id': 'batch  α'}}
 
     def test_ack_error_requires_failed_transport_and_exact_structured_binding(self):
         from router.fleet import SSHQueryError
@@ -100,7 +101,7 @@ class FleetCompletionTests(unittest.TestCase):
 
     def test_optional_metadata_degrades_without_hiding_durable_event_identity(self):
         from router.fleet_completions import query_completions
-        for field, value in (('session_id', 'bad\n'), ('agent_id', []), ('managed_id', 'bad\n'),
+        for field, value in (('session_id', 'bad\n'), ('agent_id', []), ('managed_id', 'bad\n'), ('work_item_id', 'bad\n'),
                              ('attribution', 'unsupported'), ('finished_at', True), ('uncertain_at', float('nan'))):
             raw = {**self.event, 'event': {**self.event['event'], field: value}}
             with self.subTest(field=field), patch('router.fleet_completions.ssh_stdout',

@@ -1,5 +1,14 @@
 # Durable managed-command completions
 
+`router run --work-item-id batch-job -- command args` attaches an optional caller
+work-item identity to the command, retained completion evidence, snapshots and
+local/fleet correlation exports. It must be a nonempty printable string of at most
+240 characters with no surrounding whitespace; Router preserves its exact spelling.
+Labels remain display text and never supply an identity. Without this option the
+field stays absent from managed records and completion events. This declaration
+does not enable observation outside an enabled project or grant control authority.
+Use identifiers, never prompts, instructions or credentials, in this field.
+
 An active agent can use a blocking shell/tool call to wait for commands launched with
 `router run` in an observed project:
 

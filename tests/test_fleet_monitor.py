@@ -2804,7 +2804,7 @@ class RouterTaskFleetTests(unittest.TestCase):
         return task["task_id"]
 
     def test_router_tasks_reach_fleet_status_as_lifecycle_only(self):
-        running = self.task("running", attempt_started_at=int(time.time() * 1000) - 1000)
+        running = self.task("running", attempt_started_at=int(time.time() * 1000) - 1000, work_item_id="batch  α")
         self.task("closed", at=1)  # Long finished: outside the fleet window.
         local = compose(self.control)
         self.assertEqual([task["task_id"] for task in local["router_tasks"]], [running])
@@ -2813,6 +2813,7 @@ class RouterTaskFleetTests(unittest.TestCase):
         self.assertEqual((record["status"], record["executor"], record["parent_session_id"]),
                          ("running", "codex", "parent-session"))
         self.assertEqual(record["task"], "PRIVATE TASK TEXT")
+        self.assertEqual(record["work_item_id"], "batch  α")
         self.assertFalse({"cost", "usage", "worktree", "cwd"} & record.keys())
         self.assertNotIn("router_tasks", projected.get("errors", {}))
         # A peer on an older version sends no Router tasks; that is not a partial snapshot.
@@ -2827,10 +2828,11 @@ class RouterTaskFleetTests(unittest.TestCase):
         self.assertIn("router:parent-sess", table)
 
     def test_router_task_text_follows_fleet_text_sharing(self):
-        self.task("failed", failure_reason="[Errno 2] No such file: '/Users/me/worktree'")
+        self.task("failed", failure_reason="[Errno 2] No such file: '/work/example-project'", work_item_id="batch  α")
         self.control.settings = Settings(AGENT_ROUTER_FLEET_SHARE_TEXT="false")
         [record] = compose(self.control)["router_tasks"]
         self.assertEqual((record["task"], record["failure_reason"]), (None, None))
+        self.assertEqual(record["work_item_id"], "batch  α")
 
     def test_one_odd_router_task_cannot_take_the_host_out_of_the_fleet(self):
         self.assertNotIn("router_tasks", compose(self.control))  # Older viewers never see an empty section.
@@ -2864,10 +2866,12 @@ class RouterTaskFleetTests(unittest.TestCase):
         self.task("running")
         local = compose(self.control)
         local["router_tasks"].append({**local["router_tasks"][0], "task_id": "bad", "attempts": -1})
+        local["router_tasks"].extend({**local["router_tasks"][0], "work_item_id": value}
+                                   for value in ("", " leading", "bad\n", [], "x" * 241))
         projected = _validate_snapshot(json.dumps(local).encode())
         self.assertEqual(len(projected["router_tasks"]), 1)
         self.assertTrue(projected["partial"])
-        self.assertIn("1 invalid record(s) omitted", projected["errors"]["router_tasks"])
+        self.assertIn("6 invalid record(s) omitted", projected["errors"]["router_tasks"])
         self.assertTrue(projected["sessions"] == local["sessions"] and "capacity" in projected)
 
 
