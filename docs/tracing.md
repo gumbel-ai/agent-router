@@ -1,8 +1,9 @@
 # Child tracing
 
-Router-launched children are currently untraced. Router never uploads traces or
-calls Langfuse; only a runtime's own tracing plugin could export a child trace, and
-no route that runs such a plugin inside a Router child has been verified.
+Router-launched Codex and Claude children are currently untraced, and OpenCode child
+tracing is unverified. Router never uploads traces or calls Langfuse; only a runtime's
+own tracing plugin could export a child trace, and no route that runs such a plugin
+inside a Router child has been verified.
 
 Router's token and cost counters remain the record for child usage, and
 `router correlation --json` reports `traced: "unknown"`.
@@ -11,7 +12,7 @@ Router's token and cost counters remain the record for child usage, and
 | --- | --- | --- |
 | Codex | Children run with `--ignore-user-config`. Codex then uses an empty user layer, and plugin hooks need trust from the user or session-flag layer. | Codex `rust-v0.163.0` [configuration loader](https://github.com/openai/codex/blob/rust-v0.163.0/codex-rs/config/src/loader/mod.rs#L512), [hook trust rules](https://github.com/openai/codex/blob/rust-v0.163.0/codex-rs/hooks/src/config_rules.rs#L8), [hook discovery](https://github.com/openai/codex/blob/rust-v0.163.0/codex-rs/hooks/src/engine/discovery.rs#L666) |
 | Claude | Children run with `--safe-mode` and no setting sources, so installed plugins and hooks do not load. | `claude --help` on 2.1.303; [Claude children](claude-executor.md) |
-| OpenCode | No Router-launched route is verified. | [OpenCode audit](langfuse-audit.md#opencode-plugin-052) |
+| OpenCode | Not known either way. Router's permission-only `OPENCODE_CONFIG_CONTENT` merges with other configuration, so an operator-installed plugin may still load; no Router-launched trace is verified. | [OpenCode audit](langfuse-audit.md#opencode-plugin-052) |
 
 Router does not work around these boundaries by copying hook trust, removing
 isolation flags, loading the operator's user configuration or creating another
