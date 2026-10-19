@@ -160,6 +160,35 @@ class TracingTests(RuntimeHarness, unittest.TestCase):
                     self.assertFalse(langfuse_credentials_available(environment))
                     self.assertNotIn("plugins", json.loads(environment["OPENCODE_CONFIG_CONTENT"]))
 
+    def test_remote_unselected_record_stays_unavailable_after_serving_repo_enables_tracing(self):
+        config = self.configure("opencode")
+        config.pop("tracing", None)
+        self.set_credentials(True)
+        task_id = "remote-unselected"
+        task = {"task_id": task_id, "parent_tracing_requested": True, "invocation": {
+            "executor": "opencode", "model": "test", "parent_repo": str(self.repo), "parent_worktree": str(self.repo)}}
+        validated = self.runtime.validate(task)
+        task.update(validated, session_id="S", executor="opencode", status="running", attempts=1, attempt_number=2,
+                    artifact_dir=str(self.root / "artifacts"), deadline_at=9_999_999_999_999,
+                    worktree=str(self.root / "child"))
+        with self.control.store.transaction() as db:
+            self.control.store.put(db, task)
+        config["tracing"] = "requested"
+        environments = []
+
+        def fake_launch(command, cwd, environment, directory, register, *, disposable=False):
+            environments.append(environment)
+            return SimpleNamespace(poll=lambda: 0), {}
+
+        with patch("router.daemon.launch", side_effect=fake_launch), \
+                patch.object(self.runtime, "observe", return_value={"exit_code": 0}):
+            self.runtime.phase(task_id, "child", ["child"], self.root)
+        tracing = self.control.store.get(task_id)["tracing"]
+        self.assertIs(tracing["available"], False)
+        self.assertIn("no tracing selection", tracing["reason"])
+        self.assertNotIn("LANGFUSE_SECRET_KEY", environments[0])
+        self.assertNotIn("plugins", json.loads(environments[0]["OPENCODE_CONFIG_CONTENT"]))
+
     def test_reloaded_repository_opt_out_disables_stale_tracing(self):
         config = self.configure("opencode")
         config["tracing"] = "requested"

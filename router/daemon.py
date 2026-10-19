@@ -1247,8 +1247,10 @@ class Runtime:
                     self.store.update(task_id, lambda current: current.update(tracing=dict(REMOTE_UNSELECTED_TRACING)))
                 else:
                     self.store.update(task_id, lambda current: current.pop("tracing", None))
-            elif name == "child" and (task["executor"] == "opencode" or "_claude_tracing" in task or "_codex_tracing" in task):
+            elif name == "child" and ((task["executor"] == "opencode" and tracing.get("plugin") == OPENCODE_LANGFUSE_PLUGIN)
+                                      or "_claude_tracing" in task or "_codex_tracing" in task):
                 # Rejection/resume skips validate(); record what this child receives.
+                # A record without the plugin selection stays unavailable: the child gets no plugin.
                 availability = (opencode_tracing_availability(phase_environment) if task["executor"] == "opencode"
                                 else claude_tracing.availability(langfuse_credentials_available(phase_environment))
                                 if "_claude_tracing" in task else
@@ -1610,6 +1612,9 @@ class Runtime:
             while True:
                 task = self.store.get(task_id)
                 status = transport.status(task["session_id"], task["invocation"]["request_id"])
+                if "tracing" in task and "tracing" not in status:
+                    # Never keep an earlier remote record the remote no longer reports.
+                    status["tracing"] = {"requested": True, "reason": "Decided by the remote host"}
                 if status.get("status") == "not_found":
                     raise RemoteChildError("invalid_response", "Remote request binding disappeared")
                 if "resolved_model" in status and status["resolved_model"] != task.get("resolved_model"):

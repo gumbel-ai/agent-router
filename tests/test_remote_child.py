@@ -77,6 +77,19 @@ class RemoteChildProtocolTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "tracing_requested"):
             remote_child._start_payload(self.payload(tracing_requested="yes"))
 
+    def test_tracing_request_is_optional_in_both_upgrade_directions(self):
+        older_parent = self.payload()
+        del older_parent["tracing_requested"]
+        self.assertIs(remote_child._start_payload(older_parent)["tracing_requested"], False)
+        transport = remote_child.RemoteChildTransport(FleetHost("worker", "ssh", target="example"), 1)
+        with patch("router.remote_child._exchange", return_value={"status": "created"}) as exchange:
+            transport.start(
+                session_id="session-a", request_id="request-a", invocation=self.invocation,
+                resolved_model="provider/model-a", remote_repo="/srv/project", remote_worktree="/srv/project",
+                snapshot_receipt=self.receipt, snapshot_bundle=b"abc", tracing_requested=False,
+            )
+        self.assertNotIn("tracing_requested", exchange.call_args.args[3])
+
     def test_agent_hook_denies_router_remote(self):
         from router.hooks import authorize
         result = authorize({"tool_name": "Bash", "tool_input": {"command": "router remote --json"}})
