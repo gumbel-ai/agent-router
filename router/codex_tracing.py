@@ -119,9 +119,13 @@ def selected(task: dict) -> dict | None:
 
 def hook_configuration() -> str:
     """Inline TOML accepted by Codex's ``-c`` option for a trusted Stop hook."""
-    return ("hooks={Stop=[{hooks=[{type='command',command='node \\\"${PLUGIN_ROOT}/dist/index.mjs\\\"',"
-            "timeout=30,statusMessage='Uploading Codex trace to Langfuse'}]}],"
-            f"state={{\"{HOOK_TRUST_KEY}\"={{enabled=true,trusted_hash=\"{HOOK_TRUST_HASH}\"}}}}")
+    # Use TOML basic strings for values containing shell syntax.  TOML literal
+    # strings preserve backslashes, which would change the command Codex runs.
+    return ("hooks={Stop=[{hooks=[{type='command',"
+            "command=" + json.dumps(HOOK_COMMAND) + ","
+            "timeout=30,statusMessage=" + json.dumps(HOOK_STATUS)
+            + "}]}],state={" + json.dumps(HOOK_TRUST_KEY)
+            + "={enabled=true,trusted_hash=" + json.dumps(HOOK_TRUST_HASH) + "}}}")
 
 
 def environment(result: dict[str, str], task: dict, *, credentials: dict[str, str]) -> dict[str, str]:

@@ -3,6 +3,7 @@
 import hashlib
 import json
 import tempfile
+import tomllib
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -60,6 +61,25 @@ class CodexTracingTests(unittest.TestCase):
         self.assertEqual(json.loads(environment["LANGFUSE_CODEX_METADATA"])["router_task_id"], "task-1")
         self.assertEqual(environment["LANGFUSE_CODEX_USER_ID"], "agent-router")
         self.assertNotIn("OPENAI_API_KEY", environment)
+
+    def test_hook_configuration_is_valid_toml_with_expected_structure(self):
+        parsed = tomllib.loads(codex_tracing.hook_configuration())
+        self.assertEqual(parsed, {
+            "hooks": {
+                "Stop": [{"hooks": [{
+                    "type": "command",
+                    "command": codex_tracing.HOOK_COMMAND,
+                    "timeout": 30,
+                    "statusMessage": codex_tracing.HOOK_STATUS,
+                }]}],
+                "state": {
+                    codex_tracing.HOOK_TRUST_KEY: {
+                        "enabled": True,
+                        "trusted_hash": codex_tracing.HOOK_TRUST_HASH,
+                    }
+                },
+            }
+        })
 
     def test_setup_does_not_receive_codex_tracing_credentials(self):
         task = self.selected_task()
