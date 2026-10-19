@@ -32,23 +32,27 @@ class HookTests(TransportHarness, unittest.TestCase):
         return value
 
     def test_offline_submission_and_nonliteral_dispatch(self):
-        event = {"session_id": "host", "prompt_id": "turn", "cwd": str(self.repo), "prompt": "never persist this body"}
-        unconfigured = {**event, "session_id": "unconfigured", "cwd": str(self.root / "other-project")}
-        self.assertEqual(self.hook(unconfigured, "submit"), {})
-        self.assertEqual(request("submit", {"session_id": "unconfigured", "prompt_id": "turn",
-                                           "cwd": unconfigured["cwd"]}, self.endpoint), {"instruction_id": None})
-        submission = self.hook(event, "submit")
-        self.assertIn("ROUTER_INSTRUCTION_ID=", submission["hookSpecificOutput"]["additionalContext"])
-        ordinary = self.hook({**event, "tool_name": "Bash", "tool_input": {"command": "git status"}}, "authorize")
-        self.assertEqual(ordinary, {})
-        refused = self.hook({**event, "tool_name": "Bash", "tool_input": {
-            "command": 'router start --json "{\\"task\\":\\"$(printf changed)\\"}"'}}, "authorize")
-        self.assertEqual(refused["hookSpecificOutput"]["permissionDecision"], "deny")
+        for source, prompt_key, prefix in (("claude", "prompt_id", ""), ("codex", "turn_id", "codex-")):
+            with self.subTest(source=source):
+                event = {"session_id": source + "-host", prompt_key: "turn", "cwd": str(self.repo),
+                         "hook_event_name": "UserPromptSubmit", "prompt": "never persist this body"}
+                unconfigured = {**event, "session_id": source + "-unconfigured", "cwd": str(self.root / "other-project")}
+                self.assertEqual(self.hook(unconfigured, prefix + "submit"), {})
+                self.assertEqual(request("submit", {"session_id": unconfigured["session_id"], "prompt_id": "turn",
+                                                   "cwd": unconfigured["cwd"]}, self.endpoint), {"instruction_id": None})
+                submission = self.hook(event, prefix + "submit")
+                self.assertIn("ROUTER_INSTRUCTION_ID=", submission["hookSpecificOutput"]["additionalContext"])
+                shell = {**event, "hook_event_name": "PreToolUse", "tool_name": "Bash"}
+                self.assertEqual(self.hook({**shell, "tool_input": {"command": "git status"}}, prefix + "authorize"), {})
+                refused = self.hook({**shell, "tool_input": {
+                    "command": 'router start --json "{\\"task\\":\\"$(printf changed)\\"}"'}}, prefix + "authorize")
+                self.assertEqual(refused["hookSpecificOutput"]["permissionDecision"], "deny")
         request("daemon_stop", {}, self.endpoint)
         self.daemons[-1].wait(timeout=15)
-        offline = self.hook(event, "submit")
-        self.assertEqual(offline, {})
-        self.assertEqual(self.hook(unconfigured, "submit"), {})
+        for prompt_key, prefix in (("prompt_id", ""), ("turn_id", "codex-")):
+            event = {"session_id": "offline", prompt_key: "turn", "cwd": str(self.repo), "hook_event_name": "UserPromptSubmit"}
+            self.assertEqual(self.hook(event, prefix + "submit"), {})
+            self.assertEqual(self.hook({**event, "cwd": str(self.root / "other-project")}, prefix + "submit"), {})
 
     def test_native_hooks_preserve_parent_and_allow_offline_native_work(self):
         event = {"session_id": "native-host", "prompt_id": "turn", "cwd": str(self.repo),

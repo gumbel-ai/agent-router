@@ -1,6 +1,7 @@
 {
   "name": "agent-router",
   "version": "0.4.0",
-  "description": "Observe native Codex sessions and subagents in Agent Router (lifecycle only; no content)",
+  "description": "Observe native Codex lifecycle and delegate explicitly requested children through Agent Router",
+  "skills": ["./router/plugin/skills/"],
   "hooks": "./router/plugin/codex/hooks.json"
 }
