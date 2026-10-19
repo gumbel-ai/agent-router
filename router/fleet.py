@@ -684,6 +684,7 @@ def ssh_stdout(host: FleetHost, timeout: float, arguments: list[str], *,
     deadline = time.monotonic() + timeout
     failure = None
     failure_code = "transport_failed"
+    failure_errno = None
     try:
         if process.stdout is None or process.stderr is None:
             raise ValueError("ssh output pipes unavailable")
@@ -723,6 +724,8 @@ def ssh_stdout(host: FleetHost, timeout: float, arguments: list[str], *,
                 break
     except (OSError, ValueError) as error:
         failure = str(error)
+        if isinstance(error, OSError):
+            failure_errno = error.errno
     except KeyboardInterrupt:
         failure = "SSH collection interrupted"
         raise
@@ -763,7 +766,8 @@ def ssh_stdout(host: FleetHost, timeout: float, arguments: list[str], *,
             _kill_remaining_group(process.pid)
     if failure is not None:
         raise SSHQueryError(failure_code, failure or "SSH collection failed",
-                            exit_code=process.returncode if failure_code == "exit_failed" else None)
+                            exit_code=process.returncode if failure_code == "exit_failed" else None,
+                            errno=failure_errno)
     return bytes(stdout)
 
 
