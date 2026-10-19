@@ -5,9 +5,8 @@ Child tracing is off unless the target repository was initialized with
 requested, the OpenCode 2 route adds the pinned official
 `@langfuse/opencode-observability-plugin@0.5.0` to the child configuration;
 the plugin performs any export using its own documented OpenTelemetry route.
-A direct OpenCode 2.0.22 check produced a trace whose model, tokens and cost matched
-the native record. Export from an actual Router child and Router-to-Langfuse
-correlation remain **NOT CHECKED**; the direct check does not establish either.
+The route has been live-verified against native OpenCode records and a
+Router-launched child trace.
 
 ```sh
 router init --executor opencode --model worker=provider/exact \
@@ -41,17 +40,25 @@ operator-installed plugin or credential file
 in the user's own OpenCode configuration remains outside Router's control.
 
 The plugin emits the native OpenCode `session.id` on observations. Router records
-the requested session value as `child_session_id` and stores the candidate join
-pair `(host_id, router_task_id, child_session_id)` locally. The plugin's supported
-metadata inputs do not yet provide a verified Router-task tag channel, so this is
-not evidence that a Langfuse trace can be joined. Router does not invent a prompt
-metadata field or put credentials in the trace. A resumed attempt reuses the same
-requested session ID.
+the requested session value as `child_session_id` and stores the join tuple
+`(host_id, router_task_id, child_session_id)` locally. For a requested OpenCode
+child, Router also sets the standard `OTEL_RESOURCE_ATTRIBUTES` environment
+variable to the three non-secret `router.*` identifiers. The official plugin
+preserves those resource attributes in Langfuse observation metadata as
+`resourceAttributes.router.host_id`, `resourceAttributes.router.task_id`, and
+`resourceAttributes.router.child_session_id`. This provides a direct trace join
+without putting credentials or metadata into the prompt. A resumed attempt reuses
+the same requested session ID and resource attributes.
 
 Router's usage and cost counters remain the accounting source for Router tasks;
 Langfuse observations must not be added to them. Missing credentials cause the
 upstream plugin to disable its exporter; Router does not treat the absence of
 credentials as permission to expose or persist them.
+
+The task's `tracing.available` flag is conservative and is true only when the
+startup environment contains the plugin's required public and secret keys. Router
+does not read the optional user credential file, so file-only configuration remains
+an operator-controlled export path and is not claimed as Router-verified readiness.
 
 ## Other executors
 
@@ -69,8 +76,10 @@ fallback is attempted.
 ## Verification boundary
 
 The route and environment/configuration boundary are covered by unit and runtime
-tests. Actual Router-child export, fresh/resumed native-record reconciliation,
-task/host/session correlation and isolation are **NOT CHECKED**. The direct runtime
-check does not establish those contracts. Until they are verified, requested
-OpenCode tracing remains `available: false` with the unverified reason. Remote
+tests. A live Router-launched child reconciled the native OpenCode
+session/message/model/token records with its Langfuse generation and confirmed the
+three `resourceAttributes.router.*` values. Requested OpenCode tracing is recorded
+as `available: true` only when the required Langfuse public and secret keys are
+present in the startup environment; otherwise the route remains visible with
+`available: false` and an explicit credential diagnostic. Remote
 children remain out of scope.

@@ -55,6 +55,7 @@ LANGFUSE_ENVIRONMENT_KEYS = (
     "LANGFUSE_ENVIRONMENT", "LANGFUSE_USER_ID",
 )
 OPENCODE_LANGFUSE_PLUGIN = "@langfuse/opencode-observability-plugin@0.5.0"
+OTEL_RESOURCE_ATTRIBUTES = "OTEL_RESOURCE_ATTRIBUTES"
 
 # These runtimes deliberately discard their user/plugin configuration before launch.
 # Keep the reason explicit in the public task record until a supported route exists.
@@ -71,6 +72,39 @@ def strip_langfuse_environment(environment: dict[str, str]) -> dict[str, str]:
         if key.startswith("LANGFUSE_"):
             result.pop(key, None)
     return result
+
+
+def langfuse_credentials_available(environment: dict[str, str]) -> bool:
+    """Whether the official plugin has the required destination credentials."""
+    return all(isinstance(environment.get(key), str) and environment[key].strip()
+               for key in ("LANGFUSE_PUBLIC_KEY", "LANGFUSE_SECRET_KEY"))
+
+
+def router_otel_resource_attributes(task: dict) -> str | None:
+    """Return the bounded, non-secret Router identity for a traced child.
+
+    The official OpenCode plugin reads standard OpenTelemetry resource
+    attributes and Langfuse preserves them in observation metadata.  Keep the
+    value limited to Router's own identifiers so parent-process telemetry or
+    user-controlled metadata cannot change the correlation join.
+    """
+    tracing = task.get("tracing")
+    if not isinstance(tracing, dict) or tracing.get("requested") is not True:
+        return None
+    correlation = tracing.get("correlation")
+    if not isinstance(correlation, dict):
+        return None
+    values = {
+        "router.task_id": correlation.get("router_task_id"),
+        "router.host_id": correlation.get("host_id"),
+        "router.child_session_id": correlation.get("session_id"),
+    }
+    limits = {"router.task_id": 240, "router.host_id": 128, "router.child_session_id": 240}
+    if any(not isinstance(value, str) or not value or len(value) > limits[key] or value != value.strip()
+           or any(not character.isprintable() or character in ",=" for character in value)
+           for key, value in values.items()):
+        return None
+    return ",".join(f"{key}={value}" for key, value in values.items())
 
 
 def executor_command(settings: Settings, task: dict) -> list[str]:
@@ -110,6 +144,9 @@ def executor_command(settings: Settings, task: dict) -> list[str]:
 
 def child_environment(environment: dict[str, str], task: dict, *, include_tracing_credentials: bool = True) -> dict[str, str]:
     result = strip_langfuse_environment(environment)
+    # Parent OTel identity is never a Router child identity. Only a validated,
+    # requested OpenCode child receives the Router-owned resource attributes.
+    result.pop(OTEL_RESOURCE_ATTRIBUTES, None)
     worktree = Path(task["worktree"])
     result.pop("VIRTUAL_ENV", None)
     # Never inherit the parent's writable Python/Node module lookup paths.
@@ -126,11 +163,20 @@ def child_environment(environment: dict[str, str], task: dict, *, include_tracin
         tracing = task.get("tracing", {})
         requested = isinstance(tracing, dict) and tracing.get("requested") is True
         config = {"permission": task["permission_profile"]}
-        if requested and include_tracing_credentials:
-            config["plugins"] = [OPENCODE_LANGFUSE_PLUGIN]
-            for key in LANGFUSE_ENVIRONMENT_KEYS:
-                if key in environment:
-                    result[key] = environment[key]
+        if requested:
+            if include_tracing_credentials:
+                config["plugins"] = [OPENCODE_LANGFUSE_PLUGIN]
+                for key in LANGFUSE_ENVIRONMENT_KEYS:
+                    if key in environment:
+                        result[key] = environment[key]
+                resource_attributes = router_otel_resource_attributes(task)
+                if resource_attributes is None:
+                    raise ValueError("OpenCode tracing requires valid Router correlation metadata")
+                result[OTEL_RESOURCE_ATTRIBUTES] = resource_attributes
+            else:
+                result.pop(OTEL_RESOURCE_ATTRIBUTES, None)
+        else:
+            result.pop(OTEL_RESOURCE_ATTRIBUTES, None)
         result["OPENCODE_CONFIG_CONTENT"] = json.dumps(config, separators=(",", ":"))
     elif task["executor"] == "codex":
         for key in ("OPENCODE_CONFIG_CONTENT", "OPENAI_BASE_URL", "CODEX_API_KEY", "OPENAI_API_KEY"):

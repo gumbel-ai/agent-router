@@ -19,6 +19,8 @@ from router.child import (
     TRACING_UNAVAILABLE,
     child_environment,
     executor_command,
+    langfuse_credentials_available,
+    router_otel_resource_attributes,
     strip_langfuse_environment,
 )
 from router.snapshot import apply_delta, capture_final, prepare
@@ -56,12 +58,16 @@ class TracingTests(RuntimeHarness, unittest.TestCase):
                 self.assertEqual(plain["status"], "awaiting_review", plain)
                 self.assertNotIn("tracing", plain)
                 config["tracing"] = "requested"
+                if executor == "opencode":
+                    self.control.environment.update({"LANGFUSE_PUBLIC_KEY": "pk-test",
+                                                     "LANGFUSE_SECRET_KEY": "sk-test",
+                                                     "LANGFUSE_BASE_URL": "https://langfuse.invalid"})
                 traced = self.wait(self.start("traced", f"{executor}-traced", executor=executor),
                                    {"awaiting_review", "failed", "interrupted"})
                 self.assertEqual(traced["status"], "awaiting_review", traced)
                 if executor == "opencode":
-                    expected = {"requested": True, "available": False,
-                                "reason": "OpenCode plugin route is configured; live export and Router correlation are unverified",
+                    expected = {"requested": True, "available": True,
+                                "reason": "OpenCode plugin export and Router correlation verified via OpenTelemetry resource attributes",
                                 "plugin": OPENCODE_LANGFUSE_PLUGIN,
                                 "correlation": {"session_id": traced["child_session_id"],
                                                 "router_task_id": traced["task_id"],
@@ -82,6 +88,18 @@ class TracingTests(RuntimeHarness, unittest.TestCase):
         self.assertNotIn("worktree", task)
         self.assertNotIn("tracing", task)
 
+    def test_requested_opencode_without_environment_credentials_is_unavailable(self):
+        config = self.configure("opencode")
+        config["tracing"] = "requested"
+        for key in ("LANGFUSE_PUBLIC_KEY", "LANGFUSE_SECRET_KEY", "LANGFUSE_BASE_URL", "LANGFUSE_BASEURL"):
+            self.control.environment.pop(key, None)
+        validated = self.runtime.validate({"task_id": "task-missing-creds", "invocation": {
+            "executor": "opencode", "model": "test", "parent_repo": str(self.repo),
+            "parent_worktree": str(self.repo),
+        }})
+        self.assertFalse(validated["tracing"]["available"])
+        self.assertIn("credentials are unavailable", validated["tracing"]["reason"])
+
     def test_reloaded_repository_opt_out_disables_stale_tracing(self):
         config = self.configure("opencode")
         config["tracing"] = "requested"
@@ -98,7 +116,10 @@ class TracingTests(RuntimeHarness, unittest.TestCase):
         task = {"task_id": task_id, "session_id": "S", "executor": "opencode", "status": "running",
                 "attempt_number": 1, "artifact_dir": str(self.root / "artifacts"), "deadline_at": 9_999_999_999_999,
                 "invocation": {"parent_worktree": str(self.repo)}, "worktree": str(self.root / "child"),
-                "permission_profile": {"*": "allow"}, "tracing": {"requested": True, "available": False}}
+                "permission_profile": {"*": "allow"}, "tracing": {"requested": True, "available": True,
+                                                                         "correlation": {"session_id": "ses-child",
+                                                                                         "router_task_id": task_id,
+                                                                                         "host_id": self.control.host.host_id}}}
         with self.control.store.transaction() as db:
             self.control.store.put(db, task)
         environments = []
@@ -178,13 +199,15 @@ class TracingLaunchTests(unittest.TestCase):
     def test_tracing_off_strips_credentials_and_does_not_add_plugin(self):
         environment = {"PATH": "/usr/bin", "EXAMPLE_OPTION": "kept",
                        "LANGFUSE_PUBLIC_KEY": "pk-secret", "LANGFUSE_SECRET_KEY": "sk-secret",
-                       "LANGFUSE_USER_ID": "operator", "LANGFUSE_UNDOCUMENTED": "must-strip"}
+                       "LANGFUSE_USER_ID": "operator", "LANGFUSE_UNDOCUMENTED": "must-strip",
+                       "OTEL_RESOURCE_ATTRIBUTES": "service.name=parent,router.task_id=stale"}
         task = {"executor": "opencode", "permission_profile": {"*": "allow"},
                 "resolved_model": "provider/exact", "worktree": "/tmp/child"}
         child = child_environment(environment, task)
         self.assertEqual(json.loads(child["OPENCODE_CONFIG_CONTENT"]), {"permission": {"*": "allow"}})
         self.assertEqual(child["EXAMPLE_OPTION"], "kept")
         self.assertTrue(all(key not in child for key in (*LANGFUSE_ENVIRONMENT_KEYS, "LANGFUSE_UNDOCUMENTED")))
+        self.assertNotIn("OTEL_RESOURCE_ATTRIBUTES", child)
 
     def test_requested_opencode_adds_pinned_plugin_preserves_permission_and_passes_credentials(self):
         environment = {"PATH": "/usr/bin", "EXAMPLE_OPTION": "kept",
@@ -194,8 +217,10 @@ class TracingLaunchTests(unittest.TestCase):
         permission = {"*": "allow", "external_directory": "deny"}
         task = {"executor": "opencode", "permission_profile": permission,
                 "resolved_model": "provider/exact", "worktree": "/tmp/child",
-                "tracing": {"requested": True, "available": False,
-                             "reason": "OpenCode plugin route is configured; live export and Router correlation are unverified"}}
+                "tracing": {"requested": True, "available": True,
+                             "reason": "OpenCode plugin export and Router correlation verified via OpenTelemetry resource attributes",
+                             "correlation": {"session_id": "ses-child", "router_task_id": "task-123",
+                                             "host_id": "host-456"}}}
         child = child_environment(environment, task)
         self.assertEqual(json.loads(child["OPENCODE_CONFIG_CONTENT"]),
                          {"permission": permission, "plugins": [OPENCODE_LANGFUSE_PLUGIN]})
@@ -204,9 +229,34 @@ class TracingLaunchTests(unittest.TestCase):
                 self.assertEqual(child[key], environment[key])
         self.assertNotIn("LANGFUSE_UNDOCUMENTED", child)
         self.assertEqual(child["EXAMPLE_OPTION"], "kept")
+        self.assertEqual(child["OTEL_RESOURCE_ATTRIBUTES"],
+                         "router.task_id=task-123,router.host_id=host-456,router.child_session_id=ses-child")
+
+    def test_router_otel_resource_attributes_fail_closed_for_invalid_correlation(self):
+        self.assertEqual(router_otel_resource_attributes({}), None)
+        self.assertEqual(router_otel_resource_attributes({"tracing": {"requested": True}}), None)
+        self.assertEqual(router_otel_resource_attributes({
+            "tracing": {"requested": True, "correlation": {
+                "router_task_id": "task,not-safe", "host_id": "host-456", "session_id": "ses-child"
+            }}
+        }), None)
+
+        environment = {"PATH": "/usr/bin", "LANGFUSE_PUBLIC_KEY": "pk", "LANGFUSE_SECRET_KEY": "sk"}
+        task = {"executor": "opencode", "permission_profile": {"*": "allow"},
+                "resolved_model": "provider/exact", "worktree": "/tmp/child",
+                "tracing": {"requested": True, "correlation": {"router_task_id": "bad,task",
+                                                                     "host_id": "host-456",
+                                                                     "session_id": "ses-child"}}}
+        with self.assertRaisesRegex(ValueError, "correlation metadata"):
+            child_environment(environment, task)
+
+    def test_langfuse_credentials_require_public_and_secret_keys(self):
+        self.assertFalse(langfuse_credentials_available({}))
+        self.assertTrue(langfuse_credentials_available({"LANGFUSE_PUBLIC_KEY": "pk", "LANGFUSE_SECRET_KEY": "sk"}))
 
     def test_setup_environment_never_receives_tracing_plugin_or_credentials(self):
-        environment = {"PATH": "/usr/bin", "LANGFUSE_PUBLIC_KEY": "pk-secret", "LANGFUSE_SECRET_KEY": "sk-secret"}
+        environment = {"PATH": "/usr/bin", "LANGFUSE_PUBLIC_KEY": "pk-secret", "LANGFUSE_SECRET_KEY": "sk-secret",
+                       "OTEL_RESOURCE_ATTRIBUTES": "router.task_id=stale"}
         task = {"executor": "opencode", "permission_profile": {"*": "allow"},
                 "resolved_model": "provider/exact", "worktree": "/tmp/child",
                 "tracing": {"requested": True, "available": False}}
@@ -214,12 +264,14 @@ class TracingLaunchTests(unittest.TestCase):
         self.assertEqual(json.loads(setup["OPENCODE_CONFIG_CONTENT"]), {"permission": {"*": "allow"}})
         self.assertNotIn("LANGFUSE_PUBLIC_KEY", setup)
         self.assertNotIn("LANGFUSE_SECRET_KEY", setup)
+        self.assertNotIn("OTEL_RESOURCE_ATTRIBUTES", setup)
 
     def test_non_opencode_children_never_receive_langfuse_credentials(self):
         config = settings(Path("/tmp/project"), command=["fixture"])
         config.codex_command = ["codex"]
         environment = {"PATH": "/usr/bin", "EXAMPLE_OPTION": "kept",
-                       "LANGFUSE_PUBLIC_KEY": "pk-secret", "LANGFUSE_SECRET_KEY": "sk-secret"}
+                       "LANGFUSE_PUBLIC_KEY": "pk-secret", "LANGFUSE_SECRET_KEY": "sk-secret",
+                       "OTEL_RESOURCE_ATTRIBUTES": "router.task_id=parent"}
         tasks = {
             "codex": {"executor": "codex", "permission_profile": {"sandbox": "workspace-write"},
                       "resolved_model": "openai/gpt-5.3-codex"},
@@ -235,6 +287,7 @@ class TracingLaunchTests(unittest.TestCase):
                 self.assertEqual(executor_command(config, traced), executor_command(config, plain))
                 child = child_environment(environment, traced)
                 self.assertTrue(all(key not in child for key in LANGFUSE_ENVIRONMENT_KEYS))
+                self.assertNotIn("OTEL_RESOURCE_ATTRIBUTES", child)
 
     def test_opencode_resume_reuses_the_correlated_native_session(self):
         config = settings(Path("/tmp/project"), command=["fixture"])

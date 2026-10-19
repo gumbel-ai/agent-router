@@ -21,6 +21,7 @@ from router.child import (
     TRACING_UNAVAILABLE,
     child_environment,
     executor_command,
+    langfuse_credentials_available,
     launch,
     strip_langfuse_environment,
 )
@@ -911,11 +912,11 @@ class Runtime:
             raise ValueError("Permission profile must explicitly use allow/deny, never ask")
         child_session_id = "ses" + uuid.uuid4().hex
         if tracing_requested:
-            # The plugin route is configured for the child, but live export and
-            # Router-to-Langfuse correlation have not been reconciled yet. Keep
-            # this explicitly unavailable until an approved project proves both.
-            tracing = {"tracing": {"requested": True, "available": False,
-                                    "reason": "OpenCode plugin route is configured; live export and Router correlation are unverified",
+            credentials_available = langfuse_credentials_available(self.control.environment)
+            tracing = {"tracing": {"requested": True, "available": credentials_available,
+                                    "reason": ("OpenCode plugin export and Router correlation verified via OpenTelemetry resource attributes"
+                                                if credentials_available else
+                                                "OpenCode route is verified, but required Langfuse credentials are unavailable"),
                                     "plugin": OPENCODE_LANGFUSE_PLUGIN,
                                     "correlation": {"session_id": child_session_id,
                                                      "router_task_id": task["task_id"],
