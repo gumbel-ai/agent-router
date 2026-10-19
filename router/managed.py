@@ -215,7 +215,7 @@ def _valid_identifier(value: object) -> bool:
         return False
 
 
-def wait(consumer: str, timeout: float) -> dict:
+def wait(consumer: str, timeout: float, *, cancelled=None, include_subscription: bool = False) -> dict:
     """Block locally; each daemon request is short and never changes command ownership."""
     _identifier(consumer, "consumer")
     if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or not math.isfinite(timeout) \
@@ -226,13 +226,22 @@ def wait(consumer: str, timeout: float) -> dict:
     diagnosed = False
     saw_pending = False
     subscription = None
+    serving_host = None
+
+    def delivered(result):
+        if include_subscription and subscription is not None:
+            return {**result, "host_id": serving_host, "subscription_id": subscription}
+        return result
+
     while True:
+        if cancelled is not None and cancelled.is_set():
+            return delivered({"status": "unavailable", "consumer": consumer})
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             if not saw_pending and not diagnosed:
                 print("Agent Router completion wait unavailable: deadline reached before reading completion evidence",
                       file=sys.stderr, flush=True)
-            return {"status": "unavailable" if last_error or not saw_pending else "deadline", "consumer": consumer}
+            return delivered({"status": "unavailable" if last_error or not saw_pending else "deadline", "consumer": consumer})
         try:
             if subscription is None:
                 binding = request("completion_subscribe", {"consumer": consumer}, timeout=min(2, remaining), deadline=True)
@@ -240,13 +249,14 @@ def wait(consumer: str, timeout: float) -> dict:
                         or not _valid_identifier(binding.get("subscription_id")) or not _valid_identifier(binding.get("host_id")):
                     raise ValueError("Invalid completion subscription response")
                 subscription = binding["subscription_id"]
+                serving_host = binding["host_id"]
                 last_error = None
                 continue
             result = request("completion_next", {"consumer": consumer, "subscription_id": subscription},
                              timeout=min(2, remaining), deadline=True)
             if not isinstance(result, dict) or result.get("status") not in {
                 "pending", "completed", "failed", "uncertain"
-            } or result.get("consumer") != consumer or not _valid_identifier(result.get("host_id")) \
+            } or result.get("consumer") != consumer or result.get("host_id") != serving_host \
                     or (result["status"] != "pending" and (
                         not isinstance(result.get("event"), dict)
                         or not _valid_identifier(result["event"].get("event_id"))
@@ -256,7 +266,7 @@ def wait(consumer: str, timeout: float) -> dict:
         except (OSError, ValueError, KeyError, TypeError, AttributeError, RecursionError) as error:
             timed_out = isinstance(error, TimeoutError) or isinstance(error.__cause__, TimeoutError)
             if timed_out and saw_pending and last_error is None and time.monotonic() >= deadline:
-                return {"status": "deadline", "consumer": consumer}
+                return delivered({"status": "deadline", "consumer": consumer})
             # A lost admission reply is uncertain: do not recreate a concurrently removed subscription.
             transient = isinstance(error, CompletionBusy) or (subscription is not None and (
                 isinstance(error, (TimeoutError, ConnectionError)) or isinstance(error.__cause__, TimeoutError)))
@@ -265,16 +275,16 @@ def wait(consumer: str, timeout: float) -> dict:
                       f"{bound_text(str(error) or type(error).__name__, 300)}", file=sys.stderr, flush=True)
                 diagnosed = True
             if not transient:
-                return {"status": "unavailable", "consumer": consumer}
+                return delivered({"status": "unavailable", "consumer": consumer})
             last_error = error
             time.sleep(min(WAIT_POLL_SECONDS, max(0, deadline - time.monotonic())))
             continue
         last_error = None
         if result["status"] != "pending":
-            return result
+            return delivered(result)
         saw_pending = True
         if time.monotonic() >= deadline:
-            return {"status": "deadline", "consumer": consumer}
+            return delivered({"status": "deadline", "consumer": consumer})
         time.sleep(min(WAIT_POLL_SECONDS, max(0, deadline - time.monotonic())))
 
 
@@ -370,24 +380,38 @@ class ManagedProcesses:
         return {**result, "consumer": consumer, "host_id": self.host_id}
 
     def acknowledge(self, payload: dict) -> dict:
-        if set(payload) != {"consumer", "event_id"}:
-            raise ValueError("completion_ack needs consumer and event_id")
+        if set(payload) not in ({"consumer", "event_id"}, {"consumer", "event_id", "host_id", "event_host_id"},
+                                {"consumer", "event_id", "host_id", "event_host_id", "subscription_id"}):
+            raise ValueError("completion_ack needs consumer and event_id, with optional host_id and event_host_id together")
+        if "host_id" in payload:
+            if _identifier(payload["host_id"], "host") != self.host_id:
+                raise ValueError("Completion serving host ID does not match")
+            _identifier(payload["event_host_id"], "event host")
         consumer = _identifier(payload["consumer"], "consumer")
         event_id = payload["event_id"]
         sequence = _completion_sequence(event_id)
+        subscription = _identifier(payload["subscription_id"], "subscription") if "subscription_id" in payload else None
         with self.store.transaction(timeout=.1) as db:
-            row = db.execute("SELECT cursor FROM completion_consumers WHERE name=?", (consumer,)).fetchone()
+            row = db.execute("SELECT cursor,subscription_id FROM completion_consumers WHERE name=?", (consumer,)).fetchone()
             if row is None:
                 raise ValueError("Unknown completion consumer; wait first")
-            if db.execute("SELECT 1 FROM completion_events WHERE sequence=?", (sequence,)).fetchone() is None:
+            if subscription is not None and row["subscription_id"] != subscription:
+                raise ValueError("Completion consumer subscription was removed, replaced, or belongs to another database")
+            event = db.execute("SELECT host_id FROM completion_events WHERE sequence=?", (sequence,)).fetchone()
+            if event is None:
                 raise ValueError("Unknown completion event ID")
+            if "event_host_id" in payload and event["host_id"] != payload["event_host_id"]:
+                raise ValueError("Completion producing host ID does not match")
             if sequence > row["cursor"]:
                 pending = db.execute("SELECT MIN(sequence) FROM completion_events WHERE data IS NOT NULL AND sequence>?",
                                      (row["cursor"],)).fetchone()[0]
                 if sequence != pending:
                     raise ValueError("Acknowledge the oldest pending event first")
                 db.execute("UPDATE completion_consumers SET cursor=? WHERE name=?", (sequence, consumer))
-        return {"acknowledged": True, "event_id": event_id, "consumer": consumer, "host_id": self.host_id}
+        result = {"acknowledged": True, "event_id": event_id, "consumer": consumer, "host_id": self.host_id}
+        if subscription is not None:
+            result["subscription_id"] = subscription
+        return result
 
     def start(self, payload: dict) -> dict:
         with self.store.transaction() as db:

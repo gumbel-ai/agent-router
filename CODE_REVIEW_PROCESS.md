@@ -387,6 +387,9 @@ item before requesting review.
   the new state in one swap.
 - A process-group leader exiting does not prove the group exited. After a failure,
   check the group and SIGKILL any members that remain.
+- Keep failure state independent of diagnostic text. An exception or sanitized stderr
+  can have an empty message; it must still trigger failed delivery and owned-process
+  cleanup, with a nonempty diagnostic fallback.
 
 **Parsing and cost**
 
