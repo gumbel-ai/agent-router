@@ -103,13 +103,15 @@ def _record(kind: str, row, data: dict, host_id: str) -> tuple[dict, list[str]]:
                       parent_session_id=row["session_id"], parent_agent_id=data.get("parent_agent_id"))
         authoritative = {"task_id": row["task_id"], "parent_session_id": row["session_id"]}
     elif kind in {"router_task", "attempt"}:
-        matching_parent = row["submission_session_id"] == row["parent_session_id"]
+        remote = "remote_origin" in data
+        matching_parent = not remote and row["submission_session_id"] == row["parent_session_id"]
         result.update(host_id=data.get("host_id", host_id), runtime=data.get("executor"), session_id=data.get("child_session_id"),
-                      parent_session_id=row["parent_session_id"], parent_runtime=row["parent_runtime"] if matching_parent else None,
-                      parent_agent_id=data.get("parent_agent_id"), router_task_id=row["task_id"],
+                      parent_session_id=None if remote else row["parent_session_id"],
+                      parent_runtime=row["parent_runtime"] if matching_parent else None,
+                      parent_agent_id=None if remote else data.get("parent_agent_id"), router_task_id=row["task_id"],
                       started_at=data.get("attempt_started_at"))
         result["work_item_id"] = data.get("work_item_id")
-        if not matching_parent and row["submission_session_id"] is not None:
+        if not remote and not matching_parent and row["submission_session_id"] is not None:
             invalid.append("parent_runtime")
         authoritative = {"task_id": row["task_id"]}
         if kind == "router_task":

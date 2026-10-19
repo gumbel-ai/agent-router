@@ -102,7 +102,7 @@ def required_text(payload: dict, key: str) -> str:
 def public(task: dict, store: Store | None = None, history: list[dict] | None = None) -> dict:
     result = {key: value for key, value in task.items() if key not in {
         "session_id", "invocation", "feedback", "permission_profile", "setup_command", "cleanup_requested", "token_prices",
-        "codex_usage_baseline", "codex_usage_total", "codex_baseline_complete", "claude_baseline", "claude_total", "claude_executable", "_claude_tracing"}}
+        "codex_usage_baseline", "codex_usage_total", "codex_baseline_complete", "claude_baseline", "claude_total", "claude_executable", "_claude_tracing", "remote_origin"}}
     attempt_history = store.history(task["task_id"]) if history is None and store is not None else history or []
     result.update(visibility(task, attempt_history))
     if store is not None or history is not None:
@@ -115,6 +115,9 @@ def public(task: dict, store: Store | None = None, history: list[dict] | None = 
 
 
 def visibility(task: dict, history: list[dict]) -> dict:
+    from router.remote_receiver import origin_metadata
+
+    origin = origin_metadata(task)
     model = task.get("resolved_model")
     attempts = {attempt["attempt_number"]: attempt for attempt in history if "attempt_number" in attempt}
     current = dict(task)
@@ -140,8 +143,10 @@ def visibility(task: dict, history: list[dict]) -> dict:
     if task.get("executor") == "claude":
         accounting = claude_public_usage({"usage": usage, "usage_complete": complete})
         usage, complete = accounting["usage"], accounting["usage_complete"]
-    return {"owner": "router", "control_mode": "control", "parent_session_id": task["session_id"],
-            "parent_agent_id": task.get("parent_agent_id"), "task": task["invocation"]["task"], "cwd": task["invocation"]["parent_worktree"],
+    return {"owner": "router", "control_mode": "control", "parent_session_id": None if origin else task["session_id"],
+            "parent_agent_id": None if origin else task.get("parent_agent_id"),
+            **({"remote_origin": origin} if origin else {}),
+            "task": task["invocation"]["task"], "cwd": task["invocation"]["parent_worktree"],
             "started_at": task.get("attempt_started_at"),
             "elapsed_ms": elapsed,
             "models": [model] if model else [], "model_source": "configured" if model else None,
@@ -558,6 +563,8 @@ class Controller:
                     raise ValueError("instruction_id does not belong to this current host submission")
             else:
                 task = self.store.get(required_text(invocation, "task_id"), db)
+                if "remote_origin" in task:
+                    raise ValueError("Remote task requires origin-owned remote control")
                 if task["session_id"] != session:
                     raise ValueError("Task belongs to another parent session")
             previous = db.execute("SELECT operation,payload FROM authorizations WHERE session_id=? AND request_id=?", (session, request_id)).fetchone()
@@ -584,6 +591,8 @@ class Controller:
                 session = row[0]
             else:
                 task = self.store.get(required_text(payload, "task_id"), db)
+                if "remote_origin" in task:
+                    raise ValueError("Remote task requires origin-owned remote control")
                 session = task["session_id"]
             replay = db.execute("SELECT operation,payload,task_id FROM operations WHERE session_id=? AND request_id=?", (session, request_id)).fetchone()
             if replay:
@@ -746,8 +755,8 @@ class Controller:
             # Parent references are accepted unbounded at dispatch; omit one the fleet wire
             # cannot carry rather than let it invalidate the host's whole snapshot.
             parents = {}
-            for key, value in (("parent_session_id", task["session_id"]),
-                               ("parent_agent_id", task.get("parent_agent_id"))):
+            for key, value in (("parent_session_id", view["parent_session_id"]),
+                               ("parent_agent_id", view["parent_agent_id"])):
                 try:
                     parents[key] = None if value is None else identifier(value, key)
                 except (TypeError, ValueError):

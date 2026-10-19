@@ -36,6 +36,10 @@ class Store:
                     session_id TEXT NOT NULL, request_id TEXT NOT NULL,
                     operation TEXT NOT NULL, payload TEXT NOT NULL, task_id TEXT NOT NULL,
                     PRIMARY KEY(session_id, request_id))""",
+                """CREATE TABLE IF NOT EXISTS remote_operations (
+                    origin_host_id TEXT NOT NULL, origin_session_id TEXT NOT NULL, request_id TEXT NOT NULL,
+                    operation TEXT NOT NULL, payload TEXT NOT NULL, task_id TEXT NOT NULL,
+                    PRIMARY KEY(origin_host_id, origin_session_id, request_id))""",
                 """CREATE TABLE IF NOT EXISTS tasks (
                     task_id TEXT PRIMARY KEY, session_id TEXT NOT NULL, data TEXT NOT NULL)""",
                 """CREATE TABLE IF NOT EXISTS attempts (
