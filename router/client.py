@@ -62,6 +62,9 @@ def request(operation: str, payload: dict, endpoint: Path | None = None, *, time
         if operation == "task_diff":
             if len(line) > limit or not line.endswith(b"\n"):
                 raise TaskDiffProtocolError("Incomplete or oversized task-diff reply")
+            client.settimeout(remaining())
+            if client.recv(1):
+                raise TaskDiffProtocolError("Unexpected bytes after task-diff reply")
             response = parse_json(line)
             if not isinstance(response, dict) or type(response.get("ok")) is not bool:
                 raise TaskDiffProtocolError("Invalid task-diff response envelope")

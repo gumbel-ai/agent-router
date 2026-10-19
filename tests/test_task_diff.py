@@ -9,7 +9,7 @@ import sys
 import tempfile
 import time
 import unittest
-from contextlib import contextmanager, redirect_stderr, redirect_stdout
+from contextlib import ExitStack, contextmanager, redirect_stderr, redirect_stdout
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -292,29 +292,53 @@ class TaskDiffTests(unittest.TestCase):
                 self.assertEqual(code, 2, error)
         receipt = json.dumps(self.read(), separators=(",", ":")).encode()
         valid = b'{"ok":true,"result":' + receipt + b'}\n'
-        cases = [("valid", valid, 0), ("exact-bound", b" " * (MAX_WIRE_BYTES - len(valid)) + valid, 0),
-                 ("oversize", b" " * (MAX_WIRE_BYTES + 1 - len(valid)) + valid, 1),
-                 ("empty", b"", 1), ("list", b"[]\n", 1), ("null", b"null\n", 1),
-                 ("scalar", b"true\n", 1), ("missing-ok", b"{}\n", 1),
-                 ("missing-result", b'{"ok":true}\n', 1), ("missing-error", b'{"ok":false}\n', 1),
-                 ("integer-ok", valid.replace(b'"ok":true', b'"ok":1'), 1),
-                 ("string-ok", valid.replace(b'"ok":true', b'"ok":"false"'), 1),
-                 ("extra-field", valid.replace(b'{"ok":true', b'{"extra":1,"ok":true'), 1),
-                 ("duplicate-envelope", valid.replace(b'"ok":true', b'"ok":false,"ok":true'), 1),
-                 ("duplicate-receipt", valid.replace(b'"schema_version":1', b'"schema_version":2,"schema_version":1'), 1),
-                 ("nonfinite", valid.replace(b'{"ok":true', b'{"extra":NaN,"ok":true'), 1),
-                 ("overflow-number", valid.replace(b'"schema_version":1', b'"schema_version":1e309'), 1),
-                 ("deep", b"[" * 2000 + b"0" + b"]" * 2000 + b"\n", 1),
-                 ("nonterminated", valid[:-1], 1), ("truncated", valid[:-2] + b"\n", 1),
-                 ("remainder", valid + b"{}", 1),
-                 ("invalid-error", b'{"ok":false,"error":{"private":"private instruction fixture"}}\n', 1),
-                 ("refusal", b'{"ok":false,"error":"private instruction fixture"}\n', 1),
-                 ("timeout", TimeoutError(), 1), ("interrupt", KeyboardInterrupt(), 130)]
+        exact_bound = b" " * (MAX_WIRE_BYTES - len(valid)) + valid
+        refusal = b'{"ok":false,"error":"private instruction fixture"}\n'
+        cases = [("valid", valid, 0, None), ("exact-bound", exact_bound, 0, None),
+                 ("oversize", b" " * (MAX_WIRE_BYTES + 1 - len(valid)) + valid, 1, "invalid_response"),
+                 ("empty", b"", 1, "invalid_response"), ("list", b"[]\n", 1, "invalid_response"),
+                 ("null", b"null\n", 1, "invalid_response"), ("scalar", b"true\n", 1, "invalid_response"),
+                 ("missing-ok", b"{}\n", 1, "invalid_response"),
+                 ("missing-result", b'{"ok":true}\n', 1, "invalid_response"),
+                 ("missing-error", b'{"ok":false}\n', 1, "invalid_response"),
+                 ("integer-ok", valid.replace(b'"ok":true', b'"ok":1'), 1, "invalid_response"),
+                 ("string-ok", valid.replace(b'"ok":true', b'"ok":"false"'), 1, "invalid_response"),
+                 ("extra-field", valid.replace(b'{"ok":true', b'{"extra":1,"ok":true'), 1, "invalid_response"),
+                 ("duplicate-envelope", valid.replace(b'"ok":true', b'"ok":false,"ok":true'), 1, "invalid_response"),
+                 ("duplicate-receipt", valid.replace(b'"schema_version":1', b'"schema_version":2,"schema_version":1'), 1, "invalid_response"),
+                 ("nonfinite", valid.replace(b'{"ok":true', b'{"extra":NaN,"ok":true'), 1, "invalid_response"),
+                 ("overflow-number", valid.replace(b'"schema_version":1', b'"schema_version":1e309'), 1, "invalid_response"),
+                 ("deep", b"[" * 2000 + b"0" + b"]" * 2000 + b"\n", 1, "invalid_response"),
+                 ("nonterminated", valid[:-1], 1, "invalid_response"),
+                 ("truncated", valid[:-2] + b"\n", 1, "invalid_response"),
+                 ("remainder", valid + b"{}", 1, "invalid_response"),
+                 ("invalid-error", b'{"ok":false,"error":{"private":"private instruction fixture"}}\n', 1, "invalid_response"),
+                 ("refusal", refusal, 1, "request_failed"), ("timeout", TimeoutError(), 1, "transport_deadline"),
+                 ("interrupt", KeyboardInterrupt(), 130, None),
+                 ("split-valid", [valid[:len(valid) // 2], valid[len(valid) // 2:]], 0, None),
+                 ("split-terminator", [valid[:-1], b"\n"], 0, None),
+                 ("split-json-tail", [valid, b"{}"], 1, "invalid_response"),
+                 ("split-space-tail", [valid, b" "], 1, "invalid_response"),
+                 ("split-newline-tail", [valid, b"\n"], 1, "invalid_response"),
+                 ("split-nul-tail", [valid, b"\x00"], 1, "invalid_response"),
+                 ("split-oversize-tail", [valid, b"x" * (MAX_WIRE_BYTES + 1)], 1, "invalid_response"),
+                 ("exact-bound-tail", [exact_bound, b"{}"], 1, "invalid_response"),
+                 ("split-refusal-tail", [refusal, b"{}"], 1, "invalid_response"),
+                 ("nonclosing-after-line", [valid, TimeoutError()], 1, "transport_deadline"),
+                 ("refusal-nonclosing", [refusal, TimeoutError()], 1, "transport_deadline"),
+                 ("reset-after-line", [valid, ConnectionResetError()], 1, "transport_unavailable"),
+                 ("io-error-after-line", [valid, OSError()], 1, "transport_unavailable"),
+                 ("interrupt-after-line", [valid, KeyboardInterrupt()], 130, None),
+                 ("remaining-budget", valid, 0, None),
+                 ("remaining-expired", valid, 1, "transport_deadline")]
+        clock_steps = {"remaining-budget": [0, 1, 2, 3, 4], "remaining-expired": [0, 1, 2, 3, 15]}
 
         class ReplySocket:
             def __init__(self, content):
-                self.content = content
-                self.offset = 0
+                self.chunks = list(content) if isinstance(content, list) else [content]
+                self.timeouts = []
+                self.read_sizes = []
+                self.eof_reads = 0
 
             def __enter__(self):
                 return self
@@ -323,7 +347,7 @@ class TaskDiffTests(unittest.TestCase):
                 return False
 
             def settimeout(self, timeout):
-                pass
+                self.timeouts.append(timeout)
 
             def connect(self, endpoint):
                 pass
@@ -333,18 +357,31 @@ class TaskDiffTests(unittest.TestCase):
                 self.assert_read = message["operation"]
 
             def recv(self, count):
-                if isinstance(self.content, BaseException):
-                    raise self.content
-                chunk = self.content[self.offset:self.offset + count]
-                self.offset += len(chunk)
+                self.read_sizes.append(count)
+                if not self.chunks:
+                    self.eof_reads += 1
+                    return b""
+                content = self.chunks[0]
+                if isinstance(content, BaseException):
+                    raise content
+                chunk = content[:count]
+                self.chunks[0] = content[len(chunk):]
+                if not self.chunks[0]:
+                    self.chunks.pop(0)
+                if not chunk:
+                    self.eof_reads += 1
                 return chunk
 
         def socket_read(operation, payload, **kwargs):
             return actual_request(operation, payload, self.root / "fixture.sock", **kwargs)
 
-        for name, content, expected in cases:
+        for name, content, expected, expected_error in cases:
             boundary = ReplySocket(content)
-            with self.subTest(local_envelope=name), patch("router.client.socket.socket", return_value=boundary):
+            with self.subTest(local_envelope=name), ExitStack() as stack:
+                stack.enter_context(patch("router.client.socket.socket", return_value=boundary))
+                if name in clock_steps:
+                    clock = iter(clock_steps[name])
+                    stack.enter_context(patch("router.client.time", SimpleNamespace(monotonic=lambda clock=clock: next(clock))))
                 try:
                     code, output, error = self.cli(local, socket_read)
                 except (AttributeError, KeyError) as failure:
@@ -357,8 +394,18 @@ class TaskDiffTests(unittest.TestCase):
                 else:
                     result = json.loads(output)
                     self.assertEqual(result["status"], "ok" if expected == 0 else "unavailable")
-                    if expected == 1 and name not in {"refusal", "timeout"}:
-                        self.assertEqual(result.get("error", {}).get("code"), "invalid_response")
+                    if expected_error is not None:
+                        self.assertEqual(result.get("error", {}).get("code"), expected_error)
+                    if expected == 0 or name == "refusal":
+                        self.assertEqual(boundary.eof_reads, 1)
+                        self.assertEqual(boundary.read_sizes[-1], 1)
+                    if name == "remaining-budget":
+                        self.assertEqual(boundary.timeouts, [14, 13, 12, 11])
+                    if name == "split-oversize-tail":
+                        self.assertEqual(sum(len(chunk) for chunk in boundary.chunks), MAX_WIRE_BYTES)
+                    if name == "exact-bound-tail":
+                        self.assertEqual(boundary.chunks, [b"}"])
+        self.assertEqual(self.patch.read_bytes(), before[2])
         code, _, error = self.cli([*fleet[:fleet.index("--host") + 1], "missing", *fleet[fleet.index("--host") + 2:]])
         self.assertEqual(code, 2, error)
         self.patch.unlink()

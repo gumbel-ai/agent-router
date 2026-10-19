@@ -52,8 +52,12 @@ tree IDs require empty bytes; contradictory capture evidence is refused. Strict 
 decoded length, SHA-256, identity, version, field allowlist
 and 512 KiB wire bounds are checked on local and fleet reads. Repeated reads may safely
 retrieve the same retained artifact; the digest describes the bytes actually returned.
-Local replies must also have a complete newline-terminated daemon envelope, strict
-boolean `ok`, and exactly the matching `result` or `error` field. Duplicate JSON keys,
+Local replies must also have a complete newline-terminated daemon envelope followed by
+confirmed connection EOF, strict boolean `ok`, and exactly the matching `result` or
+`error` field. EOF confirmation uses the remaining request deadline; a peer that does
+not close cannot produce a successful read. Any byte after the terminator is refused,
+even when it arrives in another socket chunk or after an exactly 512 KiB frame.
+Duplicate JSON keys,
 nonfinite values, excessive nesting and trailing data are refused before parsing loses
 that evidence. The raw-byte bound includes the local envelope and its terminator.
 
