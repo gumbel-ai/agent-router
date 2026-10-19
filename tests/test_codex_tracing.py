@@ -34,6 +34,9 @@ class CodexTracingTests(unittest.TestCase):
         self.pin = patch.object(codex_tracing, "AUDITED_DIGEST", digest.hexdigest())
         self.pin.start()
         self.addCleanup(self.pin.stop)
+        self.node = patch.object(codex_tracing.shutil, "which", return_value="/usr/bin/node")
+        self.node.start()
+        self.addCleanup(self.node.stop)
         self.task = {"task_id": "task-1", "child_session_id": "session-1", "resolved_model": "openai/gpt-5.3-codex",
                      "worktree": str(self.root / "worktree"), "artifact_dir": str(self.root / "artifacts"), "executor": "codex", "attempts": 0,
                      "invocation": {"task": "do work", "parent_repo": str(self.root), "parent_worktree": str(self.root)},
@@ -97,10 +100,33 @@ class CodexTracingTests(unittest.TestCase):
         self.assertNotIn("PLUGIN_ROOT", environment)
 
     def test_native_thread_reconciles_router_correlation(self):
+        del self.task["child_session_id"]
         task = self.selected_task()
         from router.codex import collect
-        collect(task, {"type": "thread.started", "thread_id": "12345678-1234-4321-8765-123456789abc"})
-        self.assertEqual(task["child_session_id"], task["tracing"]["correlation"]["session_id"])
+        thread = "12345678-1234-4321-8765-123456789abc"
+        collect(task, {"type": "thread.started", "thread_id": thread})
+        self.assertEqual(task["child_session_id"], thread)
+        self.assertEqual(task["tracing"]["correlation"]["session_id"], thread)
+        self.assertTrue(task["thread_observed"])
+        self.assertNotIn("execution_error", task)
+
+    def test_hook_path_excludes_delegated_repositories(self):
+        task = self.selected_task()
+        environment = child_environment({"PATH": "/usr/bin", "NODE_OPTIONS": "--require x",
+                                         "LANGFUSE_PUBLIC_KEY": "public", "LANGFUSE_SECRET_KEY": "secret"}, task)
+        self.assertEqual(environment["PATH"], "/usr/bin")
+        self.assertNotIn("NODE_OPTIONS", environment)
+        codex_tracing.shutil.which.return_value = None
+        with self.assertRaisesRegex(ValueError, "node"):
+            child_environment({"PATH": "/usr/bin"}, task)
+
+    def test_missing_credentials_disable_export_and_pin_endpoint(self):
+        task = self.selected_task()
+        environment = child_environment({"PATH": "/usr/bin", "LANGFUSE_BASEURL": "https://langfuse.example",
+                                         "LANGFUSE_ENVIRONMENT": "ci"}, task)
+        self.assertEqual(environment["TRACE_TO_LANGFUSE"], "0")
+        self.assertEqual(environment["LANGFUSE_BASE_URL"], "https://langfuse.example")
+        self.assertEqual(environment["LANGFUSE_TRACING_ENVIRONMENT"], "ci")
 
     def test_selection_allows_native_session_to_be_assigned_after_launch(self):
         task = {key: value for key, value in self.task.items() if key != "child_session_id"}

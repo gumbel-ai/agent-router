@@ -89,7 +89,13 @@ unchanged.
 Codex's plugin destination is still operator-managed; Router does not read or
 copy `~/.codex/langfuse.json`. The task's `tracing.available` flag is true only
 when the required startup credentials are present. Changed or missing plugin
-source fails closed rather than launching an untraced replacement. A repository
+source fails closed rather than launching an untraced replacement. Without
+those credentials Router sets `TRACE_TO_LANGFUSE=0`, and it always sets the
+endpoint, so a worktree `.codex/langfuse.json` cannot enable or redirect export.
+The trusted hook runs `node` outside the Codex sandbox, so selected children drop
+`NODE_OPTIONS`, loader/shell startup inputs and PATH entries inside delegated
+repositories (including `.venv/bin`); launch fails if no operator `node` remains.
+A repository
 without the explicit selection retains the visible unavailable reason below.
 
 A live check on a Linux host over SSH ran a Router-launched Codex 0.163.0 child

@@ -9,6 +9,7 @@ operator environment inputs; Router never reads or copies a credential file.
 import hashlib
 import json
 import os
+import shutil
 from pathlib import Path
 
 PLUGIN_ID = "langfuse-codex-observability@inline"
@@ -21,6 +22,8 @@ CONFIG_KEYS = {"plugin_dir"}
 HOOK_COMMAND = 'node "${PLUGIN_ROOT}/dist/index.mjs"'
 HOOK_STATUS = "Uploading Codex trace to Langfuse"
 HOOK_TRUST_KEY = "/<session-flags>/config.toml:stop:0:0"
+# Pinned plugin default; set explicitly so a worktree .codex/langfuse.json cannot redirect.
+DEFAULT_BASE_URL = "https://cloud.langfuse.com"
 HOOK_TRUST_HASH = "sha256:69a05cbfa6984ec5f1433343b45480d5239c119e7332ae863f9865edc2efec74"
 
 
@@ -130,11 +133,29 @@ def hook_configuration() -> str:
 
 def environment(result: dict[str, str], task: dict, *, credentials: dict[str, str]) -> dict[str, str]:
     selected(task)
+    # The trusted hook runs `node` outside the Codex sandbox. Mirror the Claude
+    # route: drop startup-injection inputs and delegated-repository PATH entries.
+    for key in tuple(result):
+        if key.startswith(("LD_", "DYLD_", "BASH_FUNC_")) or key in {"NODE_OPTIONS", "BASH_ENV", "ENV", "ZDOTDIR"}:
+            result.pop(key, None)
+    roots = [Path(task["worktree"]).resolve(), Path(task["artifact_dir"]).resolve()]
+    roots += [Path(task["invocation"][name]).resolve() for name in ("parent_repo", "parent_worktree")]
+    result["PATH"] = os.pathsep.join(
+        entry for entry in result.get("PATH", os.defpath).split(os.pathsep)
+        if Path(entry).is_absolute() and not any(Path(entry).resolve().is_relative_to(root) for root in roots))
+    if shutil.which("node", path=result["PATH"]) is None:
+        raise ValueError("Codex tracing requires an operator-provisioned node outside delegated repositories")
     result["PLUGIN_ROOT"] = task["_codex_tracing"]["plugin_dir"]
-    for key in ("LANGFUSE_PUBLIC_KEY", "LANGFUSE_SECRET_KEY", "LANGFUSE_BASE_URL", "LANGFUSE_BASEURL",
-                "LANGFUSE_ENVIRONMENT"):
-        if key in credentials:
-            result[key] = credentials[key]
+    available = all(isinstance(credentials.get(key), str) and credentials[key].strip()
+                    for key in ("LANGFUSE_PUBLIC_KEY", "LANGFUSE_SECRET_KEY"))
+    if available:
+        result["LANGFUSE_PUBLIC_KEY"] = credentials["LANGFUSE_PUBLIC_KEY"]
+        result["LANGFUSE_SECRET_KEY"] = credentials["LANGFUSE_SECRET_KEY"]
+    # The pinned plugin reads LANGFUSE_BASE_URL and LANGFUSE_TRACING_ENVIRONMENT only.
+    result["LANGFUSE_BASE_URL"] = (credentials.get("LANGFUSE_BASE_URL") or credentials.get("LANGFUSE_BASEURL")
+                                   or DEFAULT_BASE_URL)
+    if credentials.get("LANGFUSE_ENVIRONMENT"):
+        result["LANGFUSE_TRACING_ENVIRONMENT"] = credentials["LANGFUSE_ENVIRONMENT"]
     correlation = task["tracing"]["correlation"]
     metadata = {"router_task_id": correlation["router_task_id"], "router_host_id": correlation["host_id"]}
     session = correlation.get("session_id")
@@ -142,7 +163,7 @@ def environment(result: dict[str, str], task: dict, *, credentials: dict[str, st
         metadata["router_child_session_id"] = session
     if "work_item_id" in correlation:
         metadata["work_item_id"] = correlation["work_item_id"]
-    result.update(TRACE_TO_LANGFUSE="1", LANGFUSE_CODEX_USER_ID="agent-router",
+    result.update(TRACE_TO_LANGFUSE="1" if available else "0", LANGFUSE_CODEX_USER_ID="agent-router",
                   LANGFUSE_CODEX_METADATA=json.dumps(metadata, separators=(",", ":")),
                   LANGFUSE_CODEX_TRACE_SEED=session or correlation["router_task_id"])
     return result
