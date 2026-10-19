@@ -73,9 +73,11 @@ another home's daemon reports `unknown` before its configuration or hooks are re
 The native control socket/API was verified with Codex 0.163.0. Unsupported clients
 also report `unknown`. Queries and normal connection close share a five-second
 deadline with a one MiB output bound; cleanup after cancellation allows up to one
-further second. A missing marker is
+further second. When only normal connection close exceeds that deadline, fully
+received and validated configuration and hook evidence still determine readiness.
+A deadline before that evidence is complete reports `unknown`. A missing marker is
 `project_not_enabled`; untrusted hooks remain `hooks_untrusted`. Missing support,
-malformed replies, transport failures and deadlines report `unknown` with a reason.
+malformed replies and transport failures report `unknown` with a reason.
 Missing native Router hooks report `unknown` with discovery warnings when supplied;
 complete Router hook evidence remains usable despite unrelated discovery warnings.
 Readiness describes configuration prerequisites, not proof that an existing

@@ -36,8 +36,10 @@ async def _readiness_evidence(home: Path, cwd: Path) -> tuple[dict, dict, list[s
     # Native Codex can advertise long paths through short rendezvous aliases.
     endpoint = (home / "app-server-control" / "app-server-control.sock").resolve(strict=True)
     size = 0
-    async with asyncio.timeout(READINESS_TIMEOUT):
-        async with unix_connect(endpoint, open_timeout=READINESS_TIMEOUT, close_timeout=1,
+    evidence = None
+    deadline = asyncio.timeout(READINESS_TIMEOUT)
+    try:
+        async with deadline, unix_connect(endpoint, open_timeout=READINESS_TIMEOUT, close_timeout=1,
                                 max_size=READINESS_OUTPUT_LIMIT, max_queue=1,
                                 compression=None, ping_interval=None, proxy=None) as connection:
             async def receive(identity):
@@ -106,7 +108,12 @@ async def _readiness_evidence(home: Path, cwd: Path) -> tuple[dict, dict, list[s
                     if not isinstance(hook.get("currentHash"), str):
                         raise ValueError("Codex readiness trusted Router hook has no current hash")
                     state[key]["trusted_hash"] = hook["currentHash"]
-            return result, state, data[0]["warnings"]
+            evidence = result, state, data[0]["warnings"]
+    except TimeoutError:
+        if evidence is None or not deadline.expired():
+            raise
+        # Completed RPC evidence survives expiry during normal connection close.
+    return evidence
 
 
 def _snake(event: str) -> str:
