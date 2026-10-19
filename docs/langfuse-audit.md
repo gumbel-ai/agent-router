@@ -190,3 +190,18 @@ credential-free checks of AST-extracted Claude tag/truncation functions. No plug
 module was imported, no tracing plugin was installed, no tracing credentials or real
 session content were used, and no trace was uploaded. These checks establish
 source behavior only; all live capture and remote-host claims remain NOT CHECKED.
+
+## Follow-up Codex live check
+
+On 2026-10-19, a Linux host over SSH ran Codex 0.163.0 with the pinned
+Langfuse plugin 0.4.2 and a synthetic Router metadata payload. A native
+session-flags Stop hook was supplied without `--dangerously-bypass-hook-trust`;
+the same hook ran on a fresh invocation and its resumed invocation. Langfuse
+v2 observations contained the expected Router task/host/work-item metadata and
+the native Codex thread ID. The fresh and resumed traces had distinct trace IDs,
+non-zero generation usage/cost, and retained the same native session ID.
+
+A Router-launched Codex child using the explicit `codex_tracing` route then ran
+on the same host, exited 0 and went through accept, integrate and close. Its
+Langfuse trace carried `router_task_id`, `router_host_id` and `work_item_id`
+with usage and cost. Remote-child execution remains NOT CHECKED (see #54).

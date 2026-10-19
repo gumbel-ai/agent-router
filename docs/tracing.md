@@ -65,13 +65,50 @@ attempt records are unchanged. A launched child's tracing record is kept through
 final capture and restart recovery even if the repository opts out later; a
 later launch from an opted-out repository records no tracing.
 
+## Codex route
+
+Codex children normally run with `--ignore-user-config`, so a repository-wide
+`--tracing` request remains unavailable unless the operator explicitly selects
+the audited Codex plugin. Add one private repository setting (outside the
+delegated tree):
+
+```json
+{"codex_tracing":"{\"plugin_dir\":\"/approved/codex-langfuse-plugin\"}"}
+```
+
+Router verifies the Langfuse Codex Observability Plugin 0.4.2 source digest,
+then supplies its Stop hook and exact native session-flags trust entry through
+the child command's inline Codex configuration. It forwards only the selected
+child's documented Langfuse environment inputs and bounded metadata containing
+the Router task and host. Codex emits its native session/thread ID after launch;
+Router reconciles that ID into the local correlation record, while the plugin
+emits it on the Langfuse observations. `LANGFUSE_CODEX_USER_ID=agent-router` prevents
+fallback to a personal Codex-auth email. Router usage and cost accounting remain
+unchanged.
+
+Codex's plugin destination is still operator-managed; Router does not read or
+copy `~/.codex/langfuse.json`. The task's `tracing.available` flag is true only
+when the required startup credentials are present. Changed or missing plugin
+source fails closed rather than launching an untraced replacement. Without
+those credentials Router sets `TRACE_TO_LANGFUSE=0`, and it always sets the
+endpoint, so a worktree `.codex/langfuse.json` cannot enable or redirect export.
+The trusted hook runs `node` outside the Codex sandbox, so selected children drop
+`NODE_OPTIONS`, loader/shell startup inputs and PATH entries inside delegated
+repositories (including `.venv/bin`); launch fails if no operator `node` remains.
+A repository
+without the explicit selection retains the visible unavailable reason below.
+
+A live check on a Linux host over SSH ran a Router-launched Codex 0.163.0 child
+through accept, integrate and close; Langfuse received its trace with Router task,
+host and work-item metadata plus usage and cost. Remote-child tracing depends on
+#54, where the remote host's Router launches the child through this same path.
+
 ## Other executors
 
-Codex and Claude remain explicitly unavailable for this route:
+Claude remains explicitly unavailable for the default route:
 
 | Executor | Reason recorded when tracing is requested |
 | --- | --- |
-| Codex | Children run with `--ignore-user-config`; tracing plugin hooks need trust from that ignored user layer. |
 | Claude | Default children run with `--safe-mode`; the explicit candidate below uses `--restricted` and a selected plugin, but real tracer exports remain unverified. |
 
 Their tracing request is retained in task and attempt history with `available:
@@ -112,7 +149,7 @@ Router forwards the same documented `LANGFUSE_*` inputs as the OpenCode route
 only to the opted-in Claude child phase; the pinned plugin reads plain
 environment values before plugin options. Because it reads only
 `LANGFUSE_BASE_URL`, Router maps `LANGFUSE_BASEURL` to it when the canonical name
-is absent. Setup, default and Codex children and
+is absent. Setup, default and non-selected Codex children and
 all Git subprocesses still remove `LANGFUSE_*`. As with OpenCode, the secret is
 present in the child process environment, so child tools can read it. Router
 does not read credential files or persist credential values. `tracing.available`

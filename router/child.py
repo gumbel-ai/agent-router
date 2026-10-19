@@ -8,7 +8,7 @@ import uuid
 from collections.abc import Callable
 from pathlib import Path
 
-from router import claude_tracing
+from router import claude_tracing, codex_tracing
 from router.claude_executor import validate_persistence
 from router.config import Settings
 from router.process import creation_identity
@@ -61,7 +61,7 @@ OTEL_RESOURCE_ATTRIBUTES = "OTEL_RESOURCE_ATTRIBUTES"
 # These runtimes deliberately discard their user/plugin configuration before launch.
 # Keep the reason explicit in the public task record until a supported route exists.
 TRACING_UNAVAILABLE = {
-    "codex": "Codex children run with --ignore-user-config; tracing plugin hooks need trust from that ignored user layer",
+    "codex": "Codex tracing requires an explicit audited codex_tracing plugin selection when user configuration is ignored",
     "claude": "Claude children run with --safe-mode and no setting sources; installed plugins and hooks do not load",
 }
 
@@ -138,10 +138,12 @@ def executor_command(settings: Settings, task: dict) -> list[str]:
     session = task.get("child_session_id")
     if task["attempts"] and not session:
         raise ValueError("Codex session ID unavailable; cannot resume or silently replace this child")
+    tracing = codex_tracing.selected(task)
     return [*settings.codex_command, "exec", *(["resume", session] if session else []),
             "--json", "--ignore-user-config", "--ignore-rules", "--disable", "multi_agent", "--disable", "multi_agent_v2",
             "-c", 'approval_policy="never"', "-c", f'sandbox_mode="{task["permission_profile"]["sandbox"]}"',
             "-c", 'model_provider="openai"', "-c", 'service_tier="default"',
+            *( ["-c", codex_tracing.hook_configuration()] if tracing is not None else []),
             "--model", task["resolved_model"].removeprefix("openai/"), "--", prompt]
 
 
@@ -185,8 +187,14 @@ def child_environment(environment: dict[str, str], task: dict, *, include_tracin
             result.pop(OTEL_RESOURCE_ATTRIBUTES, None)
         result["OPENCODE_CONFIG_CONTENT"] = json.dumps(config, separators=(",", ":"))
     elif task["executor"] == "codex":
-        for key in ("OPENCODE_CONFIG_CONTENT", "OPENAI_BASE_URL", "CODEX_API_KEY", "OPENAI_API_KEY"):
+        for key in ("OPENCODE_CONFIG_CONTENT", "OPENAI_BASE_URL", "CODEX_API_KEY", "OPENAI_API_KEY",
+                    "TRACE_TO_LANGFUSE", "PLUGIN_ROOT"):
             result.pop(key, None)
+        if "_codex_tracing" in task:
+            if include_tracing_credentials:
+                codex_tracing.environment(result, task, credentials=environment)
+            else:
+                codex_tracing.selected(task)
     if task["executor"] == "claude":
         validate_persistence(environment)
         for key in ("CLAUDECODE", "CLAUDE_CODE_CHILD_SESSION", "CLAUDE_CODE_SESSION_ID", "CLAUDE_PID", "CLAUDE_CODE_ENTRYPOINT", "ANTHROPIC_MODEL", "ANTHROPIC_BASE_URL",

@@ -29,6 +29,12 @@ def collect(task: dict, event: dict) -> None:
         else:
             task["child_session_id"] = session
             task["thread_observed"] = True
+            tracing = task.get("tracing")
+            if isinstance(tracing, dict) and isinstance(tracing.get("correlation"), dict):
+                # Codex assigns the native thread ID after launch. Reconcile it
+                # into the Router/Langfuse join tuple without changing the owned
+                # session or accepting a replacement thread.
+                tracing["correlation"]["session_id"] = session
     elif kind in {"error", "turn.failed"}:
         task["execution_error"] = True
     elif kind in {"item.started", "item.completed"}:
