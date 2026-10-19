@@ -13,6 +13,7 @@ import stat
 import struct
 import subprocess
 import tempfile
+import threading
 import time
 import unicodedata
 import zlib
@@ -28,15 +29,24 @@ MAX_METADATA_BYTES = 512 * 1024
 MAX_COMMIT_BYTES = 1024
 MAX_PACK_OBJECTS = MAX_FILES * (MAX_DEPTH + 1) + 2
 MAX_EXPANDED_BYTES = MAX_TOTAL_BYTES + MAX_METADATA_BYTES + MAX_COMMIT_BYTES
+# ls-tree -t emits every ancestor and file, unlike packed tree-object bytes.
+MAX_TREE_LIST_BYTES = MAX_FILES * MAX_DEPTH * (MAX_PATH_BYTES + 6 + 1 + 4 + 1 + 64 + 1 + 20 + 1 + 1)
 GIT_TIMEOUT = 30
+GIT_CLEANUP_TIMEOUT = 1
 _IDENTITY = "Agent Router <router@localhost> 946684800 +0000"
 
 
-def _git(root, *arguments, data=None, environment=None, statuses=(0,), limit=MAX_METADATA_BYTES):
+def _git(root, *arguments, data=None, environment=None, statuses=(0,), limit=MAX_METADATA_BYTES,
+         read_configuration=False):
     """Bound stdout, stderr and process-group lifetime, including a hung Git child."""
-    env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
-    env.update(GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull, GIT_TERMINAL_PROMPT="0",
-               GIT_ALLOW_PROTOCOL="file")
+    env = {key: value for key, value in os.environ.items() if not key.startswith(("GIT_", "LANGFUSE_"))}
+    if read_configuration:
+        if arguments != ("config", "--null", "--path", "--get", "core.excludesFile"):
+            raise ValueError("Normal Git configuration is allowed only for the excludes-file query")
+        env.update((key, value) for key, value in os.environ.items() if key.startswith("GIT_CONFIG"))
+    else:
+        env.update(GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull)
+    env.update(GIT_TERMINAL_PROMPT="0", GIT_ALLOW_PROTOCOL="file")
     env.update(environment or {})
     command = ["git", "--no-replace-objects", "-c", f"core.hooksPath={os.devnull}",
                "-c", "core.fsmonitor=false", "-c", "commit.gpgSign=false",
@@ -47,41 +57,60 @@ def _git(root, *arguments, data=None, environment=None, statuses=(0,), limit=MAX
         if data is not None:
             source.write(data)
             source.seek(0)
-        with subprocess.Popen(command, env=env, stdin=source, stdout=subprocess.PIPE,
-                              stderr=subprocess.PIPE, start_new_session=True) as process:
-            output, diagnostic = bytearray(), bytearray()
-            deadline = time.monotonic() + GIT_TIMEOUT
+        process = subprocess.Popen(command, env=env, stdin=source, stdout=subprocess.PIPE,
+                                   stderr=subprocess.PIPE, start_new_session=True)
+        output, diagnostic = bytearray(), bytearray()
+        deadline = time.monotonic() + GIT_TIMEOUT
+        try:
+            with selectors.DefaultSelector() as selector:
+                selector.register(process.stdout, selectors.EVENT_READ, output)
+                selector.register(process.stderr, selectors.EVENT_READ, diagnostic)
+                while selector.get_map():
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise ValueError("Snapshot Git operation exceeded its deadline")
+                    for key, _events in selector.select(remaining):
+                        chunk = os.read(key.fileobj.fileno(), 65536)
+                        if not chunk:
+                            selector.unregister(key.fileobj)
+                        else:
+                            key.data.extend(chunk)
+                            if len(key.data) > (limit if key.data is output else 65536):
+                                raise ValueError("Snapshot Git output exceeds its bound")
+            process.wait(timeout=max(0.001, deadline - time.monotonic()))
+            if process.returncode not in statuses:
+                # Git diagnostics can quote caller-selected paths or bundle text.
+                # Keep them on this local exception boundary; receipts carry none.
+                message = diagnostic.decode(errors="replace").strip()
+                raise ValueError(f"Snapshot Git {arguments[0]} failed: {message or process.returncode}")
+            return bytes(output)
+        except subprocess.TimeoutExpired as error:
+            raise ValueError("Snapshot Git operation exceeded its deadline") from error
+        finally:
+            for stream in (process.stdout, process.stderr):
+                stream.close()
             try:
-                with selectors.DefaultSelector() as selector:
-                    selector.register(process.stdout, selectors.EVENT_READ, output)
-                    selector.register(process.stderr, selectors.EVENT_READ, diagnostic)
-                    while selector.get_map():
-                        remaining = deadline - time.monotonic()
-                        if remaining <= 0:
-                            raise ValueError("Snapshot Git operation exceeded its deadline")
-                        for key, _events in selector.select(remaining):
-                            chunk = os.read(key.fileobj.fileno(), 65536)
-                            if not chunk:
-                                selector.unregister(key.fileobj)
-                            else:
-                                key.data.extend(chunk)
-                                if len(key.data) > (limit if key.data is output else 65536):
-                                    raise ValueError("Snapshot Git output exceeds its bound")
-                process.wait(timeout=max(0.001, deadline - time.monotonic()))
-                if process.returncode not in statuses:
-                    # Git diagnostics can quote caller-selected paths or bundle text.
-                    # Keep them on this local exception boundary; receipts carry none.
-                    message = diagnostic.decode(errors="replace").strip()
-                    raise ValueError(f"Snapshot Git {arguments[0]} failed: {message or process.returncode}")
-                return bytes(output)
-            except subprocess.TimeoutExpired as error:
-                raise ValueError("Snapshot Git operation exceeded its deadline") from error
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
             finally:
                 try:
-                    os.killpg(process.pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
-                process.wait()
+                    process.wait(timeout=GIT_CLEANUP_TIMEOUT)
+                except subprocess.TimeoutExpired as error:
+                    # Retain ownership without blocking the caller on an uninterruptible child.
+                    threading.Thread(target=process.wait, name="router-snapshot-reaper", daemon=True).start()
+                    raise ValueError("Snapshot Git termination is unconfirmed after SIGKILL; background cleanup continues") from error
+
+
+def _git_with_excludes(root, *arguments, **options):
+    """Retain only the normal effective excludes-file setting, not other config."""
+    raw = _git(root, "config", "--null", "--path", "--get", "core.excludesFile",
+               statuses=(0, 1), read_configuration=True)
+    if not raw:
+        return _git(root, *arguments, **options)  # Git's native XDG default still applies.
+    if not raw.endswith(b"\0") or b"\0" in raw[:-1]:
+        raise ValueError("Git excludes-file configuration returned an invalid path")
+    return _git(root, "-c", "core.excludesFile=" + os.fsdecode(raw[:-1]), *arguments, **options)
 
 
 def _path(value):
@@ -269,8 +298,8 @@ def export_snapshot(root: Path, task_id: str, directory: Path, paths: list | tup
     info = directory.lstat()
     if not stat.S_ISDIR(info.st_mode) or info.st_mode & 0o077 or info.st_uid != os.getuid():
         raise ValueError("Snapshot artifact directory must be private, owned and not a symlink")
-    ignored = _git(root, "check-ignore", "--no-index", "-z", "--stdin",
-                   data=b"\0".join(value.encode() for value in selected) + b"\0", statuses=(0, 1))
+    ignored = _git_with_excludes(root, "check-ignore", "--no-index", "-z", "--stdin",
+                                 data=b"\0".join(value.encode() for value in selected) + b"\0", statuses=(0, 1))
     if ignored:
         raise ValueError("Snapshot selection contains an ignored path, including tracked ignored paths")
     total, records = 0, []
@@ -363,7 +392,7 @@ def import_snapshot(root: Path, receipt: dict, bundle_path: Path) -> dict:
         if _git(quarantine, "cat-file", "commit", commit) != _commit_bytes(tree, receipt["task_id"]):
             raise ValueError("Snapshot commit must be the exact parentless Router snapshot")
         total, files = 0, []
-        for entry in _git(quarantine, "ls-tree", "-rztl", "--full-tree", commit).split(b"\0"):
+        for entry in _git(quarantine, "ls-tree", "-rztl", "--full-tree", commit, limit=MAX_TREE_LIST_BYTES).split(b"\0"):
             if not entry:
                 continue
             metadata, raw_path = entry.split(b"\t", 1)

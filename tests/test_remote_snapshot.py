@@ -2,11 +2,13 @@ import hashlib
 import json
 import os
 import select
+import shlex
 import signal
 import struct
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 import zlib
@@ -25,6 +27,12 @@ class RemoteSnapshotTests(unittest.TestCase):
         temporary = tempfile.TemporaryDirectory(prefix="router-remote-snapshot-")
         self.addCleanup(temporary.cleanup)
         self.root = Path(temporary.name).resolve()
+        self.global_config = self.root / "global.config"
+        self.global_config.write_text("[core]\nexcludesFile =\n")
+        isolated = patch.dict(os.environ, {"GIT_CONFIG_GLOBAL": str(self.global_config), "GIT_CONFIG_NOSYSTEM": "1",
+                                           "GIT_CONFIG_COUNT": "0", "GIT_CONFIG_PARAMETERS": ""})
+        isolated.start()
+        self.addCleanup(isolated.stop)
         self.source = self.repository("source")
         self.target = self.repository("target")
         self.artifacts = self.root / "artifacts"
@@ -97,6 +105,45 @@ class RemoteSnapshotTests(unittest.TestCase):
             self.export(task="task-symbolic")
         with self.assertRaises(ValueError):
             self.export(task="../task-a")
+
+    def test_global_and_explicit_environment_ignore_rules_refuse_selected_files(self):
+        excludes, override = self.root / "global excludes", self.root / "environment excludes"
+        excludes.write_text("global-only.txt\n")
+        override.write_text("environment-only.txt\n")
+        git(self.source, "config", "--file", str(self.global_config), "core.excludesFile", str(excludes))
+        marker = self.root / "fsmonitor-ran"
+        git(self.source, "config", "--file", str(self.global_config), "core.fsmonitor", f"touch {marker}")
+        for index, (name, environment) in enumerate((("global-only.txt", {}), ("environment-only.txt", {
+                "GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "core.excludesFile", "GIT_CONFIG_VALUE_0": str(override)}))):
+            with self.subTest(name=name), patch.dict(os.environ, environment):
+                self.artifacts = self.root / f"ignored-artifacts-{index}"
+                (self.source / name).write_text("synthetic excluded content")
+                with self.assertRaises(ValueError):
+                    self.export((name,), task=f"ignored-{index}")
+                self.assertFalse((self.artifacts / "snapshot.bundle").exists())
+                self.assertFalse(marker.exists())
+
+    def test_maximum_depth_and_path_family_round_trips_with_bounded_tree_listing(self):
+        depth, maximum = remote_snapshot.MAX_DEPTH, remote_snapshot.MAX_PATH_BYTES
+        component, remainder = divmod(maximum - (depth - 1), depth)
+        paths = []
+        for index in range(remote_snapshot.MAX_FILES):
+            pieces = [f"worker-{index:03d}".ljust(component, "x")]
+            pieces += [f"level-{level:02d}".ljust(component, "x") for level in range(depth - 2)]
+            pieces += [f"file-{index:03d}".ljust(component + remainder, "x")]
+            path = "/".join(pieces)
+            self.assertEqual(len(path.encode()), maximum)
+            file = self.source / path
+            file.parent.mkdir(parents=True, exist_ok=True)
+            file.write_bytes(b"example\n")
+            paths.append(path)
+        receipt = self.export(paths)
+        result = remote_snapshot.import_snapshot(self.target, receipt, self.artifacts / "snapshot.bundle")
+        self.assertEqual(result["snapshot_tree"], receipt["snapshot_tree"])
+        listed = git(self.target, "ls-tree", "-rztl", "--full-tree", result["snapshot_commit"], binary=True)
+        self.assertGreater(len(listed), remote_snapshot.MAX_METADATA_BYTES)
+        self.assertLessEqual(len(listed), remote_snapshot.MAX_TREE_LIST_BYTES)
+        self.assertEqual(git(self.target, "show", f"{result['snapshot_commit']}:{paths[-1]}"), "example\n")
 
     def test_import_checks_receipt_bundle_bounds_and_ref_binding(self):
         receipt = self.export()
@@ -225,6 +272,23 @@ class RemoteSnapshotTests(unittest.TestCase):
             remote_snapshot.import_snapshot(self.target, receipt, self.artifacts / "snapshot.bundle")
         self.assertFalse(marker.exists(), "Local URL rewrite escaped the file-only transport boundary")
 
+        target = self.repository("alternate-target")
+        alternates = target / ".git" / "objects" / "info" / "alternates"
+        alternates.write_text(str(self.source / ".git" / "objects") + "\n")
+        observed = self.root / "alternate-helper-environment.json"
+        alternate_helper = self.root / "alternate-refs-helper.py"
+        alternate_helper.write_text("import json, os\nfrom pathlib import Path\n"
+                                    f"Path({str(observed)!r}).write_text(json.dumps(sorted(\n"
+                                    "    key for key in os.environ if key.startswith('LANGFUSE_'))))\n")
+        git(target, "config", "core.alternateRefsCommand", shlex.join([sys.executable, str(alternate_helper)]))
+        with patch.dict(os.environ, {"LANGFUSE_SECRET_KEY": "synthetic-secret",
+                                      "LANGFUSE_PUBLIC_KEY": "synthetic-public",
+                                      "LANGFUSE_EXAMPLE_EXTENSION": "synthetic-extension"}):
+            imported = remote_snapshot.import_snapshot(target, receipt, self.artifacts / "snapshot.bundle")
+        self.assertEqual(imported["snapshot_commit"], receipt["snapshot_commit"])
+        self.assertTrue(observed.exists(), "Real Git did not execute its alternate-refs helper")
+        self.assertEqual(json.loads(observed.read_text()), [], "Git helper inherited tracing configuration")
+
     def test_export_git_failures_stop_owned_group_and_close_pipes(self):
         helper = self.root / "owned-git-helper.py"
         helper.write_text("""import json, os, signal, sys
@@ -305,6 +369,56 @@ while True:
                 while set(identities) & sample().keys() and time.monotonic() < deadline:
                     time.sleep(0.02)
                 self.assertFalse(set(identities) & sample().keys(), "Owned leader or descendant survived Git failure")
+
+    def test_unreapable_git_reports_unknown_without_a_foreground_unbounded_wait(self):
+        foreground = threading.current_thread()
+        release, started = threading.Event(), threading.Event()
+        reapers = []
+        streams = []
+        for _ in range(2):
+            read, write = os.pipe()
+            os.close(write)
+            streams.append(os.fdopen(read, "rb"))
+
+        class Unreapable:
+            pid, returncode = 12345, None
+            stdout, stderr = streams
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_):
+                self.wait()
+
+            def wait(self, timeout=None):
+                if timeout is not None:
+                    if not 0 < timeout <= 1:
+                        raise AssertionError("Cleanup wait exceeded its declared one-second bound")
+                    raise subprocess.TimeoutExpired("controlled Git", timeout)
+                if threading.current_thread() is foreground:
+                    raise AssertionError("Unbounded foreground process wait")
+                reapers.append(threading.current_thread())
+                started.set()
+                if not release.wait(15):
+                    raise AssertionError("Controlled background reaper was not released")
+                self.returncode = -signal.SIGKILL
+                return self.returncode
+
+        try:
+            with patch.object(remote_snapshot.subprocess, "Popen", return_value=Unreapable()), \
+                    patch.object(remote_snapshot.os, "killpg"), patch.object(remote_snapshot, "GIT_TIMEOUT", 0), \
+                    self.assertRaises(ValueError) as failure:
+                self.export()
+            self.assertIn("termination is unconfirmed", str(failure.exception))
+            self.assertTrue(started.wait(15))
+            self.assertTrue(all(stream.closed for stream in streams))
+        finally:
+            release.set()
+            for reaper in reapers:
+                reaper.join(15)
+                self.assertFalse(reaper.is_alive())
+            for stream in streams:
+                stream.close()
 
 
 if __name__ == "__main__":
