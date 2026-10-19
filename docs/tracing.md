@@ -100,8 +100,10 @@ without the explicit selection retains the visible unavailable reason below.
 
 A live check on a Linux host over SSH ran a Router-launched Codex 0.163.0 child
 through accept, integrate and close; Langfuse received its trace with Router task,
-host and work-item metadata plus usage and cost. Remote-child tracing depends on
-#54, where the remote host's Router launches the child through this same path.
+host and work-item metadata plus usage and cost. A remote child is traced by the
+serving host's Router through this same path, using that host's repository
+selection and startup credentials; only the parent's request boolean crosses SSH.
+Without a serving selection the child records `available: false` with a reason.
 
 ## Other executors
 
@@ -123,8 +125,8 @@ session/message/model/token records with its Langfuse generation and confirmed t
 three `resourceAttributes.router.*` values. Requested OpenCode tracing is recorded
 as `available: true` only when the required Langfuse public and secret keys are
 present in the startup environment; otherwise the route remains visible with
-`available: false` and an explicit credential diagnostic. Remote
-children remain out of scope.
+`available: false` and an explicit credential diagnostic. A real remote-child
+trace has not yet been verified.
 
 ## Explicit Claude candidate (live verification required)
 

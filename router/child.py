@@ -169,7 +169,9 @@ def child_environment(environment: dict[str, str], task: dict, *, include_tracin
     # repository tracing flag is present.
     if task["executor"] == "opencode":
         tracing = task.get("tracing", {})
-        requested = isinstance(tracing, dict) and tracing.get("requested") is True
+        # Mirrors Claude/Codex: only a record carrying the plugin selection enables it.
+        requested = (isinstance(tracing, dict) and tracing.get("requested") is True
+                     and tracing.get("plugin") == OPENCODE_LANGFUSE_PLUGIN)
         config = {"permission": task["permission_profile"]}
         if requested:
             if include_tracing_credentials:

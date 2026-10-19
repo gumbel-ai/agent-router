@@ -569,7 +569,7 @@ class Controller:
         receipt = checked["snapshot_receipt"]
         operation_payload = canonical({"invocation": invocation, "resolved_model": checked["resolved_model"],
                                        "remote_repo": str(remote_repo), "remote_worktree": str(remote_worktree),
-                                       "snapshot_receipt": receipt})
+                                       "snapshot_receipt": receipt, "tracing_requested": checked["tracing_requested"]})
         with self.store.snapshot() as db:
             existing = db.execute("SELECT operation,payload,task_id FROM operations WHERE session_id=? AND request_id=?",
                                   (session_id, request_id)).fetchone()
@@ -634,6 +634,7 @@ class Controller:
                         "max_attempts": self.settings.max_attempts, "artifact_dir": str(artifact_dir),
                         "expected_resolved_model": checked["resolved_model"],
                         "remote_origin": {"session_id": session_id, "request_id": request_id},
+                        "parent_tracing_requested": checked["tracing_requested"],
                         "snapshot_commit": imported["snapshot_commit"], "snapshot_tree": imported["snapshot_tree"],
                         "worktree": materialized["worktree"], "branch": materialized["branch"]}
                 if "work_item_id" in invocation:
@@ -1024,6 +1025,10 @@ class Controller:
         return records
 
 
+REMOTE_UNSELECTED_TRACING = {"requested": True, "available": False,
+                             "reason": "The serving repository has no tracing selection for this executor"}
+
+
 def opencode_tracing_availability(environment: dict[str, str]) -> dict:
     """Tracing availability and reason for an OpenCode child launched with this environment."""
     available = langfuse_credentials_available(environment)
@@ -1152,6 +1157,9 @@ class Runtime:
                 # user/plugin configuration disabled, so credentials are stripped.
                 tracing = {"tracing": {"requested": True, "available": False,
                                         "reason": TRACING_UNAVAILABLE[executor]}}
+        if task.get("parent_tracing_requested") and not tracing_requested and executor + "_tracing" not in configured:
+            # A remote parent requested tracing; this serving repository selects none.
+            tracing = {"tracing": dict(REMOTE_UNSELECTED_TRACING)}
         credential_file = Path(self.control.environment.get("AGENT_ROUTER_ENV_FILE", "~/.agent-router/.env")).expanduser().resolve()
         if credential_file.is_relative_to(root):
             relative = str(credential_file.relative_to(root))
@@ -1166,10 +1174,9 @@ class Runtime:
             hosts = [host for host in load_fleet_config(DEFAULT_CONFIG).hosts if host.name == invocation["host"]]
             if len(hosts) != 1 or hosts[0].transport != "ssh":
                 raise ValueError("Remote dispatch requires one configured SSH fleet host")
-            if tracing_requested or "claude_tracing" in configured:
-                # Remote children run outside the local tracing route; record it, never drop it.
-                tracing = {"tracing": {"requested": True, "available": False,
-                                        "reason": "Remote children are not traced"}}
+            if tracing_requested or "claude_tracing" in configured or "codex_tracing" in configured:
+                # The serving host's Router applies its own selection; its status replaces this record.
+                tracing = {"tracing": {"requested": True, "reason": "Decided by the remote host"}}
             return {"executor": executor, "requested_model": invocation["model"],
                     "resolved_model": model, "remote_host": invocation["host"],
                     "remote_repo": invocation["remote_repo"], "remote_worktree": invocation["remote_worktree"], **tracing}
@@ -1235,7 +1242,11 @@ class Runtime:
             if not self._tracing_requested(task):
                 # A task can outlive a repository config reload. Fail closed for
                 # the next launch and remove the stale child opt-in.
-                self.store.update(task_id, lambda current: current.pop("tracing", None))
+                if task.get("parent_tracing_requested"):
+                    # Keep a remote parent's request visible as unavailable.
+                    self.store.update(task_id, lambda current: current.update(tracing=dict(REMOTE_UNSELECTED_TRACING)))
+                else:
+                    self.store.update(task_id, lambda current: current.pop("tracing", None))
             elif name == "child" and (task["executor"] == "opencode" or "_claude_tracing" in task or "_codex_tracing" in task):
                 # Rejection/resume skips validate(); record what this child receives.
                 availability = (opencode_tracing_availability(phase_environment) if task["executor"] == "opencode"
@@ -1573,7 +1584,8 @@ class Runtime:
                     remote = transport.start(session_id=task["session_id"], request_id=invocation["request_id"],
                                              invocation=invocation, resolved_model=task["resolved_model"],
                                              remote_repo=task["remote_repo"], remote_worktree=task["remote_worktree"],
-                                             snapshot_receipt=receipt, snapshot_bundle=bundle)
+                                             snapshot_receipt=receipt, snapshot_bundle=bundle,
+                                             tracing_requested="tracing" in task)
                 except RemoteChildError as error:
                     if error.code != "spawn_failed":
                         raise
@@ -1609,7 +1621,7 @@ class Runtime:
                     updates = {"status": remote_status, "execution_stopped": status.get("execution_stopped") is True,
                                "remote_task_id": status.get("task_id", task.get("remote_task_id"))}
                     for field in ("attempts", "attempt_number", "final_tree", "execution_outcome", "failure_reason",
-                                  "duration_ms", "exit_code", "snapshot_commit", "snapshot_tree"):
+                                  "duration_ms", "exit_code", "snapshot_commit", "snapshot_tree", "tracing"):
                         if field in status:
                             updates[field] = status[field]
                     self.store.update_with_attempt(task_id, lambda current, updates=updates: current.update(updates))
@@ -1618,7 +1630,7 @@ class Runtime:
                     updates = {"status": remote_status, "execution_stopped": True,
                                "remote_task_id": status.get("task_id", task.get("remote_task_id"))}
                     for field in ("attempts", "attempt_number", "final_tree", "execution_outcome", "failure_reason",
-                                  "duration_ms", "exit_code", "snapshot_commit", "snapshot_tree"):
+                                  "duration_ms", "exit_code", "snapshot_commit", "snapshot_tree", "tracing"):
                         if field in status:
                             updates[field] = status[field]
                     self.store.update_with_attempt(task_id, lambda current, updates=updates: current.update(updates))
@@ -1631,7 +1643,7 @@ class Runtime:
                 # parent visibly interrupted while the remote child is active.
                 updates = {"status": remote_status, "execution_stopped": False,
                            "remote_task_id": status.get("task_id", task.get("remote_task_id"))}
-                for field in ("attempts", "attempt_number", "duration_ms", "snapshot_commit", "snapshot_tree"):
+                for field in ("attempts", "attempt_number", "duration_ms", "snapshot_commit", "snapshot_tree", "tracing"):
                     if field in status:
                         updates[field] = status[field]
                 self.store.update_with_attempt(task_id, lambda current, updates=updates: current.update(updates))

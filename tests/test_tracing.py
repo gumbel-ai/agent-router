@@ -131,6 +131,35 @@ class TracingTests(RuntimeHarness, unittest.TestCase):
         self.assertFalse(validated["tracing"]["available"])
         self.assertIn("credentials are unavailable", validated["tracing"]["reason"])
 
+    def test_remote_start_uses_serving_repository_tracing_selection(self):
+        config = self.configure("opencode")
+        config["tracing"] = "requested"
+        self.set_credentials(True)
+        task = {"task_id": "task-remote-traced", "parent_tracing_requested": True, "invocation": {
+            "executor": "opencode", "model": "test", "parent_repo": str(self.repo), "parent_worktree": str(self.repo)}}
+        validated = self.runtime.validate(task)
+        self.assertEqual(validated["tracing"], self.expected_tracing({**task, **validated}, True))
+
+    def test_remote_start_without_serving_selection_is_explicitly_unavailable(self):
+        for executor in ("opencode", "codex", "claude"):
+            with self.subTest(executor=executor):
+                config = self.configure(executor)
+                config.pop("tracing", None)
+                self.set_credentials(True)
+                task = {"task_id": f"task-remote-{executor}", "parent_tracing_requested": True, "invocation": {
+                    "executor": executor, "model": "test", "parent_repo": str(self.repo),
+                    "parent_worktree": str(self.repo)}}
+                validated = self.runtime.validate(task)
+                tracing = validated["tracing"]
+                self.assertEqual(tracing["requested"], True)
+                self.assertIs(tracing["available"], False)
+                self.assertIn("no tracing selection", tracing["reason"])
+                if executor == "opencode":
+                    environment = child_environment({**TEST_CREDENTIALS, "PATH": os.defpath},
+                                                    {**task, **validated, "worktree": str(self.repo)})
+                    self.assertFalse(langfuse_credentials_available(environment))
+                    self.assertNotIn("plugins", json.loads(environment["OPENCODE_CONFIG_CONTENT"]))
+
     def test_reloaded_repository_opt_out_disables_stale_tracing(self):
         config = self.configure("opencode")
         config["tracing"] = "requested"
@@ -232,6 +261,7 @@ class TracingTests(RuntimeHarness, unittest.TestCase):
                 "attempts": 0, "attempt_number": 1, "artifact_dir": str(self.root / "artifacts"), "deadline_at": 9_999_999_999_999,
                 "invocation": {"parent_worktree": str(self.repo)}, "worktree": str(self.root / "child"),
                 "permission_profile": {"*": "allow"}, "tracing": {"requested": True, "available": True,
+                                                                         "plugin": OPENCODE_LANGFUSE_PLUGIN,
                                                                          "correlation": {"session_id": "ses-child",
                                                                                          "router_task_id": task_id,
                                                                                          "host_id": self.control.host.host_id}}}
@@ -332,7 +362,7 @@ class TracingLaunchTests(unittest.TestCase):
         permission = {"*": "allow", "external_directory": "deny"}
         task = {"executor": "opencode", "permission_profile": permission,
                 "resolved_model": "provider/exact", "worktree": "/tmp/child",
-                "tracing": {"requested": True, "available": True,
+                "tracing": {"requested": True, "available": True, "plugin": OPENCODE_LANGFUSE_PLUGIN,
                              "reason": "OpenCode plugin export and Router correlation verified via OpenTelemetry resource attributes",
                              "correlation": {"session_id": "ses-child", "router_task_id": "task-123",
                                              "host_id": "host-456"}}}
@@ -359,7 +389,8 @@ class TracingLaunchTests(unittest.TestCase):
         environment = {"PATH": "/usr/bin", "LANGFUSE_PUBLIC_KEY": "pk", "LANGFUSE_SECRET_KEY": "sk"}
         task = {"executor": "opencode", "permission_profile": {"*": "allow"},
                 "resolved_model": "provider/exact", "worktree": "/tmp/child",
-                "tracing": {"requested": True, "correlation": {"router_task_id": "bad,task",
+                "tracing": {"requested": True, "plugin": OPENCODE_LANGFUSE_PLUGIN,
+                            "correlation": {"router_task_id": "bad,task",
                                                                      "host_id": "host-456",
                                                                      "session_id": "ses-child"}}}
         with self.assertRaisesRegex(ValueError, "correlation metadata"):

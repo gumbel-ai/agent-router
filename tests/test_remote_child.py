@@ -31,7 +31,7 @@ class RemoteChildProtocolTests(unittest.TestCase):
                   "resolved_model": "provider/model-a",
                   "remote_repo": "/srv/project", "remote_worktree": "/srv/project",
                   "snapshot_receipt": self.receipt,
-                  "snapshot_base64": base64.b64encode(b"abc").decode()}
+                  "snapshot_base64": base64.b64encode(b"abc").decode(), "tracing_requested": False}
         result.update(changes)
         return result
 
@@ -53,12 +53,29 @@ class RemoteChildProtocolTests(unittest.TestCase):
             result = transport.start(
                 session_id="session-a", request_id="request-a", invocation=self.invocation,
                 resolved_model="provider/model-a", remote_repo="/srv/project", remote_worktree="/srv/project",
-                snapshot_receipt=self.receipt, snapshot_bundle=b"abc",
+                snapshot_receipt=self.receipt, snapshot_bundle=b"abc", tracing_requested=False,
             )
         self.assertEqual(result, {"status": "created"})
         payload = exchange.call_args.args[3]
         self.assertEqual(payload["snapshot_base64"], base64.b64encode(b"abc").decode())
         self.assertNotIn("snapshot_bytes", payload)
+
+    def test_remote_start_sends_only_the_tracing_request(self):
+        transport = remote_child.RemoteChildTransport(FleetHost("worker", "ssh", target="example"), 1)
+        with patch("router.remote_child._exchange", return_value={"status": "created"}) as exchange:
+            transport.start(
+                session_id="session-a", request_id="request-a", invocation=self.invocation,
+                resolved_model="provider/model-a", remote_repo="/srv/project", remote_worktree="/srv/project",
+                snapshot_receipt=self.receipt, snapshot_bundle=b"abc", tracing_requested=True,
+            )
+        payload = exchange.call_args.args[3]
+        self.assertEqual(set(payload), set(self.payload()))
+        self.assertIs(payload["tracing_requested"], True)
+        wire = canonical(payload)
+        self.assertNotIn("LANGFUSE", wire)
+        self.assertNotIn("plugin", wire)
+        with self.assertRaisesRegex(ValueError, "tracing_requested"):
+            remote_child._start_payload(self.payload(tracing_requested="yes"))
 
     def test_agent_hook_denies_router_remote(self):
         from router.hooks import authorize
