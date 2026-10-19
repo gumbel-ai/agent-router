@@ -780,12 +780,14 @@ class SessionObserver:
                      COALESCE(json_extract(data,'$.tool_correlation_partial_until'),?)>=?) OR
                     (status='unknown' AND
                      (json_extract(data,'$.restart_uncertain_until')>=? OR
+                      (json_extract(data,'$.restart_uncertain_until') IS NOT NULL AND
+                       json_extract(data,'$.tool_active_until')>=?) OR
                       (source='codex' AND json_extract(data,'$.last_event_at')>=?))) OR
                     -- Waiter history overflowed: a fresh session's waiting state is uncertain.
                     ((json_extract(data,'$.waiter_history_partial')=1 OR
                       COALESCE(json_extract(data,'$.waiter_clear_floor'),-1)>=0) AND
                      json_extract(data,'$.last_event_at')>=?))""",
-                                           (*projected_at, at, at, at, at, at - STALE_AFTER_MS,
+                                           (*projected_at, at, at, at, at, at, at - STALE_AFTER_MS,
                                             at - STALE_AFTER_MS)).fetchone()[0]
             # One predicate, so each session counts once: fresh running/waiting
             # work, or any unexpired tool (a reordered tool_start can leave a

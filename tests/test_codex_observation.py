@@ -229,6 +229,92 @@ class CodexObservationTests(unittest.TestCase):
                 self.assertEqual(self.control.sessions.fleet_records(0)[1], 0)
                 self.assertEqual(self.agent()["status"], "idle")
 
+    def test_restart_uncertainty_covers_retained_delayed_tools(self):
+        cases = ((root_known, restarts, delayed_offset) for root_known in (False, True)
+                 for restarts in (0, 1, 3) for delayed_offset in (None, 40, 60))
+        start = 10_000_000
+        for index, (root_known, restarts, delayed_offset) in enumerate(cases):
+            with self.subTest(root_known=root_known, restarts=restarts, delayed_offset=delayed_offset):
+                store = Store(self.root / f"retained-{index}" / "router.sqlite3", "host-a")
+                sessions, native = SessionObserver(store, "host-a"), NativeObserver(store, "host-a")
+                capacity = CapacitySampler(store.path.parent)
+                host = SimpleNamespace(view=lambda at: {"host_id": "host-a", "hostname": "example-host"})
+                controller = SimpleNamespace(sessions=sessions, native=native, capacity=capacity, host=host)
+                clock = [start + 200]
+
+                def send(session, agent, controller=controller):
+                    if session:
+                        controller.sessions.observe(session)
+                    if agent:
+                        controller.native.observe(agent)
+                    return {}
+
+                def hook(kind, offset, **fields):
+                    with patch("router.observer_hook.time.time", return_value=(start + offset) / 1000):
+                        observer_hook.observe_codex(payload(kind, **fields))
+
+                def restart(controller=controller):
+                    nonlocal store, sessions, native
+                    store = Store(store.path, "host-a")
+                    sessions, native = SessionObserver(store, "host-a"), NativeObserver(store, "host-a")
+                    controller.sessions, controller.native = sessions, native
+                    sessions.reconcile_restart()
+                    native.reconcile_restart()
+
+                def retained_rows(store=store):
+                    with store.connect() as db:
+                        return tuple(tuple(row) for table in ("sessions", "observations")
+                                     for row in db.execute(f"SELECT data FROM {table} ORDER BY data"))
+
+                with patch("router.observer_hook.send", side_effect=send), \
+                        patch("router.sessions.now_ms", side_effect=lambda clock=clock: clock[0]), \
+                        patch("router.native.now_ms", side_effect=lambda clock=clock: clock[0]), \
+                        patch("router.fleet_snapshot.now_ms", side_effect=lambda clock=clock: clock[0]):
+                    if root_known:
+                        hook("SessionStart", 0)
+                        hook("UserPromptSubmit", 5)
+                    hook("SubagentStart", 10, agent_id=CHILD)
+                    hook("PreToolUse", 50, agent_id=None if root_known else CHILD,
+                         tool_name="Bash", tool_use_id="older-tool")
+                    hook("SubagentStop", 100, agent_id=CHILD)
+                    restart()
+                    if delayed_offset is not None:
+                        hook("PreToolUse", delayed_offset, agent_id=CHILD,
+                             tool_name="Bash", tool_use_id="retained-tool")
+                    for _ in range(restarts):
+                        clock[0] += 100
+                        restart()
+                    before = retained_rows()
+                    stored = json.loads(before[0][0])
+                    original = start + 50 + MAX_INFLIGHT_AGE_MS
+                    tool_until = start + delayed_offset + MAX_INFLIGHT_AGE_MS if delayed_offset is not None else None
+                    self.assertEqual(stored["restart_uncertain_until"], original)
+                    self.assertEqual(stored["tool_active_until"], tool_until)
+                    self.assertEqual(stored["last_event_at"], start + 100)
+                    effective = max(original, tool_until or 0)
+                    boundaries = sorted({deadline + offset for deadline in (original, tool_until or original)
+                                         for offset in (-1, 0, 1)})
+                    for checked_at in boundaries:
+                        clock[0] = checked_at
+                        capacity._latest = {"logical_cpus": 8, "load_1m": 0, "cpu_busy_pct": 0,
+                                            "memory_available_bytes": 32 * 1024**3,
+                                            "disk_available_bytes": 64 * 1024**3,
+                                            "observed_at": checked_at - 100, "partial": False}
+                        total = None if checked_at <= effective else 0
+                        with self.subTest(checked_at=checked_at), \
+                                patch("router.capacity.time.time", return_value=checked_at / 1000):
+                            for limit in (0, 1, 100):
+                                result = compose(controller, history_limit=limit)
+                                self.assertEqual(result["capacity"]["active_claude_sessions"], total)
+                                self.assertEqual(result["capacity"]["active_agents"], 0)
+                                self.assertEqual(result["capacity"]["capacity_state"],
+                                                 "unknown" if total is None else "available")
+                                self.assertEqual(len(result["sessions"]), int(limit > 0))
+                                if limit:
+                                    self.assertEqual(result["sessions"][0]["status"], "unknown")
+                            self.assertEqual(compose(controller), result)
+                            self.assertEqual(retained_rows(), before)
+
     def test_delayed_root_stop_keeps_clock_rollback_uncertain(self):
         for child_running in (False, True):
             with self.subTest(child_running=child_running):
