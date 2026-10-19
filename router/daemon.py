@@ -15,6 +15,7 @@ import time
 import uuid
 from pathlib import Path
 
+from router import claude_tracing
 from router.capacity import CapacitySampler
 from router.child import (
     OPENCODE_LANGFUSE_PLUGIN,
@@ -101,14 +102,14 @@ def required_text(payload: dict, key: str) -> str:
 def public(task: dict, store: Store | None = None, history: list[dict] | None = None) -> dict:
     result = {key: value for key, value in task.items() if key not in {
         "session_id", "invocation", "feedback", "permission_profile", "setup_command", "cleanup_requested", "token_prices",
-        "codex_usage_baseline", "codex_usage_total", "codex_baseline_complete", "claude_baseline", "claude_total", "claude_executable"}}
+        "codex_usage_baseline", "codex_usage_total", "codex_baseline_complete", "claude_baseline", "claude_total", "claude_executable", "_claude_tracing"}}
     attempt_history = store.history(task["task_id"]) if history is None and store is not None else history or []
     result.update(visibility(task, attempt_history))
     if store is not None or history is not None:
         if task.get("executor") == "claude":
             attempt_history = [{**frame, **claude_public_usage(frame)} for frame in attempt_history]
         result["attempt_history"] = [{key: value for key, value in frame.items()
-                                      if key not in {"claude_baseline", "claude_total", "claude_executable"}}
+                                      if key not in {"claude_baseline", "claude_total", "claude_executable", "_claude_tracing"}}
                                      for frame in attempt_history]
     return result
 
@@ -897,9 +898,13 @@ class Runtime:
             except (ValueError, RecursionError) as error:
                 raise ValueError("Project Claude permissions are not valid JSON") from error
             profile = validate_claude(model, permission)
-            return {"executor": executor, "requested_model": invocation["model"], "resolved_model": model,
-                    "setup_command": configured["setup_command"], "permission_profile": profile,
-                    "child_session_id": str(uuid.uuid4()), **tracing}
+            validated = {"executor": executor, "requested_model": invocation["model"], "resolved_model": model,
+                         "setup_command": configured["setup_command"], "permission_profile": profile,
+                         "child_session_id": str(uuid.uuid4()), **tracing}
+            if "claude_tracing" in configured:
+                validated.update(claude_tracing.configure(configured["claude_tracing"], {**task, **validated},
+                                                          self.control.host.host_id, root))
+            return validated
         if executor == "codex":
             return {"executor": executor, "requested_model": invocation["model"], "resolved_model": model,
                     "setup_command": configured["setup_command"], "permission_profile": {"sandbox": sandbox},

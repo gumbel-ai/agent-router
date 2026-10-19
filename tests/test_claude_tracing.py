@@ -1,0 +1,277 @@
+"""Claude tracing command/configuration contracts; no native runtime or collector."""
+
+import hashlib
+import json
+import os
+import shlex
+import shutil
+import subprocess
+import sys
+import unittest
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
+
+from test_runtime import RuntimeHarness
+
+from router import claude_tracing
+from router.child import child_environment, executor_command
+
+MODEL = "anthropic/claude-sonnet-4-6"
+PROFILE = {"tools": ["Read", "Edit", "Write"], "allow": ["Read", "Edit", "Write"]}
+
+
+class ClaudeTracingTests(RuntimeHarness, unittest.TestCase):
+    def setUp(self):
+        super().setUp()
+        self.root = self.root.resolve()
+        self.plugin = self.root / "selected-plugin"
+        (self.plugin / ".claude-plugin").mkdir(parents=True)
+        (self.plugin / "hooks").mkdir()
+        (self.plugin / ".claude-plugin/plugin.json").write_text(json.dumps({
+            "name": "langfuse-observability", "version": "1.2.1",
+            "userConfig": {"LANGFUSE_SECRET_KEY": {"type": "string", "sensitive": True}}}))
+        (self.plugin / "hooks/hooks.json").write_text('{"hooks":{"SessionEnd":[]}}')
+        (self.plugin / "hooks/langfuse_hook.py").write_text("# operator-approved synthetic plugin\n")
+        digest = hashlib.sha256()
+        for relative in claude_tracing.PLUGIN_FILES:
+            digest.update(relative.encode() + b"\0" + (self.plugin / relative).read_bytes() + b"\0")
+        # Exercise source pinning with a synthetic fixture; never execute the real exporter.
+        pinned = patch("router.claude_tracing.AUDITED_DIGEST", digest.hexdigest())
+        pinned.start()
+        self.addCleanup(pinned.stop)
+        self.selection = {"plugin_dir": str(self.plugin), "public_key": "pk-lf-synthetic",
+                          "base_url": "https://collector.example.invalid"}
+        wrapper = self.root / "claude-fixture"
+        fixture = Path(__file__).with_name("fixture_executor.py")
+        wrapper.write_text(f'#!/bin/sh\nexec {shlex.quote(sys.executable)} {shlex.quote(str(fixture))} "$@"\n')
+        wrapper.chmod(0o700)
+        self.config.claude_command = [str(wrapper)]
+        self.config.models["test"] = MODEL
+        self.repository = self.config.repositories[str(self.repo.resolve())]
+        self.repository["claude_permissions"] = json.dumps(PROFILE)
+        self.repository["claude_tracing"] = json.dumps(self.selection)
+        self.operator_bin = self.root / "operator-bin"
+        self.operator_bin.mkdir()
+        uv = self.operator_bin / "uv"
+        uv.write_text("#!/bin/sh\nexit 0\n")
+        uv.chmod(0o700)
+        self.control.environment["PATH"] = str(self.operator_bin) + os.pathsep + self.control.environment.get("PATH", os.defpath)
+
+    def test_opt_in_fresh_and_resume_keep_permissions_identity_and_private_selection(self):
+        work_item = "w" * 240
+        task_id = self.mutate("start", {"request_version": "1", "request_id": "R", "instruction_id": self.instruction,
+            "executor": "claude", "model": "test", "task": "finished", "parent_repo": str(self.repo),
+            "parent_worktree": str(self.repo), "mode": "write", "work_item_id": work_item})["task_id"]
+        first = self.wait(task_id, {"awaiting_review", "failed"})
+        self.assertEqual(first["status"], "awaiting_review", first)
+        raw = self.control.store.get(first["task_id"])
+        self.assertTrue(first.get("tracing", {}).get("requested"), first)
+        self.assertNotIn("_claude_tracing", first)
+        self.assertNotIn(str(self.plugin), json.dumps(first))
+        self.assertNotIn("available", first["tracing"])
+        self.assertEqual(first["tracing"]["correlation"]["session_id"], first["child_session_id"])
+        self.assertEqual(first["tracing"]["correlation"]["work_item_id"], work_item)
+        self.assertIn("work_item_id", first["tracing"]["omitted_tags"])
+        self.mutate("review", {"task_id": first["task_id"], "request_id": "resume", "expected_attempt": 1,
+                               "outcome": "rejected", "feedback": "Second synthetic attempt"})
+        second = self.wait(first["task_id"], {"awaiting_review", "failed"})
+        self.assertEqual(second["status"], "awaiting_review", second)
+        self.assertEqual(second["child_session_id"], first["child_session_id"])
+        self.assertEqual(second["worktree"], first["worktree"])
+        self.assertEqual(second["cost"], .5)
+        self.assertEqual(second["usage"]["input_tokens"], 200)
+        self.assertEqual(raw["_claude_tracing"], self.control.store.get(first["task_id"])["_claude_tracing"])
+        for frame in second["attempt_history"]:
+            self.assertNotIn("_claude_tracing", frame)
+        self.assertNotIn("_claude_tracing", json.dumps(self.control.store.history(first["task_id"])))
+        commands = json.loads((Path(second["worktree"]) / "session.json").read_text())["commands"]
+        for command in commands:
+            self.assertIn("--restricted", command)
+            self.assertNotIn("--safe-mode", command)
+            self.assertEqual(command[command.index("--plugin-dir") + 1], str(self.plugin.resolve()))
+            self.assertEqual(command[command.index("--setting-sources") + 1], "")
+            self.assertEqual(command[command.index("--tools") + 1], ",".join(PROFILE["tools"]))
+            settings = json.loads(command[command.index("--settings") + 1])
+            self.assertEqual(settings["permissions"]["allow"], PROFILE["allow"])
+            self.assertEqual(settings["fallbackModel"], [])
+            self.assertIs(settings["switchModelsOnFlag"], False)
+            options = settings["pluginConfigs"]["langfuse-observability@inline"]["options"]
+            self.assertEqual(options["LANGFUSE_PUBLIC_KEY"], self.selection["public_key"])
+            self.assertEqual(options["LANGFUSE_BASE_URL"], self.selection["base_url"])
+            self.assertNotIn("LANGFUSE_SECRET_KEY", options)
+        self.assertIn("--session-id", commands[0])
+        self.assertIn("--resume", commands[1])
+        exported = self.control.handle("correlation", {})
+        self.assertNotIn("_claude_tracing", json.dumps(exported))
+        child_records = [row for row in exported["records"] if row["kind"] in {"router_task", "attempt"}]
+        self.assertEqual(len(child_records), 3)
+        for row in child_records:
+            self.assertEqual(row["work_item_id"], work_item)
+            self.assertEqual(row["traced"], "unknown")
+        self.assertNotIn(str(self.plugin), json.dumps(self.control.router_task_records()))
+
+    def test_opt_in_environment_keeps_native_auth_but_excludes_ambient_customization(self):
+        self.runtime.stop()
+        task = {"task_id": "task-synthetic", "work_item_id": "work-synthetic", "invocation": {
+            "executor": "claude", "model": "test", "parent_worktree": str(self.repo), "parent_repo": str(self.repo)}}
+        task.update(self.runtime.validate(task), worktree=str(self.root / "worker"), artifact_dir=str(self.root / "artifacts"))
+        environment = {"HOME": "/synthetic/operator", "CLAUDE_CONFIG_DIR": "/synthetic/native",
+                       "ANTHROPIC_API_KEY": "synthetic-provider", "CLAUDE_CODE_OAUTH_TOKEN": "synthetic-oauth",
+                       "HTTPS_PROXY": "https://proxy.example.invalid", "PATH": os.pathsep.join((
+                           str(Path(task["worktree"]) / ".venv/bin"), str(self.repo / "bin"), ".", str(self.operator_bin), "/usr/bin")),
+                       "CLAUDE_CODE_PLUGIN_DIRS": "/unselected", "CLAUDE_CODE_PLUGIN_SEED_DIR": "/unselected",
+                       "CLAUDE_CODE_PLUGIN_CACHE_DIR": "/unselected", "CLAUDE_CODE_SAFE_MODE": "1",
+                       "CLAUDE_CODE_SIMPLE": "1", "CLAUDE_CODE_DISABLE_AUTO_MEMORY": "0",
+                       "CLAUDE_PLUGIN_OPTION_LANGFUSE_SECRET_KEY": "synthetic-no-export",
+                       "LANGFUSE_SECRET_KEY": "synthetic-no-export", "CC_LANGFUSE_SECRET_KEY": "synthetic-no-export",
+                       "CC_LANGFUSE_TRACEPARENT": "ambient-parent", "CC_LANGFUSE_PARENT_TRACE_ID": "ambient-parent",
+                       "TRACE_TO_LANGFUSE": "true", "BASH_ENV": "/unselected", "NODE_OPTIONS": "--require /unselected"}
+        overrides = {key: str(Path(task["worktree"]) / "untrusted") for key in (
+            "UV_PYTHON", "UV_PROJECT_ENVIRONMENT", "UV_ENV_FILE", "UV_CONFIG_FILE", "UV_CACHE_DIR",
+            "PYTHONUSERBASE", "PYTHONHOME", "_PYTHON_SYSCONFIGDATA_PATH", "PIP_FIND_LINKS", "LD_PRELOAD",
+            "DYLD_INSERT_LIBRARIES", "__PYVENV_LAUNCHER__", "BASH_FUNC_hook%%")}
+        environment.update(overrides)
+        storage_overrides = {key: str(Path(task["worktree"]) / "untrusted") for key in (
+            "XDG_CACHE_HOME", "XDG_DATA_HOME", "XDG_CONFIG_HOME", "XDG_CONFIG_DIRS", "XDG_BIN_HOME", "TMPDIR", "TMP", "TEMP")}
+        environment.update(storage_overrides)
+        actual = child_environment(environment, task)
+        for key in ("HOME", "CLAUDE_CONFIG_DIR", "ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN", "HTTPS_PROXY"):
+            self.assertEqual(actual[key], environment[key])
+        for key in ("CLAUDE_CODE_PLUGIN_DIRS", "CLAUDE_CODE_PLUGIN_SEED_DIR", "CLAUDE_CODE_SAFE_MODE", "CLAUDE_CODE_SIMPLE",
+                    "CLAUDE_PLUGIN_OPTION_LANGFUSE_SECRET_KEY", "LANGFUSE_SECRET_KEY", "CC_LANGFUSE_SECRET_KEY",
+                    "CC_LANGFUSE_TRACEPARENT", "CC_LANGFUSE_PARENT_TRACE_ID", "TRACE_TO_LANGFUSE", "BASH_ENV", "NODE_OPTIONS"):
+            self.assertNotIn(key, actual)
+        self.assertEqual(actual["PATH"], str(self.operator_bin) + os.pathsep + "/usr/bin")
+        self.assertEqual(actual["CLAUDE_CODE_DISABLE_AUTO_MEMORY"], "1")
+        self.assertEqual(actual["CLAUDE_CODE_DISABLE_CLAUDE_MDS"], "1")
+        for key in overrides.keys() - {"UV_PYTHON", "UV_CACHE_DIR"}:
+            self.assertNotIn(key, actual)
+        self.assertEqual(actual["UV_PYTHON"], str(Path(sys.executable).resolve()))
+        self.assertEqual(actual["UV_PYTHON_DOWNLOADS"], "never")
+        for key in ("UV_NO_CONFIG", "UV_NO_ENV_FILE", "PYTHONNOUSERSITE", "PYTHONSAFEPATH"):
+            self.assertEqual(actual[key], "1")
+        self.assertTrue(Path(actual["CLAUDE_CODE_PLUGIN_CACHE_DIR"]).is_relative_to(task["artifact_dir"]))
+        private = Path(task["artifact_dir"]) / "claude-tracing"
+        self.assertEqual(actual["UV_CACHE_DIR"], str(private / "runtime-cache"))
+        for key in ("TMPDIR", "TMP", "TEMP"):
+            self.assertEqual(actual[key], str(private / "runtime-tmp"))
+        for key in ("XDG_CACHE_HOME", "XDG_DATA_HOME", "XDG_CONFIG_HOME", "XDG_CONFIG_DIRS", "XDG_BIN_HOME"):
+            # Native authentication/config locations stay unchanged; explicit uv
+            # cache/Python and no-config/no-downloads prevent runtime discovery here.
+            self.assertEqual(actual[key], environment[key])
+        real_uv = shutil.which("uv")
+        if real_uv is not None:
+            probe_env = {key: value for key, value in actual.items() if key in {
+                "HOME", "PATH", "UV_CACHE_DIR", "UV_PYTHON", "UV_PYTHON_DOWNLOADS", "UV_NO_CONFIG", "UV_NO_ENV_FILE",
+                "XDG_CACHE_HOME", "XDG_DATA_HOME", "TMPDIR", "TMP", "TEMP"}}
+            probe = subprocess.run([real_uv, "--no-config", "cache", "dir"], env=probe_env, cwd=self.repo,
+                                   capture_output=True, text=True, timeout=5, check=True)
+            self.assertEqual(Path(probe.stdout.strip()).resolve(), private / "runtime-cache")
+        tags = json.loads(actual["CC_LANGFUSE_TRACE_TAGS"])
+        self.assertEqual(tags, ["router_task_id:task-synthetic", "router_host_id:" + self.control.host.host_id,
+                                "work_item_id:work-synthetic"])
+        unchanged = {key: value for key, value in task.items() if key not in {"_claude_tracing", "tracing"}}
+        default = child_environment(environment, unchanged)
+        self.assertEqual(default["LANGFUSE_SECRET_KEY"], environment["LANGFUSE_SECRET_KEY"])
+        self.assertEqual(default["CLAUDE_CODE_PLUGIN_DIRS"], environment["CLAUDE_CODE_PLUGIN_DIRS"])
+
+        for work_item in (None, "short", "x" * (200 - len("work_item_id:")),
+                          "x" * (201 - len("work_item_id:")), "x" * 240):
+            with self.subTest(work_item_length=None if work_item is None else len(work_item)):
+                changed = {key: value for key, value in task.items() if key != "work_item_id"}
+                if work_item is not None:
+                    changed["work_item_id"] = work_item
+                changed.update(self.runtime.validate(changed))
+                selected_tags = json.loads(child_environment(environment, changed)["CC_LANGFUSE_TRACE_TAGS"])
+                self.assertTrue(all(len(tag) <= 200 for tag in selected_tags))
+                supported = work_item is not None and len("work_item_id:" + work_item) <= 200
+                self.assertEqual(len(selected_tags), 3 if supported else 2)
+                self.assertEqual(changed["tracing"]["correlation"].get("work_item_id"), work_item)
+                self.assertEqual("omitted_tags" in changed["tracing"], work_item is not None and not supported)
+
+    def test_private_roots_and_hook_interpreter_refuse_delegated_links(self):
+        self.runtime.stop()
+        task = {"task_id": "task-synthetic", "invocation": {
+            "executor": "claude", "model": "test", "parent_worktree": str(self.repo), "parent_repo": str(self.repo)}}
+        task.update(self.runtime.validate(task), worktree=str(self.root / "worker"), artifact_dir=str(self.root / "artifacts"))
+        outside = self.root / "outside"
+        outside.mkdir(mode=0o755)
+        base = Path(task["artifact_dir"]) / "claude-tracing"
+        base.mkdir(parents=True)
+        for name in ("plugins", "state", "runtime-cache", "runtime-tmp"):
+            with self.subTest(component=name):
+                (base / name).symlink_to(outside, target_is_directory=True)
+                with self.assertRaisesRegex(ValueError, "without symlinks"):
+                    child_environment({"PATH": str(self.operator_bin)}, task)
+                self.assertEqual(outside.stat().st_mode & 0o777, 0o755)
+                (base / name).unlink()
+        runtime_bin = self.root / "runtime-bin"
+        runtime_bin.mkdir()
+        delegated = Path(task["worktree"])
+        delegated.mkdir()
+        untrusted = delegated / "python"
+        untrusted.write_text("#!/bin/sh\nexit 99\n")
+        untrusted.chmod(0o700)
+        for executable in ("uv", "router-python"):
+            with self.subTest(executable=executable):
+                if executable == "uv":
+                    (runtime_bin / executable).symlink_to(untrusted)
+                    with self.assertRaisesRegex(ValueError, "interpreter must be outside"):
+                        child_environment({"PATH": str(runtime_bin) + os.pathsep + str(self.operator_bin)}, task)
+                    (runtime_bin / executable).unlink()
+                else:
+                    with (patch("router.claude_tracing.sys", SimpleNamespace(executable=str(untrusted))),
+                          self.assertRaisesRegex(ValueError, "interpreter must be outside")):
+                        child_environment({"PATH": str(self.operator_bin)}, task)
+        with self.assertRaisesRegex(ValueError, "existing operator-provisioned uv"):
+            child_environment({"PATH": str(runtime_bin)}, task)
+        for root in (delegated, self.repo):
+            with (self.subTest(private_directory_root=root),
+                  self.assertRaisesRegex(ValueError, "runtime/cache/tmp must be outside")):
+                child_environment({"PATH": str(self.operator_bin)}, {**task, "artifact_dir": str(root / "runtime")})
+
+    def test_invalid_selection_refuses_before_any_executor_or_worktree(self):
+        cases = ["{", "null", json.dumps({**self.selection, "secret_key": "synthetic"}),
+                 json.dumps({**self.selection, "public_key": "sk-lf-synthetic"}),
+                 json.dumps({**self.selection, "base_url": "https://user:secret@example.invalid"}),
+                 json.dumps({**self.selection, "plugin_dir": str(self.root / "absent")})]
+        for number, selected in enumerate(cases):
+            with self.subTest(selected=number):
+                self.repository["claude_tracing"] = selected
+                result = self.wait(self.start("must not launch", f"invalid-{number}", executor="claude"), {"failed", "awaiting_review"})
+                self.assertEqual(result["status"], "failed", result)
+                self.assertEqual(result["attempts"], 0)
+                self.assertNotIn("worktree", result)
+                self.assertNotIn("process", result)
+                self.assertIn("Claude tracing", result["failure_reason"])
+        self.repository["claude_tracing"] = json.dumps(self.selection)
+        manifest_file = self.plugin / ".claude-plugin/plugin.json"
+        original = manifest_file.read_text()
+        for number, change in enumerate(({"version": "1.2.2"}, {"mcpServers": {"unselected": {}}},
+                                        {"description": "same version, different source"})):
+            with self.subTest(source=change):
+                manifest_file.write_text(json.dumps({**json.loads(original), **change}))
+                result = self.wait(self.start("must not launch", f"source-{number}", executor="claude"), {"failed", "awaiting_review"})
+                self.assertEqual(result["status"], "failed", result)
+                self.assertEqual(result["attempts"], 0)
+                self.assertNotIn("process", result)
+        manifest_file.write_text(original)
+
+    def test_plugin_change_refuses_resume_and_command_after_setup_without_fallback(self):
+        first = self.wait(self.start("finished", executor="claude"), {"awaiting_review", "failed"})
+        self.assertEqual(first["status"], "awaiting_review", first)
+        selected = self.control.store.get(first["task_id"])
+        with self.assertRaisesRegex(ValueError, "refusing an untraced replacement"):
+            executor_command(self.config, {key: value for key, value in selected.items() if key != "_claude_tracing"})
+        (self.plugin / "hooks/langfuse_hook.py").write_text("# changed after operator selection\n")
+        with self.assertRaisesRegex(ValueError, "Claude tracing"):
+            executor_command(self.config, selected)
+        self.mutate("review", {"task_id": first["task_id"], "request_id": "changed", "expected_attempt": 1,
+                               "outcome": "rejected", "feedback": "Keep the original source"})
+        result = self.wait(first["task_id"], {"failed", "awaiting_review"})
+        self.assertEqual(result["status"], "failed", result)
+        self.assertEqual(result["attempts"], 1)
+        self.assertEqual(result["child_session_id"], first["child_session_id"])
+        commands = json.loads((Path(first["worktree"]) / "session.json").read_text())["commands"]
+        self.assertEqual(len(commands), 1)

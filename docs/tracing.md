@@ -67,7 +67,7 @@ Codex and Claude remain explicitly unavailable for this route:
 | Executor | Reason recorded when tracing is requested |
 | --- | --- |
 | Codex | Children run with `--ignore-user-config`; tracing plugin hooks need trust from that ignored user layer. |
-| Claude | Children run with `--safe-mode` and no setting sources; installed plugins and hooks do not load. |
+| Claude | Default children run with `--safe-mode`; the explicit candidate below uses `--restricted` and a selected plugin, but real tracer exports remain unverified. |
 
 Their tracing request is retained in task and attempt history with `available:
 false`; their child environments also strip Langfuse variables. No executor
@@ -83,3 +83,29 @@ as `available: true` only when the required Langfuse public and secret keys are
 present in the startup environment; otherwise the route remains visible with
 `available: false` and an explicit credential diagnostic. Remote
 children remain out of scope.
+
+## Explicit Claude candidate (live verification required)
+
+An operator repository entry may contain one `claude_tracing` JSON string:
+
+```json
+{"claude_tracing":"{\"plugin_dir\":\"/approved/langfuse-plugin\",\"public_key\":\"pk-lf-example\",\"base_url\":\"https://collector.example.invalid\"}"}
+```
+
+The directory must be outside the delegated repository and contain the exact
+audited Langfuse Observability Plugin 1.2.1 source. Router verifies the pinned
+manifest, hooks and digest, freezes the private selection per task, and refuses
+launch if the source changes. The candidate uses `--restricted`, `--plugin-dir`,
+empty setting sources, and native Claude sensitive plugin options for the secret;
+Router never reads or persists that secret.
+
+Selected children strip ambient plugins, hooks, Langfuse variables and attached
+trace context, while preserving native authentication. `CC_LANGFUSE_TRACE_TAGS`
+contains the Router task and host identifiers plus a bounded work-item tag when
+supported. Router usage and cost accounting remain unchanged, and
+`traced: "unknown"` remains until an exporter is independently verified.
+
+The required live checks—secure-store delivery, a fresh Router Claude export, a
+rejected/resumed export, credential isolation, and changed-plugin refusal—remain
+pending on an approved Claude environment. Synthetic hook tests do not count as
+tracer-export evidence.

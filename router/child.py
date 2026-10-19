@@ -8,6 +8,7 @@ import uuid
 from collections.abc import Callable
 from pathlib import Path
 
+from router import claude_tracing
 from router.claude_executor import validate_persistence
 from router.config import Settings
 from router.process import creation_identity
@@ -126,10 +127,15 @@ def executor_command(settings: Settings, task: dict) -> list[str]:
         if not isinstance(executable, str) or not Path(executable).is_absolute() or not task.get("executor_version"):
             raise ValueError("Claude attempt lacks an inspected executable/version binding; refusing unverified child")
         profile = task["permission_profile"]
+        tracing = claude_tracing.selected(task)
+        native_settings = {"permissions": {"allow": profile["allow"]}, "fallbackModel": [], "switchModelsOnFlag": False}
+        if tracing is not None:
+            native_settings.update(claude_tracing.options(task, tracing))
         return [executable, "--print", "--output-format", "stream-json", "--verbose",
-                "--safe-mode", "--setting-sources", "", "--permission-mode", "dontAsk", "--permission-prompts", "none",
+                *(["--restricted", "--plugin-dir", tracing["plugin_dir"]] if tracing is not None else ["--safe-mode"]),
+                "--setting-sources", "", "--permission-mode", "dontAsk", "--permission-prompts", "none",
                 "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}', "--disable-slash-commands",
-                "--tools", ",".join(profile["tools"]), "--settings", json.dumps({"permissions": {"allow": profile["allow"]}, "fallbackModel": [], "switchModelsOnFlag": False}),
+                "--tools", ",".join(profile["tools"]), "--settings", json.dumps(native_settings),
                 "--model", task["resolved_model"].removeprefix("anthropic/"),
                 "--resume" if task["attempts"] else "--session-id", session, "--", prompt]
     session = task.get("child_session_id")
@@ -189,4 +195,6 @@ def child_environment(environment: dict[str, str], task: dict, *, include_tracin
                     "ANTHROPIC_DEFAULT_SONNET_MODEL", "ANTHROPIC_DEFAULT_HAIKU_MODEL",
                     "CLAUDE_CODE_SUBAGENT_MODEL", "OPENCODE_CONFIG_CONTENT"):
             result.pop(key, None)
+        if "_claude_tracing" in task or isinstance(task.get("tracing"), dict) and task["tracing"].get("requested"):
+            result = claude_tracing.environment(result, task)
     return result
