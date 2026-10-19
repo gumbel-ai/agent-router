@@ -9,8 +9,9 @@ from pathlib import Path
 
 PLUGIN_ID = "langfuse-observability@inline"
 PLUGIN_FILES = (".claude-plugin/plugin.json", "hooks/hooks.json", "hooks/langfuse_hook.py")
-# b5b7cc364996467e856dc17575b5674f4799ad87, including relative names and NUL separators.
-AUDITED_DIGEST = "776d495fbc91ffc486e04fad0ccf2975084c299ff1034e44f7b183149bf369e5"
+# gumbel-ai/claude-observability-plugin d5829be6628cb67dc45eca699575348a152ae565
+# (upstream b5b7cc3 plus durable export), including relative names and NUL separators.
+AUDITED_DIGEST = "d87b09c364226d2194fe7fb1ec6ab5691c5c3b5ca17254ce50b1c23cb3f08deb"
 CONFIG_KEYS = {"plugin_dir"}
 AUTH_KEYS = {"CLAUDE_CONFIG_DIR", "CLAUDE_CODE_OAUTH_TOKEN"}
 
