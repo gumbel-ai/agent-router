@@ -256,11 +256,18 @@ class TransportTests(TransportHarness, unittest.TestCase):
                 waiter.communicate()
 
     def test_completion_wait_replays_offline_evidence_and_lost_ack_replies(self):
+        self.environment.update(ROUTER_MANAGED_ID="managed-parent", EXAMPLE_OPTION="preserved")
+        identity = ("import json, os; print(json.dumps({key: os.environ.get(key) "
+                    "for key in ('ROUTER_MANAGED_ID', 'EXAMPLE_OPTION')})); ")
         outside = subprocess.run([sys.executable, "-m", "router.cli", "run", "--", sys.executable, "-c",
-                                  "raise SystemExit(4)"], env=self.environment, cwd=self.root,
+                                  identity + "raise SystemExit(4)"], env=self.environment, cwd=self.root,
                                  capture_output=True, text=True, timeout=15, check=False)
         self.assertEqual(outside.returncode, 4)
         self.assertIn("not recording", outside.stderr)
+        self.assertIn("no completion event will follow", outside.stderr)
+        outside_identity = json.loads(outside.stdout)["ROUTER_MANAGED_ID"]
+        self.assertTrue(outside_identity)
+        self.assertNotEqual(outside_identity, "managed-parent")
         # A consumer subscribes even when it times out before any command starts.
         initial = self.completion_cli("wait", "--consumer", "worker-a", "--timeout", "2")
         self.assertEqual(initial.returncode, 0, initial.stderr)
@@ -268,7 +275,7 @@ class TransportTests(TransportHarness, unittest.TestCase):
         request("daemon_stop", {}, self.endpoint)
         self.daemons[-1].wait(timeout=15)
         completed = subprocess.run([sys.executable, "-m", "router.cli", "run", "--label", "batch-job", "--",
-                                    sys.executable, "-c", "raise SystemExit(3)"], env=self.environment,
+                                    sys.executable, "-c", identity + "raise SystemExit(3)"], env=self.environment,
                                    cwd=self.repo, capture_output=True, text=True, timeout=15, check=False)
         self.assertEqual(completed.returncode, 3)
         unavailable = self.completion_cli("wait", "--consumer", "worker-a", "--timeout", "5")
@@ -278,6 +285,11 @@ class TransportTests(TransportHarness, unittest.TestCase):
         self.assertEqual(delivered.returncode, 0, delivered.stderr)
         first = json.loads(delivered.stdout)
         self.assertEqual(first["status"], "failed")
+        child_environment = json.loads(completed.stdout)
+        self.assertEqual(child_environment["ROUTER_MANAGED_ID"], first["event"]["managed_id"])
+        self.assertNotIn(child_environment["ROUTER_MANAGED_ID"], (outside_identity, "managed-parent"))
+        self.assertEqual(child_environment["EXAMPLE_OPTION"], "preserved")
+        self.assertEqual(self.environment["ROUTER_MANAGED_ID"], "managed-parent")
         request("daemon_stop", {}, self.endpoint)
         self.daemons[-1].wait(timeout=15)
         self.boot()
