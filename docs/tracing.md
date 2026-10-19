@@ -59,6 +59,11 @@ The task's `tracing.available` flag is conservative and is true only when the
 startup environment contains the plugin's required public and secret keys. Router
 does not read the optional user credential file, so file-only configuration remains
 an operator-controlled export path and is not claimed as Router-verified readiness.
+Each child launch, including a rejected or resumed attempt, records the flag and
+reason for the environment that child receives; the correlation tuple and earlier
+attempt records are unchanged. A launched child's tracing record is kept through
+final capture and restart recovery even if the repository opts out later; a
+later launch from an opted-out repository records no tracing.
 
 ## Other executors
 
