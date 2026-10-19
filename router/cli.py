@@ -298,6 +298,12 @@ def main() -> None:
     snapshot.add_argument("--history-limit", type=int, default=100)
     fleet = commands.add_parser("fleet", help="Query configured local and SSH hosts")
     fleet_commands = fleet.add_subparsers(dest="fleet_command", required=True)
+    fleet_correlation = fleet_commands.add_parser("correlation", help="Export bounded content-free fleet metadata")
+    fleet_correlation.add_argument("--json", action="store_true", required=True)
+    fleet_correlation.add_argument("--config", type=Path)
+    fleet_correlation.add_argument("--host", dest="correlation_host")
+    fleet_correlation.add_argument("--limit", type=int, default=100)
+    fleet_correlation.add_argument("--cursor")
     fleet_status = fleet_commands.add_parser("status")
     fleet_status.add_argument("--json", action="store_true")
     fleet_status.add_argument("--watch", action="store_true")
@@ -441,6 +447,14 @@ def main() -> None:
             print(json.dumps(request("correlation", payload, timeout=15, deadline=True), separators=(",", ":")))
         elif args.command == "snapshot":
             print(json.dumps(request("snapshot", {"history_limit": args.history_limit}), separators=(",", ":")))
+        elif args.command == "fleet" and args.fleet_command == "correlation":
+            from router.fleet import DEFAULT_CONFIG, load_fleet_config
+            from router.fleet_correlation import query_correlation
+            result = query_correlation(load_fleet_config(args.config or DEFAULT_CONFIG), only=args.correlation_host,
+                                       limit=args.limit, cursor=args.cursor)
+            print(json.dumps(result, separators=(",", ":")), flush=True)
+            if result["partial"]:
+                raise ValueError("Fleet correlation export is partial; inspect host results")
         elif args.command == "fleet" and args.fleet_command in {"wait", "ack"}:
             from router.fleet import DEFAULT_CONFIG, load_fleet_config
             from router.fleet_completions import (
@@ -525,7 +539,7 @@ def main() -> None:
         if args.command == "fleet" and args.fleet_command in {"wait", "ack"}:
             parser.exit(130, "Agent Router fleet completion interrupted; events remain durable; "
                         "acknowledgment commit state is unknown. Retry the same delivery, never the command.\n")
-        if args.command == "correlation":
+        if args.command == "correlation" or args.command == "fleet" and args.fleet_command == "correlation":
             parser.exit(130, "Agent Router correlation export interrupted; no state changed.\n")
         if args.command == "ack":
             parser.exit(130, "Agent Router acknowledgment interrupted; commit state is unknown. "

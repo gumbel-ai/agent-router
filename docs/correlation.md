@@ -6,8 +6,8 @@ transcripts, install tracing plugins or upload traces. `traced` is always `unkno
 The export contains no prompts, responses, task instructions, labels, paths, tool
 contents, credentials, usage or costs.
 
-This is the local part of Stage A. Fleet transport is a separate follow-up. Live
-trace reconciliation, child tracing and Stages B/C are not covered.
+Local and fleet exports provide Stage A metadata for synthetic compatibility
+checks. Live trace reconciliation, child tracing and Stages B/C are not covered.
 
 ```sh
 router correlation --json --limit 100
@@ -82,6 +82,72 @@ Pass `next_cursor` unchanged until it is null. Cursors are versioned and bound t
 the producing host. Each page is a new read snapshot: updates, pruning or database
 replacement between pages can change the inventory. Start a fresh scan for a new
 inventory; use [completion wait/ack](completions.md) for durable delivery.
+
+## Fleet pages
+
+```sh
+router fleet correlation --json --config fleet.toml --limit 100
+router fleet correlation --json --config fleet.toml --host worker-b --limit 100 --cursor 'CURSOR_FROM_THAT_HOST'
+```
+
+The first command requests one page from each configured host concurrently, using
+its existing local socket or SSH transport. `--host` selects a configured display
+name; it does not establish a Router identity. A cursor requires `--host` and is
+validated against the responding Router host even on a final page. Follow each
+host's `page.next_cursor` separately. Pagination never automatically drains a host.
+
+The fleet envelope has `schema_version: 1`, `generated_at`,
+`status_scope: "recorded"`, `partial` and ordered `hosts`. Each host contains its
+configured `name`, known `host_id` or null, and `ok`. A successful host has `page`
+with the local JSON contract. A failed host has an `error` object with a structural
+`code` and, when available, `exit_code`, numeric `errno` or a fixed field-level
+`detail`. No SSH target, tags, raw SSH stderr or raw rejected data is forwarded.
+Errors can be inspected using the existing transport's operator diagnostics.
+
+| Error code | Meaning |
+| --- | --- |
+| `spawn_failed` | The local SSH executable could not start; `errno` may identify the OS failure. |
+| `exit_failed` | SSH or the remote Router command exited unsuccessfully; `exit_code` is retained. This includes unreachable hosts and peers without the CLI operation. |
+| `deadline` | Collection exceeded its transport deadline. |
+| `output_limit` | The SSH response exceeded the one-MiB wire limit. |
+| `transport_failed`, `cleanup_failed` | The transport failed while collecting or cleaning up its owned reader process. |
+| `unavailable` | The local Router socket could not be reached. |
+| `request_failed` | The local Router request failed; inspect the daemon log. |
+| `invalid_response` | The host did not supply a valid, bounded version-1 page envelope or cursor. |
+| `duplicate_host_id` | Selected configured hosts claimed the same Router identity. Pages are omitted to prevent ambiguous joins; reported IDs remain unchanged. |
+
+The receiver projects known metadata fields again. Unknown properties are omitted.
+An invalid scalar becomes null, and an invalid kind or foreign-host record is
+omitted while other records remain usable. `traced` stays `unknown` even if a peer
+claims otherwise. Such changes make the page partial. Fleet pages add
+`wire_error_count` and up to ten `wire_errors` entries, containing only `section`,
+a zero-based list `index` and fixed `fields`. Producer `invalid_records` and safe
+producer diagnostics remain separate, so receiver errors are not double-counted.
+Missing identities stay null; the envelope host does not fill an unknown record
+host. Duplicate identity detection covers selected hosts only; external mappings
+must still be unambiguous across the inventory they join.
+
+`--limit` remains 1–100 per host; fleet configuration allows at most 32 hosts. Each
+received and projected page is capped at one MiB, and the compact fleet JSON is
+capped at `32 * (1 MiB + 16 KiB) + 4 KiB`. Collection uses the configured
+`ssh_timeout_seconds` for each host, including one overall deadline for local
+socket reads, and the existing bounded SSH process cleanup. There are no retries,
+job launches, completion acknowledgments, daemon starts, credential changes or
+host-key bypasses. Interruption waits for bounded outstanding readers to finish
+cleanup and leaves Router state unchanged.
+
+| Fleet correlation exit code | Meaning |
+| --- | --- |
+| 0 | Every selected host supplied a complete page. |
+| 1 | A partial result was printed, or configuration/transport arguments failed. Inspect each host and page. |
+| 2 | Invalid CLI syntax. |
+| 130 | Interrupted; no completed fleet JSON is promised. |
+
+Other fleet commands retain their existing exit contracts. Automated checks use
+separate local daemon processes and state directories, with the SSH subprocess
+boundary replaced by a real local CLI process. They exercise process restart,
+per-host pagination and failure isolation. This is simulated transport, not a
+physical SSH or independent-machine reboot check.
 
 ## Mapping IDs outside Router
 
