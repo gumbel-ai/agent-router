@@ -173,7 +173,7 @@ class ClaudeTracingTests(RuntimeHarness, unittest.TestCase):
                                 "work_item_id:work-synthetic"])
         unchanged = {key: value for key, value in task.items() if key not in {"_claude_tracing", "tracing"}}
         default = child_environment(environment, unchanged)
-        self.assertEqual(default["LANGFUSE_SECRET_KEY"], environment["LANGFUSE_SECRET_KEY"])
+        self.assertNotIn("LANGFUSE_SECRET_KEY", default)
         self.assertEqual(default["CLAUDE_CODE_PLUGIN_DIRS"], environment["CLAUDE_CODE_PLUGIN_DIRS"])
 
         for work_item in (None, "short", "x" * (200 - len("work_item_id:")),

@@ -195,6 +195,6 @@ def child_environment(environment: dict[str, str], task: dict, *, include_tracin
                     "ANTHROPIC_DEFAULT_SONNET_MODEL", "ANTHROPIC_DEFAULT_HAIKU_MODEL",
                     "CLAUDE_CODE_SUBAGENT_MODEL", "OPENCODE_CONFIG_CONTENT"):
             result.pop(key, None)
-        if "_claude_tracing" in task or isinstance(task.get("tracing"), dict) and task["tracing"].get("requested"):
+        if "_claude_tracing" in task:
             result = claude_tracing.environment(result, task)
     return result

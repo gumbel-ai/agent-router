@@ -93,7 +93,13 @@ def configure(raw: str, task: dict, host_id: str, repository: Path) -> dict:
 
 def selected(task: dict) -> dict | None:
     if "_claude_tracing" not in task:
-        if isinstance(task.get("tracing"), dict) and task["tracing"].get("requested"):
+        tracing = task.get("tracing")
+        # Older repository-wide tracing requests are explicitly recorded as
+        # unavailable by the Router and must retain their normal untraced
+        # Claude command. The opt-in candidate has no availability marker and
+        # must fail closed if its private selection is missing.
+        if (isinstance(tracing, dict) and tracing.get("requested")
+                and "available" not in tracing):
             raise ValueError("Claude tracing selection is missing; refusing an untraced replacement")
         return None
     config = task["_claude_tracing"]

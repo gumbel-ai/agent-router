@@ -985,7 +985,8 @@ class Runtime:
     def _tracing_requested(self, task: dict) -> bool:
         root = Path(task["invocation"]["parent_worktree"]).resolve()
         configured = self.control.settings.repositories.get(str(root))
-        return isinstance(configured, dict) and configured.get("tracing") == "requested"
+        return (isinstance(configured, dict)
+                and (configured.get("tracing") == "requested" or "claude_tracing" in configured))
 
     def observe(self, task_id: str, record: dict, process=None, *, collecting: bool = False) -> dict:
         offset = self.store.get(task_id).get("event_offset", 0)
