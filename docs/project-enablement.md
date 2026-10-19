@@ -6,6 +6,8 @@ run `router daemon start` in a separate terminal and keep it running, then use
 `router enable` from another terminal. Before rerunning setup, stop any manual daemon
 with `router daemon stop`; restart it after setup. The macOS `router service`
 commands do not manage a Linux daemon. Linux live-host verification is **NOT CHECKED**.
+`router uninstall` removes the CLI and Router's user plugin installation while
+retaining configuration and history; on Linux, stop the manual daemon first.
 
 Setup does not newly enable Router's observer plugins globally. Run `router enable`
 from a Git project or one of its subdirectories.

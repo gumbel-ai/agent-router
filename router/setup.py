@@ -238,11 +238,14 @@ def uninstall(yes: bool = False) -> None:
         remove_claude_global,
     )
 
-    require_idle()
+    current = require_idle()
+    if sys.platform == "linux" and current:
+        raise ValueError("Stop the manually started daemon with router daemon stop before router uninstall")
     home = claude_home()
     user_install = claude_user_install(home)
-    confirm("Remove Agent Router's user-scoped Claude plugin, service, and CLI? Keep configuration and history.", yes)
-    stop(uninstall=True)
+    confirm("Remove Agent Router's user-scoped Claude plugin, CLI, and any managed service? Keep configuration and history.", yes)
+    if sys.platform != "linux":
+        stop(uninstall=True)
     remove_claude_global(home, user_install)
     if shutil.which("codex"):
         try:

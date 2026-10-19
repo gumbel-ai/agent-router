@@ -282,10 +282,25 @@ class SetupTests(unittest.TestCase):
                 raise ValueError("No user-scoped plugin is installed")
             return ""
 
-        with patch("router.setup.require_idle"), patch("router.setup.stop"), \
-                patch("router.setup.shutil.which", return_value=None), patch("router.setup.run", side_effect=command):
-            uninstall(yes=True)
-        self.assertEqual(calls, [["uv", "tool", "uninstall", "agent-router"]])
+        state = self.root / "state"
+        state.mkdir()
+        history = state / "history.jsonl"
+        history.write_text('{"session_id":"worker-a"}\n')
+        pointer = state / "python-path"
+        for platform in ("darwin", "linux"):
+            calls.clear()
+            pointer.write_text(sys.executable + "\n")
+            with self.subTest(platform=platform), patch("router.setup.sys.platform", platform), \
+                    patch("router.setup.require_idle", return_value=None), patch("router.setup.stop") as service, \
+                    patch("router.setup.shutil.which", return_value=None), patch("router.setup.run", side_effect=command):
+                uninstall(yes=True)
+                self.assertEqual(calls, [["uv", "tool", "uninstall", "agent-router"]])
+                self.assertFalse(pointer.exists())
+                self.assertEqual(history.read_text(), '{"session_id":"worker-a"}\n')
+                if platform == "linux":
+                    service.assert_not_called()
+                else:
+                    service.assert_called_once_with(uninstall=True)
 
     def test_observation_only_daemon_and_published_hooks_span_two_projects(self):
         state = self.root / "state"
@@ -343,6 +358,12 @@ class SetupTests(unittest.TestCase):
                     setup(yes=True)
                 self.assertEqual([call.args[0] for call in command.call_args_list], [["uv", "tool", "dir"]])
                 self.assertFalse((state / "python-path").exists())
+            with patch("router.setup.sys.platform", "linux"), patch("router.setup.run") as command, \
+                    patch("router.setup.stop") as service, patch("router.setup.shutil.which", return_value=None), \
+                    self.assertRaisesRegex(ValueError, "manually started daemon"):
+                uninstall(yes=True)
+            command.assert_not_called()
+            service.assert_not_called()
             with self.assertRaisesRegex(ValueError, "not configured"):
                 request("start", {})
             request("daemon_stop", {"only_if_idle": True})

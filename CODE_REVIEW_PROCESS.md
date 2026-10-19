@@ -366,6 +366,8 @@ item before requesting review.
 
 **Native interfaces**
 
+- When enabling a platform, trace installation, reconfiguration, and uninstall together;
+  platform-specific service management must not leak into manual-daemon paths.
 - Validate every native inventory diagnostic channel and compare required entries
   before classifying trust. Missing entries are incomplete evidence; warnings must
   retain their cause without invalidating complete, unrelated evidence.
