@@ -73,12 +73,11 @@ def supervised_state(record: dict, process: subprocess.Popen | None) -> str:
         process.poll()
     state = owned_state(record)
     if state == "uncertain" and process is not None:
-        # Exit can occur between poll() and the probe. On Darwin an unreaped
-        # direct-child leader can yield EPERM; reap it before judging liveness.
-        try:
-            process.wait(timeout=0.05)
-        except subprocess.TimeoutExpired:
-            return state
+        # Exit can occur between poll() and the probe. On Darwin an exiting
+        # direct-child leader can yield EPERM until it becomes reapable. While
+        # unreaped, its PID and group cannot be reused, so it is still owned.
+        if process.poll() is None:
+            return "exiting"
         state = owned_state(record)
     if state == "uncertain" and record.get("disposable") and Path(record["completion"]).exists():
         # The disposable gate kills its whole group after recording completion.
@@ -99,6 +98,9 @@ def _stop_group(record: dict, process: subprocess.Popen | None = None) -> None:
     state = supervised_state(record, process)
     if state == "stopped":
         return
+    if state == "exiting":
+        _await_group(record, process)
+        return
     if state != "live":
         raise UncertainProcess("Process ownership or liveness is uncertain; no signal sent")
     if record.get("interrupt_first"):
@@ -113,7 +115,11 @@ def _stop_group(record: dict, process: subprocess.Popen | None = None) -> None:
             if supervised_state(record, process) == "stopped":
                 return
             time.sleep(0.02)
-        if supervised_state(record, process) != "live":
+        state = supervised_state(record, process)
+        if state == "exiting":
+            _await_group(record, process)
+            return
+        if state != "live":
             raise UncertainProcess("Ownership became uncertain during interruption; artifacts retained")
         # Persist before escalation: a normal exit code from a launcher must not
         # erase forced-shutdown uncertainty, even after a daemon restart.
@@ -133,10 +139,17 @@ def _stop_group(record: dict, process: subprocess.Popen | None = None) -> None:
     state = supervised_state(record, process)
     if state == "live":
         os.killpg(record["pgid"], signal.SIGKILL)
-    elif state != "stopped":
+    elif state not in {"stopped", "exiting"}:
         raise UncertainProcess("Ownership became uncertain during termination; artifacts retained")
+    _await_group(record, process)
+
+
+def _await_group(record: dict, process: subprocess.Popen | None) -> None:
     if process is not None:
-        process.wait(timeout=5)
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired as error:
+            raise UncertainProcess("Owned process group leader did not exit; artifacts retained") from error
     limit = time.monotonic() + 3
     while time.monotonic() < limit:
         if owned_state(record) == "stopped":

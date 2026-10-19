@@ -1021,7 +1021,7 @@ class Runtime:
                     raise UncertainProcess("Execution stopped without reliable completion evidence")
                 self.store.update(task_id, lambda t: t.update(execution_stopped=True))
                 return json.loads(completion.read_text())
-            if state != "live":
+            if state not in {"live", "exiting"}:
                 raise UncertainProcess("Process creation identity or liveness is uncertain")
             cancel = task.get("cancel_requested") and (not collecting or task.get("cancel_requested_at", 0) > task["phase_started_at"])
             timeout = not collecting and now_ms() >= min(task["deadline_at"], record.get("deadline_at", task["deadline_at"]))
