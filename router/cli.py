@@ -329,7 +329,7 @@ def main() -> None:
     daemon.add_argument("action", choices=["start", "stop"])
     commands.add_parser("plugin-path", help="Print the bundled Claude plugin directory")
     commands.add_parser("enable", help="Enable observation in this Git project for Claude and Codex")
-    setup = commands.add_parser("setup", help="Install the user background service and register plugin marketplaces")
+    setup = commands.add_parser("setup", help="Install the CLI, register marketplaces, and install a macOS user service")
     setup.add_argument("--yes", action="store_true", help="Approve installation without prompting")
     setup.add_argument("--marketplace", default="gumbel-ai/agent-router", help="Official Claude marketplace source (or a local source for development)")
     uninstall = commands.add_parser("uninstall", help="Remove plugin, service and CLI, retaining private history")

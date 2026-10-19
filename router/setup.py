@@ -17,7 +17,6 @@ from router.service import (
     identity,
     refresh_service,
     require_idle,
-    require_platform,
     run,
     start,
     stop,
@@ -56,15 +55,20 @@ def source() -> str:
 
 def setup(yes: bool = False, marketplace: str = MARKETPLACE) -> None:
     # Probe prerequisites before changing either the CLI or host integration.
-    require_platform()
+    if sys.platform not in {"darwin", "linux"}:
+        raise ValueError("Router setup supports macOS and Linux")
     if not shutil.which("claude") or not shutil.which("uv"):
         raise ValueError("Install Claude Code and uv first")
     load_settings()
     current = require_idle()
-    confirm("Install Agent Router's CLI and background service and register plugin marketplaces? "
+    installation = "CLI and background service" if sys.platform == "darwin" else "CLI"
+    confirm(f"Install Agent Router's {installation} and register plugin marketplaces? "
             "Plugins are enabled separately per project. Local observation history stays on this machine.", yes)
     tool_dir = Path(run(["uv", "tool", "dir"])) / "agent-router"
     if current:
+        if sys.platform == "linux":
+            raise ValueError("Stop the manually started daemon with router daemon stop before router setup; "
+                             "restart it afterward with router daemon start")
         label, _ = identity()
         from router.service import domain, loaded
         if not loaded(f"{domain()}/{label}"):
@@ -84,9 +88,14 @@ def setup(yes: bool = False, marketplace: str = MARKETPLACE) -> None:
     run(["claude", "plugin", "marketplace", "add", marketplace])
     register_codex_marketplace(marketplace)
     private_write(runtime_pointer(), str(Path(sys.executable).absolute()) + "\n")
-    result = start(restart=bool(current))
-    print(f"Agent Router service ready ({result['version']}). Run router enable in each project to observe, "
-          "then use ordinary claude or codex there and router status --watch in a terminal.")
+    if sys.platform == "darwin":
+        result = start(restart=bool(current))
+        print(f"Agent Router service ready ({result['version']}).")
+    else:
+        print("Agent Router CLI installed. No background service was installed. "
+              "Run router daemon start in a separate terminal and keep it running.")
+    print("Run router enable in each project to observe, then use ordinary claude or codex there "
+          "and router status --watch in a terminal.")
     print("External delegation is opt-in: run router init in each target project. Restart existing Claude sessions to load the plugin.")
 
 

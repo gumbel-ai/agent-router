@@ -1,8 +1,14 @@
 # Project observation enablement
 
-Run `router setup` once to install the CLI and background service and register the
-plugin marketplaces. Setup does not newly enable Router's observer plugins globally.
-Then run `router enable` from a Git project or one of its subdirectories.
+Run `router setup` once to install the CLI and register the plugin marketplaces.
+On macOS it also installs the background service. On Linux it installs no service:
+run `router daemon start` in a separate terminal and keep it running, then use
+`router enable` from another terminal. Before rerunning setup, stop any manual daemon
+with `router daemon stop`; restart it after setup. The macOS `router service`
+commands do not manage a Linux daemon. Linux live-host verification is **NOT CHECKED**.
+
+Setup does not newly enable Router's observer plugins globally. Run `router enable`
+from a Git project or one of its subdirectories.
 
 The command installs `agent-router@agent-router` in Claude at **project** scope and
 writes at the current Git worktree root:

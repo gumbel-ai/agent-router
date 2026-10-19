@@ -1,3 +1,4 @@
+import io
 import json
 import os
 import plistlib
@@ -8,6 +9,7 @@ import time
 import tomllib
 import unittest
 from argparse import Namespace
+from contextlib import redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 
@@ -143,20 +145,58 @@ class SetupTests(unittest.TestCase):
         def command(argv):
             calls.append(argv)
             return str(tools) if argv == ["uv", "tool", "dir"] else ""
-        with patch("router.setup.sys.prefix", str(runtime.resolve())), \
+        pointer = self.root / "state" / "python-path"
+        for platform in ("darwin", "linux"):
+            pointer.unlink(missing_ok=True)
+            output = io.StringIO()
+            calls.clear()
+            with self.subTest(platform=platform), redirect_stdout(output), \
+                patch("router.setup.sys.prefix", str(runtime.resolve())), \
                 patch("router.setup.sys.executable", str(runtime / "bin" / "python")), \
-                patch("router.service.sys.platform", "darwin"), \
+                patch("router.setup.sys.platform", platform), \
                 patch("router.setup.shutil.which", return_value="/usr/bin/tool"), \
                 patch("router.setup.run", side_effect=command), \
                 patch("router.setup.register_codex_marketplace") as codex, \
-                patch("router.setup.start", return_value={"version": "0.2.0"}):
-            setup(yes=True)
-        codex.assert_called_once_with("gumbel-ai/agent-router")
-        self.assertEqual(calls, [["uv", "tool", "dir"], ["claude", "plugin", "marketplace", "add",
-                              "gumbel-ai/agent-router"]])
-        pointer = self.root / "state" / "python-path"
-        self.assertEqual(pointer.read_text().strip(), str(runtime / "bin" / "python"))
-        self.assertEqual(pointer.stat().st_mode & 0o777, 0o600)
+                patch("router.setup.start", return_value={"version": "0.2.0"}) as service:
+                setup(yes=True)
+                codex.assert_called_once_with("gumbel-ai/agent-router")
+                self.assertEqual(calls, [["uv", "tool", "dir"], ["claude", "plugin", "marketplace", "add",
+                                      "gumbel-ai/agent-router"]])
+                if platform == "linux":
+                    service.assert_not_called()
+                    self.assertIn("router daemon start", output.getvalue())
+                    self.assertNotIn("service ready", output.getvalue())
+                else:
+                    service.assert_called_once_with(restart=False)
+                self.assertEqual(pointer.read_text().strip(), str(runtime / "bin" / "python"))
+                self.assertEqual(pointer.stat().st_mode & 0o777, 0o600)
+
+    def test_linux_setup_installs_durable_cli_and_reports_reentry_failure(self):
+        tools = self.root / "tools"
+        for returncode in (0, 1):
+            calls = []
+            def command(argv, commands=calls):
+                commands.append(argv)
+                return str(tools) if argv == ["uv", "tool", "dir"] else ""
+            with self.subTest(returncode=returncode), \
+                    patch("router.setup.sys.platform", "linux"), \
+                    patch("router.setup.sys.prefix", str(self.root / "temporary")), \
+                    patch("router.setup.shutil.which", return_value="/usr/bin/tool"), \
+                    patch("router.setup.source", return_value="agent-router==0.3.0"), \
+                    patch("router.setup.run", side_effect=command), \
+                    patch("router.setup.start") as service, patch("router.setup.stop") as stop, \
+                    patch("router.setup.subprocess.run", return_value=subprocess.CompletedProcess([], returncode)) as child:
+                if returncode:
+                    with self.assertRaisesRegex(ValueError, "Persistent Router setup failed"):
+                        setup(yes=True, marketplace="example/marketplace")
+                else:
+                    setup(yes=True, marketplace="example/marketplace")
+                self.assertEqual(calls, [["uv", "tool", "dir"], ["uv", "tool", "install", "--force", "--python", "3.14",
+                                                                 "--from", "agent-router==0.3.0", "agent-router"]])
+                child.assert_called_once_with([str(tools / "agent-router" / "bin" / "router"), "setup", "--yes",
+                                               "--marketplace", "example/marketplace"], check=False)
+                service.assert_not_called()
+                stop.assert_not_called()
 
     def test_service_start_recovers_offline_tasks_without_killing_a_loaded_job(self):
         state = self.root / "state"
@@ -290,12 +330,13 @@ class SetupTests(unittest.TestCase):
             self.assertEqual({row["parent_session_id"] for row in rows}, {"session-0", "session-1"})
             self.assertTrue(all(row["control_mode"] == "observe" for row in rows))
             self.assertNotIn("DO NOT STORE", json.dumps(rows))
-            for prefix in (self.root / "temporary", self.root / "tools" / "agent-router"):
+            for platform, prefix in ((platform, prefix) for platform in ("darwin", "linux")
+                                     for prefix in (self.root / "temporary", self.root / "tools" / "agent-router")):
                 (state / "python-path").unlink(missing_ok=True)
                 with patch("router.setup.run", return_value=str(self.root / "tools")) as command, \
                         patch("router.setup.sys.prefix", str(prefix)), \
                         patch("router.setup.shutil.which", return_value="/usr/bin/tool"), \
-                        patch("router.service.sys.platform", "darwin"), \
+                        patch("router.setup.sys.platform", platform), \
                         patch("router.service.domain", return_value="gui/test"), \
                         patch("router.service.loaded", return_value=False), \
                         self.assertRaisesRegex(ValueError, "manually started daemon"):
