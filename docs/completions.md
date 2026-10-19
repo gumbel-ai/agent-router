@@ -8,6 +8,9 @@ Labels remain display text and never supply an identity. Without this option the
 field stays absent from managed records and completion events. This declaration
 does not enable observation outside an enabled project or grant control authority.
 Use identifiers, never prompts, instructions or credentials, in this field.
+Callers can check support first: `router status --codex --json` reports
+`"supports_work_item_id": true` without contacting the daemon (see
+[project enablement](project-enablement.md)).
 
 An active agent can use a blocking shell/tool call to wait for commands launched with
 `router run` in an observed project:
