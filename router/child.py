@@ -64,6 +64,15 @@ TRACING_UNAVAILABLE = {
 }
 
 
+def strip_langfuse_environment(environment: dict[str, str]) -> dict[str, str]:
+    """Return an environment without Langfuse credentials or identity."""
+    result = environment.copy()
+    for key in tuple(result):
+        if key.startswith("LANGFUSE_"):
+            result.pop(key, None)
+    return result
+
+
 def executor_command(settings: Settings, task: dict) -> list[str]:
     invocation = task["invocation"]
     prompt = invocation["task"]
@@ -99,8 +108,8 @@ def executor_command(settings: Settings, task: dict) -> list[str]:
             "--model", task["resolved_model"].removeprefix("openai/"), "--", prompt]
 
 
-def child_environment(environment: dict[str, str], task: dict) -> dict[str, str]:
-    result = environment.copy()
+def child_environment(environment: dict[str, str], task: dict, *, include_tracing_credentials: bool = True) -> dict[str, str]:
+    result = strip_langfuse_environment(environment)
     worktree = Path(task["worktree"])
     result.pop("VIRTUAL_ENV", None)
     # Never inherit the parent's writable Python/Node module lookup paths.
@@ -113,14 +122,11 @@ def child_environment(environment: dict[str, str], task: dict) -> dict[str, str]
     # LANGFUSE_* variable first, then restore only the documented values for the
     # verified OpenCode route. This also protects Codex/Claude when their
     # repository tracing flag is present.
-    for key in tuple(result):
-        if key.startswith("LANGFUSE_"):
-            result.pop(key, None)
     if task["executor"] == "opencode":
         tracing = task.get("tracing", {})
         requested = isinstance(tracing, dict) and tracing.get("requested") is True
         config = {"permission": task["permission_profile"]}
-        if requested:
+        if requested and include_tracing_credentials:
             config["plugins"] = [OPENCODE_LANGFUSE_PLUGIN]
             for key in LANGFUSE_ENVIRONMENT_KEYS:
                 if key in environment:

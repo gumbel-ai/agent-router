@@ -22,6 +22,7 @@ from router.child import (
     child_environment,
     executor_command,
     launch,
+    strip_langfuse_environment,
 )
 from router.claude_executor import collect as collect_claude
 from router.claude_executor import public_usage as claude_public_usage
@@ -924,13 +925,20 @@ class Runtime:
 
     def phase(self, task_id: str, name: str, command: list[str], cwd: Path, *, collecting: bool = False) -> dict:
         task = self.store.get(task_id)
+        tracing = task.get("tracing")
+        requested = isinstance(tracing, dict) and tracing.get("requested") is True
+        if requested and not self._tracing_requested(task):
+            # A task can outlive a repository config reload. Fail closed for
+            # every resumed phase and remove the stale child opt-in.
+            self.store.update(task_id, lambda current: current.pop("tracing", None))
+            task = self.store.get(task_id)
         started = now_ms()
         directory = Path(task["artifact_dir"]) / f"attempt-{task['attempt_number']}" / name
-        environment = self.control.environment.copy()
+        environment = strip_langfuse_environment(self.control.environment)
         for key in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR"):
             environment.pop(key, None)
         if "worktree" in task and name in {"setup", "child"}:
-            environment = child_environment(environment, task)
+            environment = child_environment(environment, task, include_tracing_credentials=name == "child")
         process = None
         def register(record):
             record["interrupt_first"] = name == "child" and task["executor"] in {"codex", "claude"}
@@ -958,6 +966,11 @@ class Runtime:
             if process.poll() is not None:
                 with self.lock:
                     self.processes.pop(task_id, None)
+
+    def _tracing_requested(self, task: dict) -> bool:
+        root = Path(task["invocation"]["parent_worktree"]).resolve()
+        configured = self.control.settings.repositories.get(str(root))
+        return isinstance(configured, dict) and configured.get("tracing") == "requested"
 
     def observe(self, task_id: str, record: dict, process=None, *, collecting: bool = False) -> dict:
         offset = self.store.get(task_id).get("event_offset", 0)

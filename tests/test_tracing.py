@@ -15,6 +15,7 @@ from router.child import (
     TRACING_UNAVAILABLE,
     child_environment,
     executor_command,
+    strip_langfuse_environment,
 )
 
 CLAUDE_MODEL = "anthropic/claude-sonnet-4-6"
@@ -76,8 +77,21 @@ class TracingTests(RuntimeHarness, unittest.TestCase):
         self.assertNotIn("worktree", task)
         self.assertNotIn("tracing", task)
 
+    def test_reloaded_repository_opt_out_disables_stale_tracing(self):
+        config = self.configure("opencode")
+        config["tracing"] = "requested"
+        task = {"invocation": {"parent_worktree": str(self.repo)}}
+        self.assertTrue(self.runtime._tracing_requested(task))
+        config.pop("tracing")
+        self.assertFalse(self.runtime._tracing_requested(task))
+
 
 class TracingLaunchTests(unittest.TestCase):
+    def test_router_phase_environment_stripping_does_not_mutate_source(self):
+        environment = {"PATH": "/usr/bin", "LANGFUSE_SECRET_KEY": "sk-secret", "OTHER": "kept"}
+        self.assertEqual(strip_langfuse_environment(environment), {"PATH": "/usr/bin", "OTHER": "kept"})
+        self.assertEqual(environment["LANGFUSE_SECRET_KEY"], "sk-secret")
+
     def test_tracing_off_strips_credentials_and_does_not_add_plugin(self):
         environment = {"PATH": "/usr/bin", "EXAMPLE_OPTION": "kept",
                        "LANGFUSE_PUBLIC_KEY": "pk-secret", "LANGFUSE_SECRET_KEY": "sk-secret",
@@ -107,6 +121,16 @@ class TracingLaunchTests(unittest.TestCase):
                 self.assertEqual(child[key], environment[key])
         self.assertNotIn("LANGFUSE_UNDOCUMENTED", child)
         self.assertEqual(child["EXAMPLE_OPTION"], "kept")
+
+    def test_setup_environment_never_receives_tracing_plugin_or_credentials(self):
+        environment = {"PATH": "/usr/bin", "LANGFUSE_PUBLIC_KEY": "pk-secret", "LANGFUSE_SECRET_KEY": "sk-secret"}
+        task = {"executor": "opencode", "permission_profile": {"*": "allow"},
+                "resolved_model": "provider/exact", "worktree": "/tmp/child",
+                "tracing": {"requested": True, "available": False}}
+        setup = child_environment(environment, task, include_tracing_credentials=False)
+        self.assertEqual(json.loads(setup["OPENCODE_CONFIG_CONTENT"]), {"permission": {"*": "allow"}})
+        self.assertNotIn("LANGFUSE_PUBLIC_KEY", setup)
+        self.assertNotIn("LANGFUSE_SECRET_KEY", setup)
 
     def test_non_opencode_children_never_receive_langfuse_credentials(self):
         config = settings(Path("/tmp/project"), command=["fixture"])
