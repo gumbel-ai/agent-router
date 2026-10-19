@@ -493,6 +493,37 @@ while True:
             for stream in streams:
                 stream.close()
 
+    def test_exiting_git_leader_refusing_cleanup_signal_is_awaited(self):
+        # Darwin refuses signals (EPERM) to a group whose leader is exiting but not yet reapable.
+        original_popen, original_killpg = subprocess.Popen, os.killpg
+        launched, refused = [], []
+
+        def launch(*arguments, **options):
+            launched.append(original_popen(*arguments, **options))
+            return launched[-1]
+
+        def exiting(pgid, signal_number):
+            # The leader starts exiting just as cleanup signals it; the kernel refuses the signal.
+            # A fast Git may already be exiting, so the real call can itself be refused.
+            refused.append(pgid)
+            try:
+                original_killpg(pgid, signal.SIGKILL)
+            except (PermissionError, ProcessLookupError):
+                pass
+            raise PermissionError(1, "Operation not permitted")
+
+        with patch.object(remote_snapshot.subprocess, "Popen", side_effect=launch), \
+                patch.object(remote_snapshot.os, "killpg", side_effect=exiting), \
+                self.assertRaisesRegex(ValueError, "exceeds its bound"):
+            remote_snapshot._git(self.source, "cat-file", "-p", "HEAD", limit=1)
+        self.assertEqual(refused, [launched[0].pid])
+        self.assertIsNotNone(launched[0].returncode)
+
+        # A reaped leader no longer holds its group: a refusal there stays an error.
+        with patch.object(remote_snapshot.os, "killpg", side_effect=PermissionError(1, "Operation not permitted")), \
+                self.assertRaises(PermissionError):
+            remote_snapshot._git(self.source, "rev-parse", "HEAD")
+
 
 if __name__ == "__main__":
     unittest.main()
