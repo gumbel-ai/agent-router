@@ -17,6 +17,10 @@ from pathlib import Path
 
 from router.capacity import CapacitySampler
 from router.child import child_environment, executor_command, launch
+from router.claude_executor import collect as collect_claude
+from router.claude_executor import validate as validate_claude
+from router.claude_executor import validate_command, validate_persistence
+from router.claude_executor import version as claude_version
 from router.client import CompletionRefused
 from router.codex import collect as collect_codex
 from router.codex import price_metadata
@@ -83,7 +87,7 @@ def required_text(payload: dict, key: str) -> str:
 def public(task: dict, store: Store | None = None, history: list[dict] | None = None) -> dict:
     result = {key: value for key, value in task.items() if key not in {
         "session_id", "invocation", "feedback", "permission_profile", "setup_command", "cleanup_requested", "token_prices",
-        "codex_usage_baseline", "codex_usage_total", "codex_baseline_complete"}}
+        "codex_usage_baseline", "codex_usage_total", "codex_baseline_complete", "claude_baseline", "claude_total"}}
     attempt_history = store.history(task["task_id"]) if history is None and store is not None else history or []
     result.update(visibility(task, attempt_history))
     if store is not None or history is not None:
@@ -764,7 +768,7 @@ class Runtime:
                 elif task.get("cancel_requested") and (not record or owned_state(record) == "stopped"):
                     if record and record.get("interrupt_first"):
                         self.store.update_with_attempt(task["task_id"], lambda t: t.update(status="interrupted", execution_stopped=False,
-                            shutdown_unconfirmed=True, failure_reason="Codex shutdown evidence missing after restart; operator inspection required"))
+                            shutdown_unconfirmed=True, failure_reason=f"{t['executor'].capitalize()} shutdown evidence missing after restart; operator inspection required"))
                     else:
                         self.store.update(task["task_id"], lambda t: t.update(status="cancelled", execution_stopped=True))
                 else:
@@ -811,7 +815,7 @@ class Runtime:
     def validate(self, task: dict) -> dict:
         invocation = task["invocation"]
         executor = invocation["executor"]
-        if executor not in {"opencode", "codex"}:
+        if executor not in {"opencode", "codex", "claude"}:
             raise ValueError("Unsupported executor; no fallback")
         if not getattr(self.control.settings, executor + "_command"):
             raise ValueError(f"{executor} executor is not configured; no fallback")
@@ -839,6 +843,17 @@ class Runtime:
             ignored = subprocess.run(["git", "-C", str(root), "check-ignore", "--quiet", "--", relative], check=False)
             if ignored.returncode != 0:
                 raise ValueError("The provider env file must be ignored when inside the repository")
+        if executor == "claude":
+            validate_command(self.control.settings.claude_command)
+            validate_persistence(self.control.environment)
+            try:
+                permission = json.loads(configured.get("claude_permissions", "null"))
+            except (ValueError, RecursionError) as error:
+                raise ValueError("Project Claude permissions are not valid JSON") from error
+            profile = validate_claude(model, permission)
+            return {"executor": executor, "requested_model": invocation["model"], "resolved_model": model,
+                    "setup_command": configured["setup_command"], "permission_profile": profile,
+                    "child_session_id": str(uuid.uuid4())}
         if executor == "codex":
             return {"executor": executor, "requested_model": invocation["model"], "resolved_model": model,
                     "setup_command": configured["setup_command"], "permission_profile": {"sandbox": sandbox},
@@ -867,18 +882,23 @@ class Runtime:
             environment = child_environment(environment, task)
         process = None
         def register(record):
-            record["interrupt_first"] = name == "child" and task["executor"] == "codex"
+            record["interrupt_first"] = name == "child" and task["executor"] in {"codex", "claude"}
+            if record["interrupt_first"]:
+                record["executor"] = task["executor"]
+            if name == "version":
+                record["disposable"] = True
+                record["deadline_at"] = min(task["deadline_at"], started + 5000)
             def persist(current):
                 if current.get("cancel_requested") and not collecting:
                     raise PhaseStopped("cancelled")
-                if not collecting and now_ms() >= current["deadline_at"]:
+                if not collecting and now_ms() >= min(current["deadline_at"], record.get("deadline_at", current["deadline_at"])):
                     raise PhaseStopped("router-timeout")
                 current.update(process=record, phase=name, phase_started_at=started, execution_stopped=False)
                 if name == "child":
                     current["attempts"] = current["attempt_number"]
                     current["status"] = "running"
             self.store.update(task_id, persist)
-        process, record = launch(command, cwd, environment, directory, register)
+        process, record = launch(command, cwd, environment, directory, register, disposable=name == "version")
         with self.lock:
             self.processes[task_id] = process
         try:
@@ -907,7 +927,7 @@ class Runtime:
             if state != "live":
                 raise UncertainProcess("Process creation identity or liveness is uncertain")
             cancel = task.get("cancel_requested") and (not collecting or task.get("cancel_requested_at", 0) > task["phase_started_at"])
-            timeout = not collecting and now_ms() >= task["deadline_at"]
+            timeout = not collecting and now_ms() >= min(task["deadline_at"], record.get("deadline_at", task["deadline_at"]))
             if cancel or timeout:
                 stop_owned(record, process)
                 self.store.update(task_id, lambda t: t.update(execution_stopped=True))
@@ -930,7 +950,7 @@ class Runtime:
                     event = json.loads(line)
                     if isinstance(event, dict):
                         values.append(event)
-                except (ValueError, UnicodeError):
+                except (ValueError, UnicodeError, RecursionError):
                     continue
             next_offset = stream.tell()
         if next_offset == offset:
@@ -940,6 +960,9 @@ class Runtime:
             if values:
                 current["last_event_at"] = now_ms()
             for event in values:
+                if current["executor"] == "claude":
+                    collect_claude(current, event)
+                    continue
                 if current["executor"] == "codex":
                     collect_codex(current, event)
                     continue
@@ -1013,6 +1036,9 @@ class Runtime:
                         raise PhaseStopped("cancelled")
                     if current["attempts"] >= self.control.settings.max_attempts:
                         raise ValueError("Launch ceiling exhausted")
+                    if current["executor"] == "claude":
+                        current["claude_baseline"] = current.get("claude_total", {"complete": not current["attempts"],
+                                                                                 "cost_complete": not current["attempts"]})
                     if current["executor"] == "codex":
                         current["codex_usage_baseline"] = current.get("codex_usage_total", {})
                         current["codex_baseline_complete"] = not current["attempts"] or current.get("usage_complete", False)
@@ -1023,16 +1049,15 @@ class Runtime:
                     for key in ("final_tree", "patch", "execution_outcome", "failure_reason", "exit_code", "last_event_at", "summary", "cost", "usage", "usage_complete", "cost_note", "cost_source", "executor_completed", "thread_observed", "executor_activity", "execution_error", "event_offset", "process", "phase", "phase_started_at"):
                         current.pop(key, None)
                 self.store.update(task_id, begin)
-                task = self.store.get(task_id)
-                if "snapshot_commit" not in task:
-                    self.store.update(task_id, lambda t: t.update(worktree=str(Path(t["artifact_dir"]) / "worktree"), branch=f"agent/{task_id}"))
-                    self.snapshot_phase(task_id, "prepare")
             else:
                 task = self.store.get(task_id)
                 phase = task["phase"]
                 result = self.observe(task_id, task["process"], collecting=phase == "capture")
-                if result["exit_code"] and phase != "child":
+                if result["exit_code"] and phase not in {"child", "version"}:
                     raise ValueError(f"Recovered {phase} failed with exit code {result['exit_code']}")
+                if phase == "version":
+                    version = claude_version(Path(task["process"]["stdout"]), result["exit_code"])
+                    self.store.update(task_id, lambda t: t.update(executor_version=version))
                 if phase in {"prepare", "capture"}:
                     result_file = Path(task["artifact_dir"]) / f"{phase}-{task['attempt_number']}.result.json"
                     self.store.update(task_id, lambda t: t.update(json.loads(result_file.read_text())))
@@ -1047,6 +1072,16 @@ class Runtime:
                     reason = task.get("pending_reason", "Executor failed" if failed else None)
                     self.finish(task_id, outcome, reason, already_captured=phase == "capture")
                     return
+            task = self.store.get(task_id)
+            if task["executor"] == "claude" and not task.get("executor_version"):
+                result = self.phase(task_id, "version", [*self.control.settings.claude_command, "--version"],
+                                    Path(task["invocation"]["parent_worktree"]))
+                task = self.store.get(task_id)
+                version = claude_version(Path(task["process"]["stdout"]), result["exit_code"])
+                self.store.update(task_id, lambda t: t.update(executor_version=version))
+            if "snapshot_commit" not in task:
+                self.store.update(task_id, lambda t: t.update(worktree=str(Path(t["artifact_dir"]) / "worktree"), branch=f"agent/{task_id}"))
+                self.snapshot_phase(task_id, "prepare")
             task = self.store.get(task_id)
             if not task.get("setup_done"):
                 result = self.phase(task_id, "setup", ["/bin/sh", "-c", task["setup_command"]], Path(task["worktree"]))
@@ -1091,7 +1126,7 @@ class Runtime:
 
     @staticmethod
     def child_failed(task: dict) -> bool:
-        return bool(task.get("execution_error") or task["executor"] == "codex" and
+        return bool(task.get("execution_error") or task["executor"] in {"codex", "claude"} and
                     (not task.get("executor_completed") or not task.get("thread_observed")))
 
     def finish(self, task_id: str, outcome: str, reason: str | None, already_captured: bool = False) -> None:

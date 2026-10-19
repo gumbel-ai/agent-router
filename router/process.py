@@ -21,15 +21,16 @@ class UnconfirmedShutdown(UncertainProcess):
 def verify_shutdown(record: dict) -> None:
     if not record.get("interrupt_first"):
         return
+    executor = "Claude" if record.get("executor") == "claude" else "Codex"
     try:
         if Path(record["completion"]).with_suffix(".escalated").exists():
-            raise UnconfirmedShutdown("Codex required forced termination; foreground command shutdown is unconfirmed. Operator inspection required.")
+            raise UnconfirmedShutdown(f"{executor} required forced termination; foreground command shutdown is unconfirmed. Operator inspection required.")
         completion = json.loads(Path(record["completion"]).read_text())
         if completion["exit_code"] >= 0:
             return
     except (OSError, ValueError, KeyError, TypeError):
         pass
-    raise UnconfirmedShutdown("Codex ended abruptly; foreground command shutdown is unconfirmed. Operator inspection required.")
+    raise UnconfirmedShutdown(f"{executor} ended abruptly; foreground command shutdown is unconfirmed. Operator inspection required.")
 
 
 def creation_identity(pid: int) -> str:
@@ -78,7 +79,14 @@ def supervised_state(record: dict, process: subprocess.Popen | None) -> str:
             process.wait(timeout=0.05)
         except subprocess.TimeoutExpired:
             return state
-        return owned_state(record)
+        state = owned_state(record)
+    if state == "uncertain" and record.get("disposable") and Path(record["completion"]).exists():
+        # The disposable gate kills its whole group after recording completion.
+        # Reaping the leader can precede disappearance of another killed member.
+        limit = time.monotonic() + 3
+        while state == "uncertain" and time.monotonic() < limit:
+            time.sleep(0.02)
+            state = owned_state(record)
     return state
 
 
@@ -94,7 +102,7 @@ def _stop_group(record: dict, process: subprocess.Popen | None = None) -> None:
     if state != "live":
         raise UncertainProcess("Process ownership or liveness is uncertain; no signal sent")
     if record.get("interrupt_first"):
-        # Codex owns foreground commands in separate groups; Ctrl-C lets its
+        # Harnesses own foreground commands in separate groups; Ctrl-C lets the
         # harness close them before we terminate the owned CLI group.
         try:
             os.killpg(record["pgid"], signal.SIGINT)
