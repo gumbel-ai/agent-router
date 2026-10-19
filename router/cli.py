@@ -9,7 +9,7 @@ from pathlib import Path
 
 from pydantic import ValidationError
 
-from router.client import request
+from router.client import CompletionBusy, CompletionRefused, request
 from router.codex_plugin import availability as codex_availability
 from router.config import load_settings, socket_path, state_dir
 from router.dispatch import MUTATIONS
@@ -282,6 +282,7 @@ def main() -> None:
     ack.add_argument("--host-id")
     ack.add_argument("--event-host-id")
     ack.add_argument("--subscription-id")
+    ack.add_argument("--json-errors", action="store_true", help="Emit typed acknowledgment refusal JSON; retain exit code 1")
     consumer = commands.add_parser("consumer", help="Inspect and remove completion subscriptions")
     consumer_commands = consumer.add_subparsers(dest="consumer_command", required=True)
     consumer_list = consumer_commands.add_parser("list")
@@ -434,7 +435,14 @@ def main() -> None:
                 payload.update(host_id=args.host_id, event_host_id=args.event_host_id)
             if args.subscription_id is not None:
                 payload["subscription_id"] = args.subscription_id
-            print(json.dumps(request("completion_ack", payload), separators=(",", ":")))
+            try:
+                result = request("completion_ack", payload)
+            except (CompletionBusy, CompletionRefused) as error:
+                if args.json_errors:
+                    code = "database_busy" if isinstance(error, CompletionBusy) else "acknowledgment_refused"
+                    print(json.dumps({"schema_version": 1, **payload, "error": {"code": code}}, separators=(",", ":")))
+                raise
+            print(json.dumps(result, separators=(",", ":")))
         elif args.command == "consumer":
             operation, payload = (("completion_consumer_list", {"limit": args.limit, "offset": args.offset})
                                   if args.consumer_command == "list" else

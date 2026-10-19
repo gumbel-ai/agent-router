@@ -663,9 +663,11 @@ def _validate_snapshot(payload: bytes) -> dict:
 
 
 class SSHQueryError(ValueError):
-    def __init__(self, code: str, message: str, *, exit_code: int | None = None, errno: int | None = None):
+    def __init__(self, code: str, message: str, *, exit_code: int | None = None, errno: int | None = None,
+                 stdout: bytes | None = None):
         super().__init__(message)
         self.code, self.exit_code, self.errno = code, exit_code, errno
+        self.stdout = stdout
 
 
 def ssh_stdout(host: FleetHost, timeout: float, arguments: list[str], *,
@@ -767,7 +769,7 @@ def ssh_stdout(host: FleetHost, timeout: float, arguments: list[str], *,
     if failure is not None:
         raise SSHQueryError(failure_code, failure or "SSH collection failed",
                             exit_code=process.returncode if failure_code == "exit_failed" else None,
-                            errno=failure_errno)
+                            errno=failure_errno, stdout=bytes(stdout) if failure_code == "exit_failed" else None)
     return bytes(stdout)
 
 
