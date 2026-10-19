@@ -434,6 +434,12 @@ item before requesting review.
 
 **Parsing and cost**
 
+- For a one-response connection that closes after its reply, require EOF under the
+  remaining request deadline before accepting either a success or error envelope.
+  A terminator at the end of one socket chunk does not exclude trailing data in the
+  next. Test split JSON, whitespace, newline, NUL and oversized tails, a peer that
+  never closes, and timeout/reset/interruption at EOF. At the exact frame limit,
+  request at least one byte for the EOF probe; `recv(0)` cannot establish closure.
 - Avoid regular expressions on untrusted free text. Where one is unavoidable, bound
   every quantifier and time it on 1 MB of its worst-case character; an unbounded
   `\\*` before an optional quote once made matching quadratic (13 s for 20k

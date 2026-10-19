@@ -40,16 +40,41 @@ def request(operation: str, payload: dict, endpoint: Path | None = None, *, time
         client.sendall((canonical({"operation": operation, "payload": payload}) + "\n").encode())
         received = bytearray()
         limit = 4 * 1024 * 1024
+        if operation == "task_diff":
+            from router.task_diff import (
+                MAX_WIRE_BYTES,
+                TaskDiffProtocolError,
+                parse_json,
+            )
+            limit = MAX_WIRE_BYTES
         while len(received) <= limit:
             client.settimeout(remaining())
             chunk = client.recv(min(65536, limit + 1 - len(received)))
             if not chunk:
                 break
             newline = chunk.find(b"\n")
+            if operation == "task_diff" and newline >= 0 and newline != len(chunk) - 1:
+                raise TaskDiffProtocolError("Unexpected bytes after task-diff reply")
             received.extend(chunk if newline < 0 else chunk[:newline + 1])
             if newline >= 0:
                 break
         line = bytes(received)
+        if operation == "task_diff":
+            if len(line) > limit or not line.endswith(b"\n"):
+                raise TaskDiffProtocolError("Incomplete or oversized task-diff reply")
+            client.settimeout(remaining())
+            if client.recv(1):
+                raise TaskDiffProtocolError("Unexpected bytes after task-diff reply")
+            response = parse_json(line)
+            if not isinstance(response, dict) or type(response.get("ok")) is not bool:
+                raise TaskDiffProtocolError("Invalid task-diff response envelope")
+            if response["ok"]:
+                if set(response) != {"ok", "result"} or not isinstance(response.get("result"), dict):
+                    raise TaskDiffProtocolError("Invalid task-diff success envelope")
+                return response["result"]
+            if set(response) != {"ok", "error"} or not isinstance(response.get("error"), str):
+                raise TaskDiffProtocolError("Invalid task-diff error envelope")
+            raise ValueError("Task-diff daemon refused the read")
         if operation == "completion_next" and len(line) <= limit and not line.endswith(b"\n"):
             raise ConnectionResetError("Router closed the connection before a complete reply")
         if not line or len(line) > 4 * 1024 * 1024:
