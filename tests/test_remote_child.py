@@ -57,6 +57,11 @@ class RemoteChildProtocolTests(unittest.TestCase):
         self.assertEqual(payload["snapshot_base64"], base64.b64encode(b"abc").decode())
         self.assertNotIn("snapshot_bytes", payload)
 
+    def test_agent_hook_denies_router_remote(self):
+        from router.hooks import authorize
+        result = authorize({"tool_name": "Bash", "tool_input": {"command": "router remote --json"}})
+        self.assertEqual(result["hookSpecificOutput"]["permissionDecision"], "deny")
+
     def test_remote_request_parser_rejects_duplicate_and_nonfinite_fields(self):
         with self.assertRaisesRegex(ValueError, "duplicate"):
             remote_child.parse_request(b'{"operation":"status","operation":"start","payload":{}}')

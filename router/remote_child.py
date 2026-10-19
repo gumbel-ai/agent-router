@@ -248,7 +248,8 @@ def _exchange(host: FleetHost, timeout: float, operation: str, payload: dict) ->
     if process.returncode != 0:
         raise RemoteChildError("exit_failed", "Remote Router rejected the request")
     try:
-        response = json.loads(bytes(output), parse_constant=lambda value: (_ for _ in ()).throw(ValueError(value)))
+        response = json.loads(bytes(output), object_pairs_hook=_unique_object,
+                              parse_constant=lambda value: (_ for _ in ()).throw(ValueError(value)))
     except (ValueError, UnicodeError, RecursionError) as error:
         raise RemoteChildError("invalid_response", "Remote Router returned invalid JSON") from error
     if not isinstance(response, dict) or set(response) != {"ok", "result"} or response.get("ok") is not True:

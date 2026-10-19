@@ -1490,7 +1490,7 @@ class Runtime:
         invocation = task["invocation"]
         try:
             config = load_fleet_config(DEFAULT_CONFIG)
-            hosts = [host for host in config.hosts if host.name == task["remote_host"]]
+            hosts = [host for host in config.hosts if host.name == task["remote_host"] and host.transport == "ssh"]
         except ValueError:
             hosts = []
         if len(hosts) != 1:
