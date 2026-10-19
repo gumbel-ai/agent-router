@@ -40,6 +40,7 @@ def request(operation: str, payload: dict, endpoint: Path | None = None, *, time
         client.sendall((canonical({"operation": operation, "payload": payload}) + "\n").encode())
         received = bytearray()
         limit = 4 * 1024 * 1024
+        bounded_read = operation in {"task_diff", "request_status"}
         if operation == "task_diff":
             from router.task_diff import (
                 MAX_WIRE_BYTES,
@@ -47,34 +48,45 @@ def request(operation: str, payload: dict, endpoint: Path | None = None, *, time
                 parse_json,
             )
             limit = MAX_WIRE_BYTES
+            protocol_error = TaskDiffProtocolError
+            read_name = "task-diff"
+        elif operation == "request_status":
+            from router.request_status import (
+                MAX_WIRE_BYTES,
+                RequestStatusProtocolError,
+                parse_json,
+            )
+            limit = MAX_WIRE_BYTES
+            protocol_error = RequestStatusProtocolError
+            read_name = "request-status"
         while len(received) <= limit:
             client.settimeout(remaining())
             chunk = client.recv(min(65536, limit + 1 - len(received)))
             if not chunk:
                 break
             newline = chunk.find(b"\n")
-            if operation == "task_diff" and newline >= 0 and newline != len(chunk) - 1:
-                raise TaskDiffProtocolError("Unexpected bytes after task-diff reply")
+            if bounded_read and newline >= 0 and newline != len(chunk) - 1:
+                raise protocol_error(f"Unexpected bytes after {read_name} reply")
             received.extend(chunk if newline < 0 else chunk[:newline + 1])
             if newline >= 0:
                 break
         line = bytes(received)
-        if operation == "task_diff":
+        if bounded_read:
             if len(line) > limit or not line.endswith(b"\n"):
-                raise TaskDiffProtocolError("Incomplete or oversized task-diff reply")
+                raise protocol_error(f"Incomplete or oversized {read_name} reply")
             client.settimeout(remaining())
             if client.recv(1):
-                raise TaskDiffProtocolError("Unexpected bytes after task-diff reply")
+                raise protocol_error(f"Unexpected bytes after {read_name} reply")
             response = parse_json(line)
             if not isinstance(response, dict) or type(response.get("ok")) is not bool:
-                raise TaskDiffProtocolError("Invalid task-diff response envelope")
+                raise protocol_error(f"Invalid {read_name} response envelope")
             if response["ok"]:
                 if set(response) != {"ok", "result"} or not isinstance(response.get("result"), dict):
-                    raise TaskDiffProtocolError("Invalid task-diff success envelope")
+                    raise protocol_error(f"Invalid {read_name} success envelope")
                 return response["result"]
             if set(response) != {"ok", "error"} or not isinstance(response.get("error"), str):
-                raise TaskDiffProtocolError("Invalid task-diff error envelope")
-            raise ValueError("Task-diff daemon refused the read")
+                raise protocol_error(f"Invalid {read_name} error envelope")
+            raise ValueError(f"{read_name} daemon refused the read")
         if operation == "completion_next" and len(line) <= limit and not line.endswith(b"\n"):
             raise ConnectionResetError("Router closed the connection before a complete reply")
         if not line or len(line) > 4 * 1024 * 1024:

@@ -103,6 +103,47 @@ class ControlTests(unittest.TestCase):
                 self.router.handle("start", payload)
         self.assertEqual(self.router.store.all(), [])
 
+    def test_request_status_recovers_committed_start_without_reauthorizing_or_relaunching(self):
+        selection = {"session_id": "S", "request_id": "R", "host_id": self.router.host.host_id}
+        missing = self.router.handle("request_status", selection)
+        self.assertEqual(missing["status"], "not_found")
+        self.assertEqual(self.router.store.all(), [])
+        invocation = self.payload(self.submission())
+        self.authorize(invocation)
+        # Ignore the committed reply, as a disconnected caller would.
+        task_id = self.router.handle("start", invocation)["task_id"]
+        self.submission(prompt="next-prompt")
+        restarted = Controller(settings(self.root / "repo"), {}, self.root / "state")
+        before = restarted.store.all()
+        for _ in range(2):
+            result = restarted.handle("request_status", selection)
+            self.assertEqual(result, {"schema_version": 1, **selection, "status": "found",
+                                      "operation": "start", "task_id": task_id})
+            self.assertEqual(restarted.store.all(), before)
+        self.assertEqual(len(before), 1)
+        self.assertNotIn("Implement a test", str(result))
+        self.assertNotIn(str(self.root), str(result))
+        self.assertEqual(restarted.handle("request_status", {**selection, "session_id": "other"})["status"], "not_found")
+        mismatch = restarted.handle("request_status", {**selection, "host_id": "other-host"})
+        self.assertEqual((mismatch["status"], mismatch["error"]["code"]), ("unknown", "identity_mismatch"))
+
+    def test_request_status_observes_only_committed_coherent_bindings(self):
+        selection = {"session_id": "S", "request_id": "R"}
+        with self.router.store.transaction() as db:
+            self.router.store.put(db, {"task_id": "task-example", "session_id": "S"})
+            db.execute("INSERT INTO operations VALUES('S','R','start','{}','task-example')")
+            # The writer may still be committing after its caller disconnected.
+            self.assertEqual(self.router.handle("request_status", selection)["status"], "not_found")
+        self.assertEqual(self.router.handle("request_status", selection)["status"], "found")
+        for operation, task_id, owner in (("unknown", "task-example", "S"), ("start", "missing", "S"),
+                                          ("start", "bad\nidentity", "S"), ("start", "task-example", "other")):
+            with self.subTest(operation=operation, task_id=task_id, owner=owner):
+                with self.router.store.transaction() as db:
+                    db.execute("UPDATE operations SET operation=?,task_id=?", (operation, task_id))
+                    db.execute("UPDATE tasks SET session_id=?", (owner,))
+                result = self.router.handle("request_status", selection)
+                self.assertEqual((result["status"], result["error"]["code"]), ("unknown", "binding_invalid"))
+
     def test_review_guards_and_failed_artifact_salvage(self):
         instruction = self.submission()
         invocation = self.payload(instruction)
