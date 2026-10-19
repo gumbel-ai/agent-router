@@ -16,6 +16,7 @@ from dataclasses import dataclass, field, fields
 from pathlib import Path
 
 from router.capacity import CapacityThresholds, classify
+from router.correlation import identifier
 from router.fleet_snapshot import (
     CAPACITY_ALERT_KINDS,
     MAX_SNAPSHOT_BYTES,
@@ -273,7 +274,9 @@ def _project_record(record: dict, allowed: frozenset[str], required: tuple[str, 
                       "parent_reference_omitted", "cleanup_failed", "group_outlived"}
     for key in allowed & record.keys():
         value = record[key]
-        if key in text_fields:
+        if key == "work_item_id":
+            projected[key] = None if value is None else identifier(value, key)
+        elif key in text_fields:
             limit = 2000 if key in {"cwd", "worktree"} else 500 if key in {
                 "visibility_reason", "failure_reason", "subject",
             } else 240
@@ -473,12 +476,12 @@ def _validate_snapshot(payload: bytes) -> dict:
                                    "attempts", "parent_session_id", "parent_agent_id", "task", "activity",
                                    "failure_reason", "created_at", "started_at", "elapsed_ms", "last_event_at",
                                    "cleanup_pending", "cleanup_failed", "shutdown_unconfirmed",
-                                   "parent_reference_omitted"}),
+                                   "parent_reference_omitted", "work_item_id"}),
         "managed_processes": frozenset({"host_id", "managed_id", "status", "label", "pid", "pgid",
                                         "started_at", "finished_at", "exit_code", "visibility_reason",
                                         "attribution", "session_id", "agent_id", "executable",
                                         "argument_count", "cwd", "elapsed_ms", "signal",
-                                        "max_process_rss_bytes", "group_outlived", "uncertain_at"}),
+                                        "max_process_rss_bytes", "group_outlived", "uncertain_at", "work_item_id"}),
         "inferred_processes": frozenset({"host_id", "pid", "pgid", "status", "label", "started_at",
                                          "visibility_reason", "attribution", "source", "session_id",
                                          "cpu_pct", "rss_bytes"}),

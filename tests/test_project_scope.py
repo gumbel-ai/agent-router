@@ -279,20 +279,21 @@ class ManagedScopeTests(unittest.TestCase):
         self.state.mkdir()
         self.addCleanup(os.chdir, os.getcwd())
 
-    def run_in(self, directory: Path, script: str):
+    def run_in(self, directory: Path, script: str, **options):
         os.chdir(directory)
         with patch("router.managed.request", side_effect=AssertionError("must not report")) as reporter, \
                 redirect_stderr(io.StringIO()) as stderr:
-            code = run([sys.executable, "-c", script], "label", None, None, self.state)
+            code = run([sys.executable, "-c", script], "label", None, None, self.state, **options)
         return code, reporter, stderr.getvalue()
 
     def test_a_command_outside_every_project_runs_but_is_not_recorded(self):
         outside = self.root / "outside"
         outside.mkdir()
-        code, reporter, stderr = self.run_in(outside, "raise SystemExit(4)")
+        code, reporter, stderr = self.run_in(outside, "raise SystemExit(4)", work_item_id="batch-job")
         self.assertEqual(code, 4)
         reporter.assert_not_called()
         self.assertIn("not recording", stderr)
+        self.assertIn("no completion event will follow", stderr)
         self.assertFalse(completion_directory(self.state).exists())
 
     def test_a_malformed_marker_stops_before_the_command_starts(self):

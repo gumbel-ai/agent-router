@@ -36,7 +36,7 @@ Each record has `kind`, `host_id`, `traced`, and these nullable metadata fields:
 | `runtime`, `model_provider` | Execution runtime and model provider are separate. Unknown runtime strings pass through. No provider is inferred from a runtime or model name. |
 | `session_id`, `agent_id` | Known native identities in that runtime's namespace. |
 | `parent_session_id`, `parent_agent_id`, `parent_runtime` | Only stored parent identities; never inferred from labels, filenames or nearby times. |
-| `router_task_id`, `managed_id`, `work_item_id`, `event_id` | Separate Router task, managed command, supplied native team-task and completion identities. |
+| `router_task_id`, `managed_id`, `work_item_id`, `event_id` | Separate Router task, managed command, explicitly supplied work-item and completion identities. |
 | `status`, `lifecycle_event`, `timestamp` | Last recorded status, stored event kind and its host timestamp when available. This is durable evidence, not a new liveness check. |
 | `created_at`, `updated_at`, `started_at`, `finished_at`, `uncertain_at` | Stored timing, in host epoch milliseconds; null when unavailable. |
 | `attempt_number`, `attempts`, `review_retries`, `continuations` | Existing attempt identity and counters; no execution retries are added. |
@@ -67,6 +67,21 @@ detached job ended: wrapping a detaching launcher observes the launcher.
 Completion-row timestamps can also reflect imported upgrade evidence; only a
 known `finished_at` reports the retained command-end timestamp. Retained legacy
 rows are included without reapplying project admission to historical records.
+
+Callers may declare one optional `work_item_id`: use `router run --work-item-id ID`
+for a managed command or a top-level `"work_item_id":"batch-job"` in an authorized
+`router start --json` invocation. It follows the identifier bounds below; explicit
+JSON null is invalid. The declaration remains fixed across task attempts and
+survives evidence replay and daemon restart. It is carried in managed/completion
+records, task/attempt records and their local/fleet views. Historical or omitted
+values stay absent in those records and null in this correlation schema.
+
+For native `work_item` records, the ID remains the stored native task ID. For
+`router_task`, `attempt`, `managed` and `completion`, it is the caller's declaration.
+Router assigns no meaning or authority to either value and does not infer costs,
+parentage or trace attribution from matching strings. Labels, environment variables
+and nearby timestamps never provide this field. There is no arbitrary metadata
+object; callers must supply identifiers rather than content or secrets.
 
 Identifiers keep their exact printable spelling, including repeated internal spaces;
 controls, surrounding whitespace and oversized values are rejected without rewriting.

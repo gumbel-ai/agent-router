@@ -75,7 +75,8 @@ class FleetCorrelationTests(unittest.TestCase):
                                   "model_provider": "openai", "session_id": "child-session",
                                   "parent_session_id": "parent-session", "parent_agent_id": "parent-agent",
                                   "parent_runtime": "claude", "router_task_id": "task-a",
-                                  "attempt_number": 2, "attempts": 2, "task": "fixture-private-content"})
+                                  "attempt_number": 2, "attempts": 2, "task": "fixture-private-content",
+                                  "work_item_id": "batch  α"})
         source["prompt"] = "fixture-private-content"
         source["records"][0]["tool_contents"] = {"secret": "fixture-secret-value"}
         for mutate, valid, partial in ((lambda page: None, True, False),
@@ -113,6 +114,7 @@ class FleetCorrelationTests(unittest.TestCase):
                                           attempt["router_task_id"], attempt["attempt_number"], attempt["attempts"]),
                                          ("codex", "openai", "child-session", "parent-session", "parent-agent", "claude",
                                           "task-a", 2, 2))
+                        self.assertEqual(attempt["work_item_id"], "batch  α")
                         if page["records"][0].get("host_id") is None:
                             self.assertIsNone(projected["records"][0]["host_id"])
                             self.assertIsNone(projected["records"][0]["session_id"])
