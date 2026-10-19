@@ -1,3 +1,4 @@
+import asyncio
 import json
 import os
 import subprocess
@@ -5,9 +6,11 @@ import tempfile
 import threading
 import tomllib
 import unittest
+from contextlib import asynccontextmanager
 from pathlib import Path
 from unittest.mock import patch
 
+from websockets.asyncio.client import unix_connect
 from websockets.exceptions import ConnectionClosed
 from websockets.sync.server import unix_serve
 
@@ -311,6 +314,69 @@ class CodexPluginTests(unittest.TestCase):
         result = availability(self.home)
         self.assertEqual(result["state"], "unknown")
         self.assertIn("start Codex normally", result["detail"])
+
+    def test_readiness_deadline_keeps_only_completed_evidence(self):
+        self.install("0.9.0")
+        trusted = {key: {"trusted_hash": value} for key, value in expected_trust(HOOKS).items()}
+        self.configure(entries=trusted)
+        timeout = asyncio.timeout
+        cases = [("connect", {}, "unknown"), ("config/read", {}, "unknown"),
+                 ("hooks/list", {}, "unknown"), ("close", {}, "ready"),
+                 ("close", {"config": {"plugins": {PLUGIN_ID: {"enabled": False}}}}, "plugin_disabled"),
+                 ("close", {"state": {}}, "hooks_untrusted"),
+                 ("close", {"inventory": {"data": []}}, "unknown"), ("close_error", {}, "unknown")]
+        for boundary, options, expected in cases:
+            with self.subTest(boundary=boundary, expected=expected):
+                (self.home / "rpc.json").write_text(json.dumps(options))
+                (self.home / "rpc.log").unlink(missing_ok=True)
+                deadlines = []
+
+                def capture_timeout(seconds, deadlines=deadlines):
+                    deadline = timeout(seconds)
+                    deadlines.append(deadline)
+                    return deadline
+
+                async def expire(deadlines=deadlines):
+                    # Exercise the real deadline cancellation at an exact boundary,
+                    # without depending on interpreter speed or a sleep race.
+                    deadlines[0].reschedule(asyncio.get_running_loop().time())
+                    await asyncio.Future()
+
+                @asynccontextmanager
+                async def connect(*args, boundary=boundary, expire=expire, **kwargs):
+                    if boundary == "connect":
+                        await expire()
+                    async with unix_connect(*args, **kwargs) as connection:
+                        receive = connection.recv
+
+                        async def recv():
+                            raw = await receive()
+                            identity = {"config/read": 1, "hooks/list": 2}.get(boundary)
+                            if identity is not None and json.loads(raw).get("id") == identity:
+                                await expire()
+                            return raw
+
+                        with patch.object(connection, "recv", side_effect=recv):
+                            try:
+                                yield connection
+                            finally:
+                                if boundary == "close":
+                                    await expire()
+                                if boundary == "close_error":
+                                    raise TimeoutError("fixture close failure")
+
+                with patch("router.codex_plugin.unix_connect", side_effect=connect), \
+                        patch("router.codex_plugin.asyncio.timeout", side_effect=capture_timeout):
+                    result = availability(self.home)
+                self.assertEqual(result["state"], expected, result)
+                self.assertEqual(deadlines[0].expired(), boundary != "close_error")
+                if boundary == "connect":
+                    self.assertFalse((self.home / "rpc.log").exists())
+                else:
+                    calls = [json.loads(line)["request"]["method"]
+                             for line in (self.home / "rpc.log").read_text().splitlines()]
+                    self.assertEqual(calls[-1], "config/read" if boundary == "config/read" else "hooks/list")
+                self.assertEqual(availability(self.home)["state"], expected if boundary == "close" else "ready")
 
     def test_readiness_honors_the_selected_home_and_project_marker(self):
         self.install("0.9.0")
