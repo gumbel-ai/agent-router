@@ -184,6 +184,7 @@ def _exchange(host: FleetHost, timeout: float, operation: str, payload: dict) ->
     deadline = time.monotonic() + timeout
     output, diagnostic = bytearray(), bytearray()
     selector = selectors.DefaultSelector()
+    completed = False
     try:
         if process.stdin is None or process.stdout is None or process.stderr is None:
             raise RemoteChildError("transport_failed", "Remote transport pipes unavailable")
@@ -221,6 +222,7 @@ def _exchange(host: FleetHost, timeout: float, operation: str, payload: dict) ->
                 elif len(diagnostic) < 65536:
                     diagnostic.extend(chunk[:65536 - len(diagnostic)])
         process.wait(timeout=max(.001, deadline - time.monotonic()))
+        completed = True
     except RemoteChildError:
         raise
     except (OSError, subprocess.TimeoutExpired) as error:
@@ -230,12 +232,17 @@ def _exchange(host: FleetHost, timeout: float, operation: str, payload: dict) ->
         for stream in (process.stdin, process.stdout, process.stderr):
             if stream is not None and not stream.closed:
                 stream.close()
-        if process.poll() is None:
+        # On failure, stop the owned group even if the SSH leader already
+        # exited: a descendant may still hold a pipe. Reaping is bounded.
+        if not completed:
             try:
                 os.killpg(process.pid, signal.SIGKILL)
             except OSError:
                 pass
-            process.wait()
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired as error:
+            raise RemoteChildError("cleanup_unconfirmed", "Remote transport did not exit after SIGKILL") from error
     if process.returncode != 0:
         raise RemoteChildError("exit_failed", "Remote Router rejected the request")
     try:

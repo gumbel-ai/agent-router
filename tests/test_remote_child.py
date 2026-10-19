@@ -6,7 +6,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from router import remote_child
-from router.daemon import Runtime
+from router.daemon import Controller, PhaseStopped, Runtime
 from router.fleet import FleetHost
 
 
@@ -120,6 +120,79 @@ class RemoteChildProtocolTests(unittest.TestCase):
             runtime.execute_remote("task-a")
         self.assertEqual(task["status"], "interrupted")
         self.assertFalse(task["execution_stopped"])
+
+    def test_cancel_during_export_suppresses_unsent_start(self):
+        directory = Path(tempfile.mkdtemp())
+        task = {"task_id": "task-a", "session_id": "session-a", "remote_host": "worker",
+                "remote_repo": "/srv/project", "remote_worktree": "/srv/project", "status": "cancelling",
+                "cancel_requested": True, "execution_stopped": True, "artifact_dir": str(directory),
+                "resolved_model": "provider/model-a",
+                "invocation": {**self.invocation, "parent_worktree": str(directory),
+                               "context": {"relevant_paths": ["code.txt"]}}}
+        started = []
+
+        class Store:
+            def get(self, _task_id):
+                return task
+
+            def update(self, _task_id, change):
+                change(task)
+                return task
+
+        class Transport:
+            def __init__(self, _host, _timeout):
+                pass
+
+            def start(self, **kwargs):
+                started.append(kwargs)
+
+        def export(_root, _task_id, artifact, _paths):
+            artifact.mkdir(parents=True)
+            (artifact / "snapshot.bundle").write_bytes(b"abc")
+            return self.receipt
+
+        runtime = Runtime.__new__(Runtime)
+        runtime.store = Store()
+        config = SimpleNamespace(hosts=(FleetHost("worker", "ssh", target="example"),), ssh_timeout_seconds=1)
+        with patch("router.fleet.load_fleet_config", return_value=config), \
+                patch("router.remote_child.RemoteChildTransport", Transport), \
+                patch("router.remote_snapshot.export_snapshot", export), \
+                self.assertRaises(PhaseStopped):
+            runtime.execute_remote("task-a")
+        self.assertEqual(started, [])
+        self.assertTrue(task["execution_stopped"])
+
+    def test_locally_invalid_review_or_close_is_refused_before_ssh(self):
+        controller = Controller.__new__(Controller)
+        controller.settings = SimpleNamespace(max_attempts=1)
+        task = {"task_id": "task-a", "remote_host": "worker", "remote_task_id": "task-a",
+                "status": "awaiting_review", "attempts": 1, "execution_stopped": True,
+                "final_tree": "a" * 40, "review_history": []}
+        with patch("router.fleet.load_fleet_config") as load:
+            with self.assertRaisesRegex(ValueError, "ceiling"):
+                controller.forward_remote(task, "review", {"task_id": "task-a", "request_id": "r",
+                                                           "expected_attempt": 1, "outcome": "rejected",
+                                                           "feedback": "again"})
+            with self.assertRaises(ValueError):
+                controller.forward_remote(task, "close", {"task_id": "task-a", "request_id": "r",
+                                                          "disposition": "integrated"})
+        load.assert_not_called()
+        self.assertEqual(task["status"], "awaiting_review")
+
+    def test_restart_reconciles_interrupted_remote_task(self):
+        task = {"task_id": "task-a", "remote_host": "worker", "status": "interrupted",
+                "execution_stopped": False}
+        runtime = Runtime.__new__(Runtime)
+        runtime.control = SimpleNamespace(native=SimpleNamespace(reconcile_restart=lambda: None),
+                                          sessions=SimpleNamespace(reconcile_restart=lambda: None),
+                                          start_lifecycle_writer=lambda: None,
+                                          capacity=SimpleNamespace(start=lambda: None),
+                                          settings=SimpleNamespace(max_attempts=None))
+        runtime.store = SimpleNamespace(all=lambda: [task])
+        with patch.object(Runtime, "spawn") as spawn, patch.object(Runtime, "schedule"):
+            runtime.start()
+            runtime.scheduler.join(1)
+        spawn.assert_called_once_with(task, recovered=True)
 
     def test_remote_cancelling_and_recovery_reconcile_remotely(self):
         for status, recovered in (("cancelling", False), ("running", True)):

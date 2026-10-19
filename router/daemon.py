@@ -1,5 +1,6 @@
 """Local control plane: durable operations, bounded supervision, no auto-spawn."""
 
+import copy
 import fcntl
 import hashlib
 import json
@@ -803,6 +804,11 @@ class Controller:
 
     def forward_remote(self, task: dict, operation: str, payload: dict) -> None:
         """Commit review/close remotely before changing the parent's state."""
+        # Refuse a locally invalid transition before any remote mutation.
+        if operation == "review":
+            self.review(copy.deepcopy(task), payload)
+        elif operation == "close":
+            self.close(copy.deepcopy(task), payload)
         from router.fleet import DEFAULT_CONFIG, load_fleet_config
         from router.remote_child import RemoteChildTransport
         host_name = task["remote_host"]
@@ -810,12 +816,12 @@ class Controller:
         hosts = [host for host in config.hosts if host.name == host_name]
         if len(hosts) != 1:
             raise ValueError("Remote task host is no longer configured; parent state unchanged")
-        if not task.get("remote_task_id"):
-            if task["execution_stopped"]:
-                return  # The start was never sent; there is no remote task to control.
-            raise ValueError("Remote task identity is not yet confirmed; parent state unchanged")
+        if not task.get("remote_task_id") and task["execution_stopped"]:
+            return  # The start was never sent; there is no remote task to control.
         forwarded = dict(payload)
-        forwarded["task_id"] = task["remote_task_id"]
+        # The snapshot task identity is the parent task_id on both hosts, so a
+        # possibly admitted start whose reply was lost is still addressable.
+        forwarded["task_id"] = task.get("remote_task_id", task["task_id"])
         transport = RemoteChildTransport(hosts[0], config.ssh_timeout_seconds)
         if operation == "review":
             transport.review(forwarded)
@@ -1000,6 +1006,11 @@ class Runtime:
         self.control.start_lifecycle_writer()
         self.control.capacity.start()
         for task in self.store.all():
+            if task.get("remote_host") and task["status"] == "interrupted" and not task["execution_stopped"]:
+                # A lost reply leaves remote ownership unknown; reconcile it from
+                # the original request binding without resubmitting work.
+                self.spawn(task, recovered=True)
+                continue
             if task["status"] == "closed" and task.get("cleanup_pending") and task.get("cleanup_error") is None:
                 self.store.update(task["task_id"], lambda t: t.update(cleanup_requested=True))
             if self.control.settings.max_attempts is not None and task["status"] != "closed" and task["max_attempts"] != self.control.settings.max_attempts:
@@ -1477,9 +1488,12 @@ class Runtime:
             bundle = (artifact / "snapshot.bundle").read_bytes()
             # From here the receiver may commit the start even if its reply is
             # lost, so ownership is uncertain until a status read settles it.
-            self.store.update(task_id, lambda current: current.update(
-                snapshot_commit=receipt["snapshot_commit"], snapshot_tree=receipt["snapshot_tree"],
-                status="running", execution_stopped=False))
+            # Recheck cancellation in the same write: an unsent start is suppressed.
+            def claim(current):
+                if current.get("cancel_requested"):
+                    raise PhaseStopped("cancelled")
+                current.update(status="running", execution_stopped=False)
+            self.store.update(task_id, claim)
         try:
             if not recovered and not task.get("remote_task_id"):
                 remote = transport.start(session_id=task["session_id"], request_id=invocation["request_id"],
@@ -1489,7 +1503,11 @@ class Runtime:
                 remote_id = remote.get("task_id")
                 if not isinstance(remote_id, str):
                     raise RemoteChildError("invalid_response", "Remote start did not return a task identity")
-                self.store.update(task_id, lambda current: current.update(remote_task_id=remote_id))
+                if remote_id != task_id:
+                    raise RemoteChildError("invalid_response", "Remote start returned a different task identity")
+                self.store.update(task_id, lambda current: current.update(
+                    remote_task_id=remote_id, snapshot_commit=receipt["snapshot_commit"],
+                    snapshot_tree=receipt["snapshot_tree"]))
             while True:
                 task = self.store.get(task_id)
                 status = transport.status(task["session_id"], task["invocation"]["request_id"])
@@ -1497,9 +1515,11 @@ class Runtime:
                     raise RemoteChildError("invalid_response", "Remote request binding disappeared")
                 if "resolved_model" in status and status["resolved_model"] != task.get("resolved_model"):
                     raise RemoteChildError("invalid_response", "Remote task resolved a different exact model")
+                if status.get("status") != "not_found" and status.get("task_id") != task_id:
+                    raise RemoteChildError("invalid_response", "Remote status returned a different task identity")
                 remote_status = status.get("status")
                 if remote_status in {"awaiting_review", "failed", "interrupted", "blocked", "cancelled"}:
-                    updates = {"status": remote_status, "execution_stopped": bool(status.get("execution_stopped")),
+                    updates = {"status": remote_status, "execution_stopped": status.get("execution_stopped") is True,
                                "remote_task_id": status.get("task_id", task.get("remote_task_id"))}
                     for field in ("attempts", "attempt_number", "final_tree", "execution_outcome", "failure_reason",
                                   "duration_ms", "exit_code", "snapshot_commit", "snapshot_tree"):
