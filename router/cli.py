@@ -372,6 +372,8 @@ def main() -> None:
     init.add_argument("--model", help="alias=provider/exact-model")
     init.add_argument("--setup-command", help="Child dependency setup command; not run during init")
     init.add_argument("--permissions", help="Explicit executor permission JSON; never overwrites OpenCode permissions")
+    init.add_argument("--tracing", action="store_true",
+                      help="Request runtime-plugin tracing for children; default off. See docs/tracing.md for current availability")
     init.add_argument("--concurrency", type=int)
     init.add_argument("--timeout", type=float)
     init.add_argument("--attempts", type=int)

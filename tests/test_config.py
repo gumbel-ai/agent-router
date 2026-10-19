@@ -30,6 +30,7 @@ class ConfigTests(unittest.TestCase):
         cases = [{key: value for key, value in valid.items() if key != missing} for missing in valid]
         cases += [{**valid, "AGENT_ROUTER_CONCURRENCY_CAP": 0}, {**valid, "AGENT_ROUTER_ATTEMPT_TIMEOUT_SECONDS": float("inf")}]
         cases += [{**valid, "AGENT_ROUTER_REPOSITORIES": {"/tmp/project": {"setup_command": "true", "codex_sandbox": "danger-full-access"}}},
+                  {**valid, "AGENT_ROUTER_REPOSITORIES": {"/tmp/project": {"setup_command": "true", "tracing": "true"}}},
                   {**valid, "AGENT_ROUTER_CODEX_COMMAND": [""]},
                   {**valid, "AGENT_ROUTER_CLAUDE_COMMAND": ["claude", "--append-system-prompt"]}]
         cases += [{**valid, "AGENT_ROUTER_MODEL_PRICES": {"m": []}},

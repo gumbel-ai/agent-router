@@ -74,12 +74,25 @@ class SetupTests(unittest.TestCase):
         repo = self.repository("existing")
         (repo / "opencode.json").write_text('{"permission":{"*":"deny"}}')
         args = Namespace(yes=True, model="small=provider/exact", setup_command="true", permissions=None,
-                         sandbox=None, executor="opencode", concurrency=3, timeout=600, attempts=3)
+                         sandbox=None, executor="opencode", concurrency=3, timeout=600, attempts=3, tracing=False)
         with patch("router.setup.git", return_value=str(repo)), patch("router.setup.initialize"), \
                 patch("router.setup.confirm") as confirmation:
             init(args)
         self.assertIn("existing opencode.json permissions", confirmation.call_args.args[0])
         self.assertNotIn("permissions None", confirmation.call_args.args[0])
+        self.assertIn("child tracing off", confirmation.call_args.args[0])
+
+    def test_tracing_opt_in_is_explicit_per_init(self):
+        repo = self.repository("tracing")
+        with patch("router.setup.shutil.which", side_effect=lambda name: "/usr/bin/" + name), patch("router.setup.refresh_service"):
+            initialize(repo, "codex=openai/gpt-5.3-codex", "true", None, 3, 600, 3,
+                       executor="codex", sandbox="workspace-write", tracing=True)
+            config, _ = load_settings()
+            self.assertEqual(config.repositories[str(repo.resolve())]["tracing"], "requested")
+            initialize(repo, "codex=openai/gpt-5.3-codex", "true", None, 3, 600, 3,
+                       executor="codex", sandbox="workspace-write")
+            config, _ = load_settings()
+            self.assertNotIn("tracing", config.repositories[str(repo.resolve())])
 
     def test_codex_opt_in_needs_no_opencode_and_preserves_both_executors(self):
         repo = self.repository("codex")
