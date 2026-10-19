@@ -152,6 +152,9 @@ def child_environment(environment: dict[str, str], task: dict, *, include_tracin
     result.pop(OTEL_RESOURCE_ATTRIBUTES, None)
     worktree = Path(task["worktree"])
     result.pop("VIRTUAL_ENV", None)
+    # subprocess cwd does not update inherited PWD; CLIs that resolve the project
+    # from the environment would otherwise operate on the parent checkout.
+    result["PWD"] = str(worktree.resolve())
     # Never inherit the parent's writable Python/Node module lookup paths.
     result.pop("PYTHONPATH", None)
     result.pop("NODE_PATH", None)
