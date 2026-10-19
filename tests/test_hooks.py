@@ -127,13 +127,37 @@ class HookTests(TransportHarness, unittest.TestCase):
 
     def test_locked_observation_database_is_best_effort_and_fast(self):
         database = self.root / "state" / "router.sqlite3"
-        with closing(sqlite3.connect(database, timeout=.1)) as locked, locked:
-            locked.execute("BEGIN IMMEDIATE")
-            started = time.monotonic()
-            self.assertEqual(self.hook({"hook_event_name": "SessionStart", "session_id": "locked",
-                                        "cwd": str(self.repo)}, "observe"), {})
-            elapsed = time.monotonic() - started
-        self.assertLess(elapsed, .3)
+        ready = self.root / "observer.ready"
+        command = [sys.executable, "-c", ("from pathlib import Path\n"
+                   "from router.observer_hook import main\n"
+                   f"Path({str(ready)!r}).touch()\nmain()\n")]
+        startup = time.monotonic()
+        process = subprocess.Popen(command, env=self.environment, stdin=subprocess.PIPE,
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        try:
+            # Measure hook handling under contention separately from interpreter startup/imports.
+            deadline = time.monotonic() + 15
+            while not ready.exists() and time.monotonic() < deadline:
+                if process.poll() is not None:
+                    output, error = process.communicate(timeout=15)
+                    self.fail(f"Observer exited before readiness: {process.returncode}; {output!r}; {error!r}")
+                time.sleep(.01)
+            self.assertTrue(ready.exists(), "Observer did not become ready within 15 seconds")
+            startup = time.monotonic() - startup
+            with closing(sqlite3.connect(database, timeout=.1)) as locked, locked:
+                locked.execute("BEGIN IMMEDIATE")
+                started = time.monotonic()
+                output, error = process.communicate(json.dumps({
+                    "hook_event_name": "SessionStart", "session_id": "locked", "cwd": str(self.repo),
+                }), timeout=15)
+                self.assertEqual(process.returncode, 0, error)
+                self.assertEqual(json.loads(output), {})
+                elapsed = time.monotonic() - started
+            self.assertLess(elapsed, .3, f"Observer handling: {elapsed:.3f}s; startup: {startup:.3f}s")
+        finally:
+            if process.poll() is None:
+                process.kill()
+            process.communicate(timeout=15)
         deadline = time.monotonic() + 2
         while time.monotonic() < deadline:
             if "locked" in {item["session_id"] for item in request("snapshot", {}, self.endpoint)["sessions"]}:
