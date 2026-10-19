@@ -771,6 +771,15 @@ class Controller:
         return records
 
 
+def opencode_tracing_availability(environment: dict[str, str]) -> dict:
+    """Tracing availability and reason for an OpenCode child launched with this environment."""
+    available = langfuse_credentials_available(environment)
+    return {"available": available,
+            "reason": ("OpenCode plugin export and Router correlation verified via OpenTelemetry resource attributes"
+                       if available else
+                       "OpenCode route is verified, but required Langfuse credentials are unavailable")}
+
+
 class PhaseStopped(RuntimeError):
     def __init__(self, reason: str):
         self.reason = reason
@@ -921,11 +930,7 @@ class Runtime:
             raise ValueError("Permission profile must explicitly use allow/deny, never ask")
         child_session_id = "ses" + uuid.uuid4().hex
         if tracing_requested:
-            credentials_available = langfuse_credentials_available(self.control.environment)
-            tracing = {"tracing": {"requested": True, "available": credentials_available,
-                                    "reason": ("OpenCode plugin export and Router correlation verified via OpenTelemetry resource attributes"
-                                                if credentials_available else
-                                                "OpenCode route is verified, but required Langfuse credentials are unavailable"),
+            tracing = {"tracing": {"requested": True, **opencode_tracing_availability(self.control.environment),
                                     "plugin": OPENCODE_LANGFUSE_PLUGIN,
                                     "correlation": {"session_id": child_session_id,
                                                      "router_task_id": task["task_id"],
@@ -936,16 +941,23 @@ class Runtime:
 
     def phase(self, task_id: str, name: str, command: list[str], cwd: Path, *, collecting: bool = False) -> dict:
         task = self.store.get(task_id)
+        phase_environment = self.control.environment.copy()
         tracing = task.get("tracing")
         requested = isinstance(tracing, dict) and tracing.get("requested") is True
-        if requested and not self._tracing_requested(task):
-            # A task can outlive a repository config reload. Fail closed for
-            # every resumed phase and remove the stale child opt-in.
-            self.store.update(task_id, lambda current: current.pop("tracing", None))
+        # The child registration below sets attempts to attempt_number. After that,
+        # the tracing record is this launch's evidence: capture and recovery keep it.
+        if requested and task["attempts"] != task["attempt_number"]:
+            if not self._tracing_requested(task):
+                # A task can outlive a repository config reload. Fail closed for
+                # the next launch and remove the stale child opt-in.
+                self.store.update(task_id, lambda current: current.pop("tracing", None))
+            elif name == "child" and task["executor"] == "opencode":
+                # Rejection/resume skips validate(); record what this child receives.
+                availability = opencode_tracing_availability(phase_environment)
+                self.store.update(task_id, lambda current: current["tracing"].update(availability))
             task = self.store.get(task_id)
         started = now_ms()
         directory = Path(task["artifact_dir"]) / f"attempt-{task['attempt_number']}" / name
-        phase_environment = self.control.environment.copy()
         environment = strip_langfuse_environment(phase_environment)
         for key in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR"):
             environment.pop(key, None)
