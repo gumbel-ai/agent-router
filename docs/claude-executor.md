@@ -147,14 +147,18 @@ inventories, or personal paths to the public PR.
    sum of both session totals. Cache buckets remain separate. No extra launch occurs.
 4. Reject once more and confirm the launch ceiling refuses attempt 3. Accept or
    discard the existing result using the normal review/close flow.
-5. In another synthetic task with a short approved deadline, request foreground
-   shell work that will exceed it. Confirm graceful harness interruption, owned
+5. Before the shutdown checks, initialize a second disposable enabled project with
+   `Bash` included in `tools` and an operator-approved allow rule for the specific
+   foreground shell command. Confirm its private init event includes `Bash`.
+   Keep the original Read/Edit/Write-only project for the tool-denial check.
+   In the second project, use a synthetic task with a short approved deadline and
+   request foreground shell work that will exceed it. Confirm graceful harness interruption, owned
    process shutdown, retained worktree, and no relaunch. On a disposable task,
    abruptly stop the native CLI while its foreground command runs: confirm
    `interrupted`, retained capacity, refused close, and the operator recovery
    procedure above. Repeat after restarting Router; forced escalation must remain
-   unconfirmed even if the launcher returns zero. Request a tool outside the configured list and confirm it is
-   denied rather than prompting or bypassing permissions.
+   unconfirmed even if the launcher returns zero. In the original Read/Edit/Write-only
+   project, request `Bash` and confirm it is denied rather than prompting or bypassing permissions.
 6. Repeat fresh/resumed coverage with the operator's actual approved authentication
    method and selected Claude config directory. Restart Router between completed
    attempts and confirm baseline/session persistence. Report sanitized PASS/FAIL
