@@ -476,14 +476,15 @@ def main() -> None:
                 directory = state_dir()
                 serve(settings, environment, directory, socket_path())
         elif args.command == "remote":
+            from router.remote_child import parse_request
             if not args.json:
                 parser.error("remote requires --json")
             raw = sys.stdin.buffer.read(12 * 1024 * 1024 + 1)
             if len(raw) > 12 * 1024 * 1024:
                 parser.error("Remote child request exceeds its wire bound")
             try:
-                message = json.loads(raw)
-            except (ValueError, UnicodeError, RecursionError) as error:
+                message = parse_request(raw)
+            except (TypeError, ValueError, UnicodeError, RecursionError) as error:
                 parser.error(f"Invalid remote child request: {error}")
             if not isinstance(message, dict) or set(message) != {"operation", "payload"}:
                 parser.error("Invalid remote child request envelope")

@@ -371,11 +371,12 @@ class RemoteSnapshotTests(unittest.TestCase):
         self.assertEqual(info["snapshot_commit"], receipt["snapshot_commit"])
         self.assertEqual((Path(info["worktree"]) / "code.txt").read_text(), "source initial\n")
         self.assertEqual(git(self.target, "rev-parse", "HEAD").strip(), parent_head)
+        self.assertEqual(remote_snapshot.materialize_snapshot(self.target, receipt, artifact), info)
         (Path(info["worktree"]) / "code.txt").write_text("remote result\n")
         git(Path(info["worktree"]), "add", "code.txt")
         final = remote_snapshot._git(Path(info["worktree"]), "write-tree").decode().strip()
         self.assertNotEqual(final, receipt["snapshot_tree"])
-        with self.assertRaises(ValueError):
+        with self.assertRaisesRegex(ValueError, "already exists"):
             remote_snapshot.materialize_snapshot(self.target, receipt, artifact)
 
     def test_export_git_failures_stop_owned_group_and_close_pipes(self):

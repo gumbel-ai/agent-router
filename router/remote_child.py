@@ -28,6 +28,28 @@ REVIEW_OUTCOMES = frozenset({"accepted", "rejected", "continue"})
 DISPOSITIONS = frozenset({"integrated", "discarded"})
 
 
+def _unique_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("Remote child request contains duplicate fields")
+        result[key] = value
+    return result
+
+
+def _reject_number(_value):
+    raise ValueError("Remote child request contains a non-integer number")
+
+
+def parse_request(raw: bytes) -> dict:
+    """Parse the SSH request without discarding duplicate or nonfinite fields."""
+    result = json.loads(raw, object_pairs_hook=_unique_object,
+                        parse_constant=_reject_number, parse_float=_reject_number)
+    if not isinstance(result, dict):
+        raise TypeError("Remote child request must be an object")
+    return result
+
+
 class RemoteChildError(ValueError):
     """A typed remote-child transport or protocol failure."""
 

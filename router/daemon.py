@@ -573,47 +573,69 @@ class Controller:
             raise ValueError("Remote repository is not configured on the serving host")
         inbox = self.directory / "remote-inbox" / hashlib.sha256(request_id.encode()).hexdigest()
         inbox.mkdir(parents=True, exist_ok=True, mode=0o700)
-        bundle = inbox / "snapshot.bundle"
+        # Serialize the durable request binding with import/materialization. A
+        # lost SSH response causes the parent to replay the exact request while
+        # the first server call may still be finishing; without this lock both
+        # calls can race through the initial operation lookup and one can reject
+        # the already-created worktree instead of returning the same task.
+        lock_path = inbox / "request.lock"
         try:
-            with bundle.open("xb") as stream:
-                os.chmod(bundle, 0o600)
-                stream.write(checked["snapshot_bytes"])
-        except FileExistsError:
-            # The immutable receipt/digest check below decides whether this is
-            # the same transfer; never follow or overwrite an existing path.
-            pass
-        imported = import_snapshot(remote_repo, receipt, bundle)
-        # The parent snapshot identity is the durable task identity on both hosts.
-        # This makes reconnect and cleanup address the same ref/worktree without a
-        # second mutable mapping.
-        task_id = receipt["task_id"]
-        artifact_dir = self.directory / "tasks" / task_id
-        materialized = materialize_snapshot(remote_repo, receipt, artifact_dir)
-        task = {"task_id": task_id, "session_id": session_id, "parent_agent_id": None,
-                "instruction_id": invocation["instruction_id"], "invocation": invocation,
-                "status": "created", "attempts": 0, "review_retries": 0, "continuations": 0,
-                "executor": invocation["executor"], "requested_model": invocation["model"],
-                "review_history": [], "created_at": now_ms(), "execution_stopped": True,
-                "max_attempts": self.settings.max_attempts, "artifact_dir": str(artifact_dir),
-                "remote_origin": {"session_id": session_id, "request_id": request_id,
-                                   },
-                "snapshot_commit": imported["snapshot_commit"], "snapshot_tree": imported["snapshot_tree"],
-                "worktree": materialized["worktree"], "branch": materialized["branch"]}
-        if "work_item_id" in invocation:
-            task["work_item_id"] = invocation["work_item_id"]
-        with self.store.transaction() as db:
-            existing = db.execute("SELECT operation,payload,task_id FROM operations WHERE session_id=? AND request_id=?",
-                                  (session_id, request_id)).fetchone()
-            if existing:
-                if tuple(existing[:2]) != ("start", operation_payload):
-                    raise ValueError("Remote request_id was already used with another payload")
-                return public(self.store.get(existing[2], db), self.store)
-            collision = db.execute("SELECT session_id FROM tasks WHERE task_id=?", (task_id,)).fetchone()
-            if collision is not None:
-                raise ValueError("Remote snapshot task identity is already in use")
-            self.store.put(db, task)
-            db.execute("INSERT INTO operations VALUES(?,?,?,?,?)",
-                       (session_id, request_id, "start", operation_payload, task_id))
+            lock_fd = os.open(lock_path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+        except OSError as error:
+            raise ValueError("Remote request lock is unavailable") from error
+        with os.fdopen(lock_fd, "a+") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            try:
+                with self.store.snapshot() as db:
+                    existing = db.execute("SELECT operation,payload,task_id FROM operations WHERE session_id=? AND request_id=?",
+                                          (session_id, request_id)).fetchone()
+                    if existing:
+                        if tuple(existing[:2]) != ("start", operation_payload):
+                            raise ValueError("Remote request_id was already used with another payload")
+                        return public(self.store.get(existing[2], db), self.store)
+                bundle = inbox / "snapshot.bundle"
+                try:
+                    with bundle.open("xb") as stream:
+                        os.chmod(bundle, 0o600)
+                        stream.write(checked["snapshot_bytes"])
+                except FileExistsError:
+                    # The immutable receipt/digest check below decides whether
+                    # this is the same transfer; never follow or overwrite an
+                    # existing path.
+                    pass
+                imported = import_snapshot(remote_repo, receipt, bundle)
+                # The parent snapshot identity is the durable task identity on
+                # both hosts. This makes reconnect and cleanup address the same
+                # ref/worktree without a second mutable mapping.
+                task_id = receipt["task_id"]
+                artifact_dir = self.directory / "tasks" / task_id
+                materialized = materialize_snapshot(remote_repo, receipt, artifact_dir)
+                task = {"task_id": task_id, "session_id": session_id, "parent_agent_id": None,
+                        "instruction_id": invocation["instruction_id"], "invocation": invocation,
+                        "status": "created", "attempts": 0, "review_retries": 0, "continuations": 0,
+                        "executor": invocation["executor"], "requested_model": invocation["model"],
+                        "review_history": [], "created_at": now_ms(), "execution_stopped": True,
+                        "max_attempts": self.settings.max_attempts, "artifact_dir": str(artifact_dir),
+                        "remote_origin": {"session_id": session_id, "request_id": request_id},
+                        "snapshot_commit": imported["snapshot_commit"], "snapshot_tree": imported["snapshot_tree"],
+                        "worktree": materialized["worktree"], "branch": materialized["branch"]}
+                if "work_item_id" in invocation:
+                    task["work_item_id"] = invocation["work_item_id"]
+                with self.store.transaction() as db:
+                    existing = db.execute("SELECT operation,payload,task_id FROM operations WHERE session_id=? AND request_id=?",
+                                          (session_id, request_id)).fetchone()
+                    if existing:
+                        if tuple(existing[:2]) != ("start", operation_payload):
+                            raise ValueError("Remote request_id was already used with another payload")
+                        return public(self.store.get(existing[2], db), self.store)
+                    collision = db.execute("SELECT session_id FROM tasks WHERE task_id=?", (task_id,)).fetchone()
+                    if collision is not None:
+                        raise ValueError("Remote snapshot task identity is already in use")
+                    self.store.put(db, task)
+                    db.execute("INSERT INTO operations VALUES(?,?,?,?,?)",
+                               (session_id, request_id, "start", operation_payload, task_id))
+            finally:
+                fcntl.flock(lock, fcntl.LOCK_UN)
         self.changed.set()
         return public(task, self.store)
 
@@ -1465,11 +1487,26 @@ class Runtime:
                     self.store.update_with_attempt(task_id, lambda current, updates=updates: current.update(updates))
                     return
                 if remote_status in {"accepted", "integrated", "closed"}:
-                    self.store.update_with_attempt(task_id, lambda current, remote_status=remote_status: current.update(
-                        status=remote_status, execution_stopped=True))
+                    updates = {"status": remote_status, "execution_stopped": True,
+                               "remote_task_id": status.get("task_id", task.get("remote_task_id"))}
+                    for field in ("attempts", "attempt_number", "final_tree", "execution_outcome", "failure_reason",
+                                  "duration_ms", "exit_code", "snapshot_commit", "snapshot_tree"):
+                        if field in status:
+                            updates[field] = status[field]
+                    self.store.update_with_attempt(task_id, lambda current, updates=updates: current.update(updates))
                     return
                 if remote_status not in {"created", "validating", "preparing", "running", "retrying", "cancelling"}:
                     raise RemoteChildError("invalid_response", "Remote task returned an unknown state")
+                # Recovery starts with a locally uncertain task. A successful
+                # status read is the evidence that re-establishes the remote
+                # task identity and its current liveness; do not leave the
+                # parent visibly interrupted while the remote child is active.
+                updates = {"status": remote_status, "execution_stopped": False,
+                           "remote_task_id": status.get("task_id", task.get("remote_task_id"))}
+                for field in ("attempts", "attempt_number", "duration_ms", "snapshot_commit", "snapshot_tree"):
+                    if field in status:
+                        updates[field] = status[field]
+                self.store.update_with_attempt(task_id, lambda current, updates=updates: current.update(updates))
                 time.sleep(.2)
         except RemoteChildError as error:
             reason = f"Remote transport {error.code}; execution outcome is unknown"
