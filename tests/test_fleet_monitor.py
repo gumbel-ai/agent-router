@@ -12,7 +12,7 @@ import time
 import unittest
 import uuid
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import contextmanager, redirect_stdout
+from contextlib import closing, contextmanager, redirect_stdout
 from pathlib import Path
 from unittest.mock import mock_open, patch
 
@@ -180,7 +180,7 @@ class HostAndMigrationTests(unittest.TestCase):
     def test_additive_observation_migration_preserves_history_and_adds_host_scope(self):
         with tempfile.TemporaryDirectory() as temp:
             path = Path(temp) / "router.sqlite3"
-            with sqlite3.connect(path) as db:
+            with closing(sqlite3.connect(path)) as db, db:
                 db.execute("CREATE TABLE observations(task_id TEXT PRIMARY KEY, session_id TEXT NOT NULL, data TEXT NOT NULL)")
                 db.execute("INSERT INTO observations VALUES(?,?,?)", ("native-old", "S", json.dumps({
                     "task_id": "native-old", "parent_session_id": "S", "agent_id": "A", "executor": "claude"})))
@@ -197,7 +197,7 @@ class HostAndMigrationTests(unittest.TestCase):
     def test_unknown_observation_schema_is_rejected_without_data_loss(self):
         with tempfile.TemporaryDirectory() as temp:
             path = Path(temp) / "router.sqlite3"
-            with sqlite3.connect(path) as db:
+            with closing(sqlite3.connect(path)) as db, db:
                 db.execute("""CREATE TABLE observations(
                     task_id TEXT PRIMARY KEY, session_id TEXT NOT NULL,
                     data TEXT NOT NULL, legacy_note TEXT NOT NULL)""")
@@ -205,7 +205,7 @@ class HostAndMigrationTests(unittest.TestCase):
                            ("native-old", "S", "{}", "retain me"))
             with self.assertRaisesRegex(ValueError, "Unsupported observations schema"):
                 Store(path, "local-host")
-            with sqlite3.connect(path) as db:
+            with closing(sqlite3.connect(path)) as db, db:
                 self.assertEqual(
                     [row[1] for row in db.execute("PRAGMA table_info(observations)")],
                     ["task_id", "session_id", "data", "legacy_note"],
@@ -218,18 +218,18 @@ class HostAndMigrationTests(unittest.TestCase):
     def test_migration_is_atomic_and_preserves_legacy_positional_inserts(self):
         with tempfile.TemporaryDirectory() as temp:
             path = Path(temp) / "router.sqlite3"
-            with sqlite3.connect(path) as db:
+            with closing(sqlite3.connect(path)) as db, db:
                 db.execute("CREATE TABLE observations(task_id TEXT PRIMARY KEY, session_id TEXT NOT NULL, data TEXT NOT NULL)")
                 db.execute("INSERT INTO observations VALUES(?,?,?)", ("bad", "S", "not-json"))
             with self.assertRaises(json.JSONDecodeError):
                 Store(path, "host")
-            with sqlite3.connect(path) as db:
+            with closing(sqlite3.connect(path)) as db, db:
                 tables = {row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
                 self.assertEqual(tables, {"observations"})
                 db.execute("UPDATE observations SET data=?", (json.dumps({
                     "task_id": "bad", "parent_session_id": "S", "agent_id": "A", "executor": "claude"}),))
             Store(path, "host")
-            with sqlite3.connect(path) as db:
+            with closing(sqlite3.connect(path)) as db, db:
                 db.execute("INSERT INTO observations VALUES(?,?,?)", ("legacy-write", "S2", json.dumps({
                     "task_id": "legacy-write", "parent_session_id": "S2", "agent_id": "B"})))
                 self.assertEqual(db.execute("SELECT count(*) FROM observations").fetchone()[0], 2)
@@ -238,10 +238,10 @@ class HostAndMigrationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             path = Path(temp) / "router.sqlite3"
             Store(path, "host")
-            with sqlite3.connect(path) as db:
+            with closing(sqlite3.connect(path)) as db, db:
                 schema_version = db.execute("PRAGMA schema_version").fetchone()[0]
             Store(path, "host")
-            with sqlite3.connect(path) as db:
+            with closing(sqlite3.connect(path)) as db, db:
                 self.assertEqual(db.execute("PRAGMA schema_version").fetchone()[0], schema_version)
 
     def test_active_tool_deadline_index_persists_and_serves_the_count_query(self):
@@ -250,7 +250,7 @@ class HostAndMigrationTests(unittest.TestCase):
             Store(path, "host")
             Store(path, "host")
 
-            with sqlite3.connect(path) as db:
+            with closing(sqlite3.connect(path)) as db, db:
                 index = db.execute(
                     "SELECT sql FROM sqlite_master WHERE type='index' AND name=?",
                     ("sessions_active_tool_deadline",),
