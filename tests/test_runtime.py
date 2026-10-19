@@ -2,12 +2,13 @@ import fcntl
 import json
 import os
 import queue
+import subprocess
 import sys
 import tempfile
 import threading
 import time
 import unittest
-from contextlib import closing
+from contextlib import closing, nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -79,6 +80,50 @@ class RuntimeHarness:
             diagnostics.append(f"{path.relative_to(directory)}:\n{content}")
         evidence = "\n".join(diagnostics) if diagnostics else "[no prepare stderr artifacts available]"
         self.fail(f"Task did not reach {states}: {task}\nGit prepare stderr:\n{evidence}")
+
+class ExitingLeader:
+    """Models Darwin under load: an exiting group leader stays unsignalable before it becomes reapable."""
+
+    def __init__(self, process, record, seconds):
+        self.process, self.completion, self.seconds = process, Path(record["completion"]), seconds
+        self.reapable_at = None
+
+    def reapable(self):
+        # The gate publishes completion before exiting; the modeled exit starts there.
+        if self.reapable_at is None and self.completion.exists():
+            self.reapable_at = time.monotonic() + self.seconds
+        return self.reapable_at is not None and time.monotonic() >= self.reapable_at
+
+    def exiting(self):
+        return not self.reapable() and self.reapable_at is not None
+
+    def poll(self):
+        # Never reap before the modeled window ends, so completion cannot bypass it.
+        return self.process.poll() if self.reapable() else None
+
+    def wait(self, timeout=None):
+        if self.exiting():
+            remaining = self.reapable_at - time.monotonic()
+            if timeout is not None and timeout < remaining:
+                time.sleep(timeout)
+                raise subprocess.TimeoutExpired("leader", timeout)
+            time.sleep(max(0, remaining))
+        return self.process.wait(timeout)
+
+
+def exiting_leaders(test):
+    """Patch the group signal probe: Darwin reports EPERM for a group whose leader is exiting."""
+    leaders, killpg = {}, os.killpg
+    def probe(pgid, signal_number):
+        leader = leaders.get(pgid)
+        if signal_number == 0 and leader is not None and leader.exiting():
+            raise PermissionError(1, "Operation not permitted")
+        return killpg(pgid, signal_number)
+    patcher = patch("router.process.os.killpg", side_effect=probe)
+    patcher.start()
+    test.addCleanup(patcher.stop)
+    return leaders
+
 
 class RuntimeTests(RuntimeHarness, unittest.TestCase):
     def test_wait_failure_includes_git_preparation_stderr(self):
@@ -981,12 +1026,51 @@ class RuntimeTests(RuntimeHarness, unittest.TestCase):
         self.assertIn("final_tree", stopped)
 
     def test_final_error_event_is_collected_after_process_exit(self):
-        task_id = self.start("final error")
-        failed = self.wait(task_id, {"failed", "interrupted", "awaiting_review"})
-        self.assertEqual(failed["status"], "failed", failed)
-        self.assertEqual(failed["exit_code"], 0)
-        self.assertTrue(failed["execution_error"])
-        self.assertIn("final_tree", failed)
+        leaders = exiting_leaders(self)
+        def slow_child_exit(command, cwd, environment, directory, register, **options):
+            process, record = launch(command, cwd, environment, directory, register, **options)
+            if directory.name != "child":
+                return process, record
+            leaders[record["pid"]] = ExitingLeader(process, record, seconds=1)
+            return leaders[record["pid"]], record
+        for slow_exit in (False, True):
+            with self.subTest(slow_exit=slow_exit), (patch("router.daemon.launch", side_effect=slow_child_exit) if slow_exit else nullcontext()):
+                task_id = self.start("final error", f"final-error-{slow_exit}")
+                failed = self.wait(task_id, {"failed", "interrupted", "awaiting_review"})
+                self.assertEqual(failed["status"], "failed", failed)
+                self.assertEqual(failed["exit_code"], 0)
+                self.assertTrue(failed["execution_error"])
+                self.assertIn("final_tree", failed)
+        self.assertEqual([leader.reapable_at is not None for leader in leaders.values()], [True])
+
+    def test_stopping_an_exiting_leader_awaits_reaping(self):
+        leaders = exiting_leaders(self)
+        ready = "from pathlib import Path; Path('ready').touch(); "
+        sleep = "import time; time.sleep(60)"
+        on_interrupt = "import signal, sys; signal.signal(signal.SIGINT, lambda *_: sys.exit(0)); "
+        # Name, script, interrupt first, already exited before the stop, modeled exit seconds.
+        rows = (("already exiting", ready, False, True, 1),
+                ("exits on terminate", ready + sleep, False, False, 1),
+                ("exits on interrupt", on_interrupt + ready + sleep, True, False, 3.5))
+        for index, (name, script, interrupt_first, exited, seconds) in enumerate(rows):
+            with self.subTest(name):
+                cwd = self.root / f"exiting-{index}"
+                cwd.mkdir()
+                process, record = launch([sys.executable, "-c", script], cwd, os.environ.copy(),
+                                         self.root / f"exiting-group-{index}", lambda record: None)
+                self.addCleanup(lambda record=record, process=process: process.poll() is None and stop_owned(record, process))
+                leader = leaders[record["pid"]] = ExitingLeader(process, record, seconds)
+                record.update(interrupt_first=interrupt_first, executor="codex")
+                marker = Path(record["completion"]) if exited else cwd / "ready"
+                end = time.monotonic() + 15
+                while not marker.exists() and time.monotonic() < end:
+                    time.sleep(0.02)
+                self.assertTrue(marker.exists())
+                if exited:
+                    self.assertTrue(leader.exiting())
+                stop_owned(record, leader)
+                self.assertIsNotNone(process.returncode)
+                self.assertEqual(owned_state(record), "stopped")
 
     def test_uncertain_execution_reserves_admission_until_cancel(self):
         self.runtime.stop()

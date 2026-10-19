@@ -68,10 +68,26 @@ def owned_state(record: dict) -> str:
     return "uncertain"
 
 
+def _unsignalable(record: dict) -> bool:
+    try:
+        os.killpg(record["pgid"], 0)
+    except PermissionError:
+        return True
+    except ProcessLookupError:
+        pass
+    return False
+
+
 def supervised_state(record: dict, process: subprocess.Popen | None) -> str:
     if process is not None:
         process.poll()
     state = owned_state(record)
+    if state == "uncertain" and process is not None and process.poll() is None and _unsignalable(record):
+        # Darwin skips zombie and exiting members when signalling a group, so a
+        # group whose leader is exiting reports EPERM before the leader becomes
+        # reapable. A live leader shares our credentials and is signalable, and
+        # while unreaped its PID and group cannot be reused: it is still owned.
+        return "exiting"
     if state == "uncertain" and process is not None:
         # Exit can occur between poll() and the probe. On Darwin an unreaped
         # direct-child leader can yield EPERM; reap it before judging liveness.
@@ -99,6 +115,9 @@ def _stop_group(record: dict, process: subprocess.Popen | None = None) -> None:
     state = supervised_state(record, process)
     if state == "stopped":
         return
+    if state == "exiting":
+        _await_group(record, process)
+        return
     if state != "live":
         raise UncertainProcess("Process ownership or liveness is uncertain; no signal sent")
     if record.get("interrupt_first"):
@@ -113,7 +132,11 @@ def _stop_group(record: dict, process: subprocess.Popen | None = None) -> None:
             if supervised_state(record, process) == "stopped":
                 return
             time.sleep(0.02)
-        if supervised_state(record, process) != "live":
+        state = supervised_state(record, process)
+        if state == "exiting":
+            _await_group(record, process)
+            return
+        if state != "live":
             raise UncertainProcess("Ownership became uncertain during interruption; artifacts retained")
         # Persist before escalation: a normal exit code from a launcher must not
         # erase forced-shutdown uncertainty, even after a daemon restart.
@@ -133,10 +156,17 @@ def _stop_group(record: dict, process: subprocess.Popen | None = None) -> None:
     state = supervised_state(record, process)
     if state == "live":
         os.killpg(record["pgid"], signal.SIGKILL)
-    elif state != "stopped":
+    elif state not in {"stopped", "exiting"}:
         raise UncertainProcess("Ownership became uncertain during termination; artifacts retained")
+    _await_group(record, process)
+
+
+def _await_group(record: dict, process: subprocess.Popen | None) -> None:
     if process is not None:
-        process.wait(timeout=5)
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired as error:
+            raise UncertainProcess("Owned process group leader did not exit; artifacts retained") from error
     limit = time.monotonic() + 3
     while time.monotonic() < limit:
         if owned_state(record) == "stopped":
