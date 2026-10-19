@@ -1,5 +1,7 @@
 import base64
+import tempfile
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -23,6 +25,7 @@ class RemoteChildProtocolTests(unittest.TestCase):
 
     def payload(self, **changes):
         result = {"session_id": "session-a", "request_id": "request-a", "invocation": self.invocation,
+                  "resolved_model": "provider/model-a",
                   "remote_repo": "/srv/project", "remote_worktree": "/srv/project",
                   "snapshot_receipt": self.receipt,
                   "snapshot_base64": base64.b64encode(b"abc").decode()}
@@ -36,6 +39,8 @@ class RemoteChildProtocolTests(unittest.TestCase):
             remote_child._start_payload(self.payload(invocation={**self.invocation, "request_id": "other"}))
         with self.assertRaisesRegex(ValueError, "bytes"):
             remote_child._start_payload(self.payload(snapshot_base64=base64.b64encode(b"abcd").decode()))
+        with self.assertRaisesRegex(ValueError, "resolved model"):
+            remote_child._start_payload(self.payload(resolved_model=""))
 
     def test_transport_start_keeps_snapshot_base64_on_wire(self):
         transport = remote_child.RemoteChildTransport(
@@ -44,7 +49,7 @@ class RemoteChildProtocolTests(unittest.TestCase):
         with patch("router.remote_child._exchange", return_value={"status": "created"}) as exchange:
             result = transport.start(
                 session_id="session-a", request_id="request-a", invocation=self.invocation,
-                remote_repo="/srv/project", remote_worktree="/srv/project",
+                resolved_model="provider/model-a", remote_repo="/srv/project", remote_worktree="/srv/project",
                 snapshot_receipt=self.receipt, snapshot_bundle=b"abc",
             )
         self.assertEqual(result, {"status": "created"})
@@ -66,6 +71,64 @@ class RemoteChildProtocolTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             remote_child._control_payload("close", {"task_id": "t", "request_id": "r",
                                                       "disposition": "integrated", "keep_artifacts": 1})
+
+    def test_control_payloads_keep_local_optional_fields_optional(self):
+        accepted = {"task_id": "t", "request_id": "r", "expected_attempt": 1, "outcome": "accepted"}
+        self.assertEqual(remote_child._control_payload("review", accepted), accepted)
+        closing = {"task_id": "t", "request_id": "r", "disposition": "discarded"}
+        self.assertEqual(remote_child._control_payload("close", closing), closing)
+        with self.assertRaises(ValueError):
+            remote_child._control_payload("review", {"task_id": "t", "request_id": "r", "expected_attempt": 1,
+                                                       "outcome": "rejected"})
+
+    def test_lost_start_reply_keeps_remote_ownership_uncertain(self):
+        directory = Path(tempfile.mkdtemp())
+        task = {"task_id": "task-a", "session_id": "session-a", "remote_host": "worker",
+                "remote_repo": "/srv/project", "remote_worktree": "/srv/project", "status": "preparing",
+                "execution_stopped": True, "artifact_dir": str(directory), "resolved_model": "provider/model-a",
+                "invocation": {**self.invocation, "parent_worktree": str(directory),
+                               "context": {"relevant_paths": ["code.txt"]}}}
+
+        class Store:
+            def get(self, _task_id):
+                return task
+
+            def update(self, _task_id, change):
+                change(task)
+                return task
+
+            update_with_attempt = update
+
+        class Transport:
+            def __init__(self, _host, _timeout):
+                pass
+
+            def start(self, **_kwargs):
+                raise remote_child.RemoteChildError("deadline", "lost reply")
+
+        def export(_root, _task_id, artifact, _paths):
+            artifact.mkdir(parents=True)
+            (artifact / "snapshot.bundle").write_bytes(b"abc")
+            return self.receipt
+
+        runtime = Runtime.__new__(Runtime)
+        runtime.store = Store()
+        config = SimpleNamespace(hosts=(FleetHost("worker", "ssh", target="example"),), ssh_timeout_seconds=1)
+        with patch("router.fleet.load_fleet_config", return_value=config), \
+                patch("router.remote_child.RemoteChildTransport", Transport), \
+                patch("router.remote_snapshot.export_snapshot", export):
+            runtime.execute_remote("task-a")
+        self.assertEqual(task["status"], "interrupted")
+        self.assertFalse(task["execution_stopped"])
+
+    def test_remote_cancelling_and_recovery_reconcile_remotely(self):
+        for status, recovered in (("cancelling", False), ("running", True)):
+            task = {"task_id": "task-a", "remote_host": "worker", "status": status}
+            runtime = Runtime.__new__(Runtime)
+            runtime.store = SimpleNamespace(get=lambda _task_id, task=task: task)
+            with patch.object(Runtime, "execute_remote") as execute_remote:
+                runtime.execute("task-a", recovered)
+            execute_remote.assert_called_once_with("task-a", recovered=True)
 
     def test_recovery_projects_remote_liveness_and_terminal_capture(self):
         task = {

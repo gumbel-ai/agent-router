@@ -91,11 +91,13 @@ def _receipt(value: object) -> dict:
 
 def _start_payload(payload: dict) -> dict:
     if not isinstance(payload, dict) or set(payload) != {
-            "session_id", "request_id", "invocation", "remote_repo", "remote_worktree",
+            "session_id", "request_id", "invocation", "resolved_model", "remote_repo", "remote_worktree",
             "snapshot_receipt", "snapshot_base64"}:
         raise ValueError("Remote start has invalid fields")
     _text(payload["session_id"], "session_id")
     _text(payload["request_id"], "request_id")
+    if not isinstance(payload["resolved_model"], str) or not payload["resolved_model"].strip():
+        raise ValueError("Remote start requires the parent's exact resolved model")
     _absolute_path(payload["remote_repo"], "remote_repo")
     _absolute_path(payload["remote_worktree"], "remote_worktree")
     invocation = payload["invocation"]
@@ -128,7 +130,8 @@ def _control_payload(operation: str, payload: dict) -> dict:
         _text(payload["session_id"], "session_id")
         _text(payload["request_id"], "request_id")
     elif operation == "review":
-        if not isinstance(payload, dict) or set(payload) != {"task_id", "request_id", "expected_attempt", "outcome", "feedback"}:
+        required = {"task_id", "request_id", "expected_attempt", "outcome"}
+        if not isinstance(payload, dict) or not required <= set(payload) <= required | {"feedback"}:
             raise ValueError("Remote review has invalid fields")
         _text(payload["task_id"], "task_id", 128)
         _text(payload["request_id"], "request_id")
@@ -136,21 +139,24 @@ def _control_payload(operation: str, payload: dict) -> dict:
             raise ValueError("Remote review attempt is invalid")
         if payload["outcome"] not in REVIEW_OUTCOMES:
             raise ValueError("Remote review outcome is invalid")
+        # Mirrors the local review contract: feedback is optional for acceptance.
         if payload["outcome"] != "accepted":
-            _text(payload["feedback"], "feedback", 2000)
-        elif not isinstance(payload["feedback"], str) or payload["feedback"]:
-            raise ValueError("Accepted remote review must not include feedback")
+            _text(payload.get("feedback"), "feedback", 2000)
+        elif "feedback" in payload and not isinstance(payload["feedback"], str):
+            raise ValueError("Remote review feedback must be a string")
     elif operation == "cancel":
         if not isinstance(payload, dict) or set(payload) != {"task_id", "request_id"}:
             raise ValueError("Remote cancel has invalid fields")
         _text(payload["task_id"], "task_id", 128)
         _text(payload["request_id"], "request_id")
     else:
-        if not isinstance(payload, dict) or set(payload) != {"task_id", "request_id", "disposition", "keep_artifacts"}:
+        required = {"task_id", "request_id", "disposition"}
+        if not isinstance(payload, dict) or not required <= set(payload) <= required | {"keep_artifacts"}:
             raise ValueError("Remote close has invalid fields")
         _text(payload["task_id"], "task_id", 128)
         _text(payload["request_id"], "request_id")
-        if payload["disposition"] not in DISPOSITIONS or type(payload["keep_artifacts"]) is not bool:
+        # Mirrors the local close contract: keep_artifacts defaults to false.
+        if payload["disposition"] not in DISPOSITIONS or type(payload.get("keep_artifacts", False)) is not bool:
             raise ValueError("Remote close disposition is invalid")
     return payload
 
@@ -181,8 +187,11 @@ def _exchange(host: FleetHost, timeout: float, operation: str, payload: dict) ->
     try:
         if process.stdin is None or process.stdout is None or process.stderr is None:
             raise RemoteChildError("transport_failed", "Remote transport pipes unavailable")
-        process.stdin.write(request)
-        process.stdin.close()
+        # Write the request under the same deadline as the reads: a peer that
+        # stops reading must not block the caller past its timeout.
+        unsent = memoryview(request)
+        os.set_blocking(process.stdin.fileno(), False)
+        selector.register(process.stdin, selectors.EVENT_WRITE, "stdin")
         for stream, kind in ((process.stdout, "stdout"), (process.stderr, "stderr")):
             os.set_blocking(stream.fileno(), False)
             selector.register(stream, selectors.EVENT_READ, kind)
@@ -191,6 +200,15 @@ def _exchange(host: FleetHost, timeout: float, operation: str, payload: dict) ->
             if remaining <= 0:
                 raise RemoteChildError("deadline", "Remote child request exceeded its deadline")
             for key, _events in selector.select(min(remaining, .25)):
+                if key.data == "stdin":
+                    try:
+                        unsent = unsent[os.write(key.fileobj.fileno(), unsent):]
+                    except BlockingIOError:
+                        continue
+                    if not unsent:
+                        selector.unregister(key.fileobj)
+                        key.fileobj.close()
+                    continue
                 chunk = os.read(key.fileobj.fileno(), 65536)
                 if not chunk:
                     selector.unregister(key.fileobj)
@@ -209,8 +227,8 @@ def _exchange(host: FleetHost, timeout: float, operation: str, payload: dict) ->
         raise RemoteChildError("transport_failed", "Remote child transport failed") from error
     finally:
         selector.close()
-        for stream in (process.stdout, process.stderr):
-            if stream is not None:
+        for stream in (process.stdin, process.stdout, process.stderr):
+            if stream is not None and not stream.closed:
                 stream.close()
         if process.poll() is None:
             try:
@@ -236,9 +254,10 @@ class RemoteChildTransport:
         self.host = host
         self.timeout = timeout
 
-    def start(self, *, session_id: str, request_id: str, invocation: dict, remote_repo: str,
+    def start(self, *, session_id: str, request_id: str, invocation: dict, resolved_model: str, remote_repo: str,
               remote_worktree: str, snapshot_receipt: dict, snapshot_bundle: bytes) -> dict:
         payload = {"session_id": session_id, "request_id": request_id, "invocation": invocation,
+                   "resolved_model": resolved_model,
                    "remote_repo": remote_repo, "remote_worktree": remote_worktree,
                    "snapshot_receipt": snapshot_receipt,
                    "snapshot_base64": base64.b64encode(snapshot_bundle).decode("ascii")}
