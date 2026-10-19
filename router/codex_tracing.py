@@ -166,5 +166,5 @@ def environment(result: dict[str, str], task: dict, *, credentials: dict[str, st
         metadata["work_item_id"] = correlation["work_item_id"]
     result.update(TRACE_TO_LANGFUSE="1" if available else "0", LANGFUSE_CODEX_USER_ID="agent-router",
                   LANGFUSE_CODEX_METADATA=json.dumps(metadata, separators=(",", ":")),
-                  LANGFUSE_CODEX_TRACE_SEED=session or correlation["router_task_id"])
+                  LANGFUSE_CODEX_TRACE_SEED=correlation["router_task_id"])  # stable across resume
     return result

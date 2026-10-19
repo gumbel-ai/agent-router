@@ -63,6 +63,7 @@ class CodexTracingTests(unittest.TestCase):
         self.assertEqual(environment["PLUGIN_ROOT"], str(self.plugin.resolve()))
         self.assertEqual(json.loads(environment["LANGFUSE_CODEX_METADATA"])["router_task_id"], "task-1")
         self.assertEqual(environment["LANGFUSE_CODEX_USER_ID"], "agent-router")
+        self.assertEqual(environment["LANGFUSE_CODEX_TRACE_SEED"], "task-1")
         self.assertNotIn("OPENAI_API_KEY", environment)
 
     def test_hook_configuration_is_valid_toml_with_expected_structure(self):
