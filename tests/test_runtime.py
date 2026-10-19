@@ -88,15 +88,18 @@ class ExitingLeader:
         self.process, self.completion, self.seconds = process, Path(record["completion"]), seconds
         self.reapable_at = None
 
-    def exiting(self):
-        if self.process.returncode is not None or not self.completion.exists():
-            return False
-        if self.reapable_at is None:
+    def reapable(self):
+        # The gate publishes completion before exiting; the modeled exit starts there.
+        if self.reapable_at is None and self.completion.exists():
             self.reapable_at = time.monotonic() + self.seconds
-        return time.monotonic() < self.reapable_at
+        return self.reapable_at is not None and time.monotonic() >= self.reapable_at
+
+    def exiting(self):
+        return not self.reapable() and self.reapable_at is not None
 
     def poll(self):
-        return None if self.exiting() else self.process.poll()
+        # Never reap before the modeled window ends, so completion cannot bypass it.
+        return self.process.poll() if self.reapable() else None
 
     def wait(self, timeout=None):
         if self.exiting():
