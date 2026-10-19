@@ -468,6 +468,9 @@ class Controller:
         if operation == "correlation":
             from router.correlation import export
             return export(self.store, self.host.host_id, payload)
+        if operation == "task_diff":
+            from router.task_diff import export
+            return export(self.store, self.directory, self.host.host_id, payload)
         if operation == "snapshot":
             if set(payload) - {"history_limit"}:
                 raise ValueError("Unknown snapshot option")

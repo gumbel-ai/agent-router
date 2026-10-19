@@ -267,6 +267,13 @@ def main() -> None:
     status.add_argument("--json", action="store_true")
     status.add_argument("--watch", action="store_true")
     status.add_argument("--native-offset", type=int, default=0, help="Native observation page offset (100 per page)")
+    task_diff = commands.add_parser("task-diff", help="Read one retained task patch as a bounded JSON receipt")
+    task_diff.add_argument("task_id")
+    task_diff.add_argument("--attempt", type=int, required=True)
+    task_diff.add_argument("--json", action="store_true", required=True)
+    task_diff.add_argument("--host-id", help="Expected serving Router host identity")
+    for field in ("snapshot-commit", "snapshot-tree", "final-tree"):
+        task_diff.add_argument("--" + field)
     run = commands.add_parser("run", help="Run a command in its own process group and record completion evidence")
     run.add_argument("--label", help="Short name shown in status and fleet views")
     run.add_argument("--session", help="Launching Claude Code or Codex session ID")
@@ -300,6 +307,15 @@ def main() -> None:
     snapshot.add_argument("--history-limit", type=int, default=100)
     fleet = commands.add_parser("fleet", help="Query configured local and SSH hosts")
     fleet_commands = fleet.add_subparsers(dest="fleet_command", required=True)
+    fleet_diff = fleet_commands.add_parser("task-diff", help="Read a retained patch from one explicit configured host")
+    fleet_diff.add_argument("task_id")
+    fleet_diff.add_argument("--attempt", type=int, required=True)
+    fleet_diff.add_argument("--json", action="store_true", required=True)
+    fleet_diff.add_argument("--host", required=True)
+    fleet_diff.add_argument("--host-id", required=True)
+    fleet_diff.add_argument("--config", type=Path)
+    for field in ("snapshot-commit", "snapshot-tree", "final-tree"):
+        fleet_diff.add_argument("--" + field)
     fleet_correlation = fleet_commands.add_parser("correlation", help="Export bounded content-free fleet metadata")
     fleet_correlation.add_argument("--json", action="store_true", required=True)
     fleet_correlation.add_argument("--config", type=Path)
@@ -361,7 +377,29 @@ def main() -> None:
     hook.add_argument("event", choices=["submit", "authorize", "observe"])
     args = parser.parse_args()
     try:
-        if args.command == "enable":
+        if args.command == "task-diff" or args.command == "fleet" and args.fleet_command == "task-diff":
+            from router.task_diff import fetch, options
+            payload = {"task_id": args.task_id, "attempt_number": args.attempt}
+            for field in ("host_id", "snapshot_commit", "snapshot_tree", "final_tree"):
+                if getattr(args, field) is not None:
+                    payload[field] = getattr(args, field)
+            try:
+                payload = options(payload)
+            except ValueError as error:
+                parser.exit(2, f"Invalid task-diff selection: {error}\n")
+            host, timeout = None, 15
+            if args.command == "fleet":
+                from router.fleet import DEFAULT_CONFIG, load_fleet_config
+                config = load_fleet_config(args.config or DEFAULT_CONFIG)
+                selected = [entry for entry in config.hosts if entry.name == args.host]
+                if len(selected) != 1:
+                    parser.exit(2, "Task-diff requires one known configured host\n")
+                host, timeout = selected[0], config.ssh_timeout_seconds
+            result = fetch(payload, host=host, timeout=timeout)
+            print(json.dumps(result, separators=(",", ":")), flush=True)
+            if result["status"] != "ok":
+                parser.exit(1, f"Task diff unavailable: {result['error']['code']}; task unchanged.\n")
+        elif args.command == "enable":
             from router.project_enablement import enable
             enable()
         elif args.command in {"setup", "init", "uninstall"}:
@@ -545,6 +583,8 @@ def main() -> None:
     except (ValueError, OSError) as error:
         parser.exit(1, f"Agent Router: {error}\n")
     except KeyboardInterrupt:
+        if args.command == "task-diff" or args.command == "fleet" and args.fleet_command == "task-diff":
+            parser.exit(130, "Agent Router task-diff read interrupted; task unchanged. Repeat the same read.\n")
         if args.command == "fleet" and args.fleet_command in {"wait", "ack"}:
             parser.exit(130, "Agent Router fleet completion interrupted; events remain durable; "
                         "acknowledgment commit state is unknown. Retry the same delivery, never the command.\n")
