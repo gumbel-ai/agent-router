@@ -431,6 +431,8 @@ item before requesting review.
 - Keep failure state independent of diagnostic text. An exception or sanitized stderr
   can have an empty message; it must still trigger failed delivery and owned-process
   cleanup, with a nonempty diagnostic fallback.
+- Ref or artifact recovery must not suppress unconfirmed process cleanup. A matching
+  persisted result does not prove that its producing process terminated.
 
 **Parsing and cost**
 

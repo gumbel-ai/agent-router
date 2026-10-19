@@ -36,9 +36,13 @@ GIT_CLEANUP_TIMEOUT = 1
 _IDENTITY = "Agent Router <router@localhost> 946684800 +0000"
 
 
+class _GitStatusError(ValueError):
+    """Git exited with a status the operation did not accept."""
+
+
 def _git(root, *arguments, data=None, environment=None, statuses=(0,), limit=MAX_METADATA_BYTES,
-         read_configuration=False):
-    """Bound stdout, stderr and process-group lifetime, including a hung Git child."""
+         read_configuration=False, stdout_consumer=None):
+    """Bound captured output and process-group lifetime; optionally stream stdout."""
     env = {key: value for key, value in os.environ.items() if not key.startswith(("GIT_", "LANGFUSE_"))}
     if read_configuration:
         if arguments != ("config", "--null", "--path", "--get", "core.excludesFile"):
@@ -73,6 +77,8 @@ def _git(root, *arguments, data=None, environment=None, statuses=(0,), limit=MAX
                         chunk = os.read(key.fileobj.fileno(), 65536)
                         if not chunk:
                             selector.unregister(key.fileobj)
+                        elif key.data is output and stdout_consumer is not None:
+                            stdout_consumer(chunk)
                         else:
                             key.data.extend(chunk)
                             if len(key.data) > (limit if key.data is output else 65536):
@@ -82,7 +88,7 @@ def _git(root, *arguments, data=None, environment=None, statuses=(0,), limit=MAX
                 # Git diagnostics can quote caller-selected paths or bundle text.
                 # Keep them on this local exception boundary; receipts carry none.
                 message = diagnostic.decode(errors="replace").strip()
-                raise ValueError(f"Snapshot Git {arguments[0]} failed: {message or process.returncode}")
+                raise _GitStatusError(f"Snapshot Git {arguments[0]} failed: {message or process.returncode}")
             return bytes(output)
         except subprocess.TimeoutExpired as error:
             raise ValueError("Snapshot Git operation exceeded its deadline") from error
@@ -156,9 +162,26 @@ def _repository(root, require_head=True):
         raise ValueError("Snapshot transfer refuses unresolved merges")
     if _git(root, "config", "--bool", "--get", "core.sparseCheckout", statuses=(0, 1)).strip() == b"true":
         raise ValueError("Snapshot transfer refuses sparse checkouts")
-    entries = _git(root, "ls-files", "--stage", "-z").split(b"\0")
-    if any(entry.startswith((b"160000 ", b"120000 ")) for entry in entries):
-        raise ValueError("Snapshot transfer refuses indexed submodules and symlinks")
+    prefix, invalid_record, invalid_mode = bytearray(), False, False
+
+    def inspect_modes(chunk):
+        nonlocal invalid_record, invalid_mode
+        for value in chunk:
+            if value == 0:
+                if len(prefix) != 7:
+                    invalid_record = True
+                prefix.clear()
+            elif len(prefix) < 7:
+                prefix.append(value)
+                if len(prefix) == 7 and prefix not in (b"100644 ", b"100755 "):
+                    invalid_mode = True
+
+    # Finish bounded Git cleanup before reporting a mode refusal; transport failures still propagate.
+    _git(root, "ls-files", "--stage", "-z", stdout_consumer=inspect_modes)
+    if prefix or invalid_record:
+        raise ValueError("Git index returned malformed or unterminated mode metadata")
+    if invalid_mode:
+        raise ValueError("Snapshot transfer requires indexed regular files; submodules and symlinks are refused")
     return root
 
 
@@ -211,7 +234,7 @@ def _bind(root, task_id, commit):
         return
     try:
         _git(root, "update-ref", "--no-deref", reference, commit, "0" * len(commit))
-    except ValueError:
+    except _GitStatusError:
         if _git(root, "rev-parse", "--verify", "--quiet", reference, statuses=(0, 1)).strip() != commit.encode():
             raise ValueError("Snapshot task is already bound or its ref could not be persisted") from None
 

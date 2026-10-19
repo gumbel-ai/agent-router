@@ -189,6 +189,79 @@ class RemoteSnapshotTests(unittest.TestCase):
         self.assertFalse(marker.exists())
         self.assertEqual(git(self.source, "show", f"{receipts[0]['snapshot_commit']}:code.txt"), "source initial\n")
 
+    def test_persisted_ref_does_not_hide_unconfirmed_git_cleanup(self):
+        receipt = self.export(task="uncertain-import")
+        bundle = self.artifacts / "snapshot.bundle"
+        original_popen = subprocess.Popen
+        for direction, repository, task in (("export", self.source, "uncertain-export"),
+                                             ("import", self.target, "uncertain-import")):
+            with self.subTest(direction=direction):
+                reference = f"refs/router/snap/{task}"
+                reaped, commits = threading.Event(), []
+
+                def launch(command, reference=reference, reaped=reaped, commits=commits, **options):
+                    process = original_popen(command, **options)
+                    if command[-5:-3] != ["update-ref", "--no-deref"] or command[-3] != reference:
+                        return process
+                    commits.append(command[-2])
+                    original_wait, waited = process.wait, []
+
+                    def wait(timeout=None):
+                        if timeout is None:
+                            try:
+                                return original_wait()
+                            finally:
+                                reaped.set()
+                        if not waited:
+                            waited.append(True)
+                            return original_wait(timeout=timeout)
+                        raise subprocess.TimeoutExpired(command, timeout)
+
+                    process.wait = wait
+                    return process
+
+                try:
+                    with patch.object(remote_snapshot.subprocess, "Popen", side_effect=launch), \
+                            self.assertRaises(ValueError) as failure:
+                        if direction == "export":
+                            remote_snapshot.export_snapshot(repository, task, self.root / task, ["code.txt"])
+                        else:
+                            remote_snapshot.import_snapshot(repository, receipt, bundle)
+                    self.assertIn("termination is unconfirmed", str(failure.exception))
+                finally:
+                    self.assertTrue(reaped.wait(15), "Controlled Git cleanup did not finish")
+                    self.assertEqual(len(commits), 1)
+                    self.assertEqual(git(repository, "rev-parse", reference).strip(), commits[0])
+
+    def test_large_repository_index_allows_small_snapshots_and_refuses_unsupported_modes(self):
+        receipt = self.export()
+        bundle = self.artifacts / "snapshot.bundle"
+        for direction, repository in (("export", self.source), ("import", self.target)):
+            with self.subTest(direction=direction):
+                blob = git(repository, "rev-parse", "HEAD:code.txt").strip()
+                entries = b"".join(f"{100644 if index % 2 else 100755} {blob}\tindexed-{index:05d}-example.txt\0".encode()
+                                   for index in range(10000))
+                subprocess.run(["git", "-C", str(repository), "update-index", "-z", "--index-info"],
+                               input=entries, capture_output=True, check=True)
+                self.assertGreater(len(git(repository, "ls-files", "--stage", "-z", binary=True)),
+                                   remote_snapshot.MAX_METADATA_BYTES)
+
+                def transfer(direction=direction, repository=repository):
+                    if direction == "export":
+                        return remote_snapshot.export_snapshot(repository, "large-export", self.root / "large-export", ["code.txt"])
+                    return remote_snapshot.import_snapshot(repository, receipt, bundle)
+
+                result = transfer()
+                self.assertEqual(git(repository, "ls-tree", "--name-only", result["snapshot_commit"]).splitlines(), ["code.txt"])
+                for mode, object_id in (("120000", blob), ("160000", git(repository, "rev-parse", "HEAD").strip())):
+                    with self.subTest(direction=direction, mode=mode):
+                        git(repository, "update-index", "--add", "--cacheinfo", f"{mode},{object_id},zz-unsupported")
+                        try:
+                            with self.assertRaises(ValueError):
+                                transfer()
+                        finally:
+                            git(repository, "update-index", "--force-remove", "zz-unsupported")
+
     def test_parented_unsafe_or_extra_object_bundles_are_rejected_before_import(self):
         receipt = self.export()
         original_commit = git(self.source, "cat-file", "commit", receipt["snapshot_commit"], binary=True)

@@ -15,6 +15,8 @@ Git operations; unrelated user/system settings remain disabled. Git selects its
 normal XDG ignore-file default when no explicit path is configured.
 Missing/deleted files must be absent from the selection. Indexed symlinks,
 submodules, unresolved merges and sparse checkouts are unsupported and refused.
+Repository admission streams index modes with fixed-size parser state, so unrelated
+tracked-file counts and path lengths do not consume the selected snapshot's budget.
 
 Selected files are read as raw bytes with bounded, no-follow reads and change
 detection. Git clean filters, hooks and fsmonitor do not run. A temporary index
@@ -74,6 +76,8 @@ disabled. Validation does not check out files or integrate anything.
 
 Failed export may leave unreachable Git objects or an immutable snapshot ref;
 failed import may leave validated objects before a conflicting ref is refused.
+An uncertain Git timeout or cleanup remains an error even if its ref was persisted;
+only a confirmed Git status failure can recover from a matching concurrent ref.
 Neither outcome authorizes a command launch. Retry only the same immutable transfer
 identity when appropriate; never use a transfer error to rerun a command or fall
 back to local execution. A separate end-to-end origin request binding and durable
