@@ -534,10 +534,12 @@ class Controller:
         if not self.settings.delegation_enabled and (operation == "start" or
                 operation == "review" and payload.get("outcome") in {"rejected", "continue"}):
             raise ValueError("External delegation is not configured; run router init in the project")
+        # SSH runs here, outside the lifecycle lock and every DB transaction.
+        forwarded = operation != "start" and self.forward_unlocked(operation, payload)
         with self.lifecycle_lock:
             if self.draining:
                 raise ValueError("Router is stopping for maintenance; retry after it restarts")
-            result = self.mutate(operation, payload)
+            result = self.mutate(operation, payload, forwarded)
         self.changed.set()
         return public(result, self.store)
 
@@ -681,6 +683,11 @@ class Controller:
             if replay:
                 if tuple(replay) != (operation, encoded):
                     raise ValueError("Remote request_id was already used with another payload")
+                if operation == "close" and task.get("cleanup_pending"):
+                    # Mirrors local close replay: retry cleanup; the parent waits for the new result.
+                    task.update(cleanup_requested=True, cleanup_error=None)
+                    self.store.put(db, task)
+                    self.changed.set()
                 return public(task, history=self.store.history(task_id, db))
             if operation == "review":
                 self.review(task, checked)
@@ -748,7 +755,7 @@ class Controller:
                            (session, request_id, operation, encoded, row[0], actor))
         return {"authorized": True, "request_id": request_id}
 
-    def mutate(self, operation: str, payload: dict) -> dict:
+    def mutate(self, operation: str, payload: dict, forwarded: bool = False) -> dict:
         request_id = required_text(payload, "request_id")
         encoded = canonical(payload)
         with self.store.transaction() as db:
@@ -788,16 +795,14 @@ class Controller:
                 if "work_item_id" in payload:
                     task["work_item_id"] = payload["work_item_id"]
             elif operation == "review":
-                if task.get("remote_host"):
-                    self.forward_remote(task, operation, payload)
+                self.require_forwarded(task, forwarded)
                 self.review(task, payload)
             elif operation == "cancel":
                 if set(payload) - {"task_id", "request_id"}:
                     raise ValueError("Unknown cancel field")
                 if task["status"] in {"accepted", "integrated", "closed"}:
                     raise ValueError("Finalize accepted work through close")
-                if task.get("remote_host"):
-                    self.forward_remote(task, operation, payload)
+                self.require_forwarded(task, forwarded)
                 task.update(cancel_requested=True, cancel_requested_at=now_ms())
                 if task["status"] in {"created", "retrying", "awaiting_review", "blocked", "failed", "cancelled"} and task["execution_stopped"] \
                         and not task.get("remote_task_id"):  # a sent remote task waits for remote confirmation
@@ -805,13 +810,46 @@ class Controller:
                 else:
                     task["status"] = "cancelling"
             else:
-                if task.get("remote_host"):
-                    self.forward_remote(task, operation, payload)
+                self.require_forwarded(task, forwarded)
                 self.close(task, payload)
             self.store.put(db, task)
             db.execute("UPDATE authorizations SET consumed=1 WHERE session_id=? AND request_id=?", (session, request_id))
             db.execute("INSERT INTO operations VALUES(?,?,?,?,?)", (session, request_id, operation, encoded, task["task_id"]))
             return task
+
+    def forward_unlocked(self, operation: str, payload: dict) -> bool:
+        """Send a remote review/cancel/close before ``mutate`` records it; True when sent.
+
+        The serving Router binds each request_id, so a lost reply is settled by
+        replaying the same request; the parent records nothing until a reply.
+        """
+        request_id = required_text(payload, "request_id")
+        with self.store.snapshot() as db:
+            task = self.store.get(required_text(payload, "task_id"), db)
+            if not task.get("remote_host"):
+                return False
+            session = task["session_id"]
+            if db.execute("SELECT 1 FROM operations WHERE session_id=? AND request_id=?", (session, request_id)).fetchone():
+                return False  # mutate() answers the replay
+            authorization = db.execute("SELECT * FROM authorizations WHERE session_id=? AND request_id=?",
+                                       (session, request_id)).fetchone()
+        if (authorization is None or authorization["consumed"] or authorization["operation"] != operation
+                or authorization["payload"] != canonical(payload)):
+            raise ValueError("Missing matching single-use dispatch authorization")
+        with self.lifecycle_lock:
+            if self.draining:
+                raise ValueError("Router is stopping for maintenance; retry after it restarts")
+        if operation == "cancel":
+            if set(payload) - {"task_id", "request_id"}:
+                raise ValueError("Unknown cancel field")
+            if task["status"] in {"accepted", "integrated", "closed"}:
+                raise ValueError("Finalize accepted work through close")
+        return self.forward_remote(task, operation, payload) is not None
+
+    @staticmethod
+    def require_forwarded(task: dict, forwarded: bool) -> None:
+        if task.get("remote_host") and not forwarded and (task.get("remote_task_id") or not task["execution_stopped"]):
+            raise ValueError("Remote task state changed before forwarding; replay the request")
 
     def forward_remote(self, task: dict, operation: str, payload: dict) -> dict | None:
         """Commit review/close remotely before changing the parent's state."""
@@ -1643,6 +1681,8 @@ class Runtime:
             task = self.store.get(task_id)
             if "worktree" in task:
                 cleanup(Path(task["invocation"]["parent_worktree"]), task)
+            if task.get("remote_task_id"):
+                self.clean_remote(task)
             self.store.update(task_id, lambda t: t.update(cleanup_pending=False, cleanup_error=None, artifacts_removed_at=now_ms()))
         except Exception as error:
             LOGGER.exception("Task cleanup failed: %s", task_id)
@@ -1650,6 +1690,40 @@ class Runtime:
             self.store.update(task_id, lambda t: t.update(cleanup_error=message))
         finally:
             self.retired(task_id)
+
+    def clean_remote(self, task: dict) -> None:
+        """Wait for the serving Router's cleanup; its failure becomes the parent's cleanup_error."""
+        from router.fleet import DEFAULT_CONFIG, load_fleet_config
+        from router.remote_child import RemoteChildError, RemoteChildTransport
+        config = load_fleet_config(DEFAULT_CONFIG)
+        hosts = [host for host in config.hosts if host.name == task["remote_host"] and host.transport == "ssh"]
+        if len(hosts) != 1:
+            raise ValueError("Remote host is no longer configured; remote cleanup unconfirmed")
+        transport = RemoteChildTransport(hosts[0], config.ssh_timeout_seconds)
+        with self.store.snapshot() as db:
+            close = db.execute("SELECT payload FROM operations WHERE task_id=? AND operation='close'",
+                               (task["task_id"],)).fetchone()
+        retried = False
+        deadline = time.monotonic() + 60
+        try:
+            while True:
+                remote = transport.status(task["session_id"], task["invocation"]["request_id"])
+                if remote.get("status") != "closed":
+                    raise ValueError("Remote task is not closed; remote cleanup unconfirmed")
+                if not remote.get("cleanup_pending"):
+                    return
+                if remote.get("cleanup_error") is not None:
+                    if retried or close is None:
+                        raise ValueError(f"Remote cleanup failed: {str(remote['cleanup_error'])[:500]}")
+                    # Replaying the original close makes the serving Router retry its cleanup.
+                    transport.close({**json.loads(close[0]), "task_id": task["remote_task_id"]})
+                    retried = True
+                    continue
+                if time.monotonic() > deadline:
+                    raise ValueError("Remote cleanup did not finish before its deadline")
+                time.sleep(.5)
+        except RemoteChildError as error:
+            raise ValueError(f"Remote cleanup unconfirmed: {error}") from error
 
     def stop(self) -> None:
         self.stopping.set()

@@ -1,5 +1,6 @@
 import base64
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -7,6 +8,8 @@ from unittest.mock import patch
 
 from router import remote_child
 from router.daemon import Controller, PhaseStopped, Runtime
+from router.db import Store
+from router.dispatch import canonical
 from router.fleet import FleetHost
 
 
@@ -351,6 +354,78 @@ class RemoteChildProtocolTests(unittest.TestCase):
         self.assertTrue(task["execution_stopped"])
         self.assertEqual(task["remote_task_id"], "task-a")
         self.assertEqual(task["final_tree"], "a" * 40)
+
+
+    def remote_store(self, task: dict) -> Store:
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        store = Store(Path(directory.name) / "router.db")
+        task = {"session_id": "S", "remote_host": "worker", "remote_task_id": "task-a", "attempts": 1,
+                "review_history": [], "created_at": 1, "invocation": {**self.invocation, "request_id": "start"},
+                **task}
+        with store.transaction() as db:
+            store.put(db, task)
+        return store
+
+    def test_remote_forward_runs_outside_db_transaction_and_lifecycle_lock(self):
+        controller = Controller.__new__(Controller)
+        controller.settings = SimpleNamespace(delegation_enabled=True, max_attempts=3)
+        controller.lifecycle_lock = threading.Lock()
+        controller.changed = threading.Event()
+        controller.draining = False
+        controller.store = self.remote_store({"task_id": "task-a", "status": "running", "execution_stopped": False})
+        payload = {"task_id": "task-a", "request_id": "cancel-a"}
+        with controller.store.transaction() as db:
+            db.execute("INSERT INTO authorizations(session_id,request_id,operation,payload,instruction_id) VALUES(?,?,?,?,?)",
+                       ("S", "cancel-a", "cancel", canonical(payload), "instruction-a"))
+        observed = []
+
+        def forward(_task, operation, _payload):
+            # Another writer and lifecycle admission proceed while SSH is in flight.
+            observed.append(controller.lifecycle_lock.acquire(blocking=False))
+            controller.lifecycle_lock.release()
+            with controller.store.transaction(timeout=.5) as db:
+                db.execute("SELECT 1")
+            return {"status": "cancelling", "task_id": "task-a"}
+
+        with patch.object(Controller, "forward_remote", side_effect=forward):
+            result = controller.handle("cancel", payload)
+        self.assertEqual(observed, [True])
+        self.assertEqual(result["status"], "cancelling")
+        with controller.store.snapshot() as db:
+            self.assertIsNotNone(db.execute("SELECT 1 FROM operations WHERE request_id='cancel-a'").fetchone())
+
+    def test_remote_cleanup_failure_is_projected_after_one_retry(self):
+        store = self.remote_store({"task_id": "task-a", "status": "closed", "execution_stopped": True,
+                                   "cleanup_pending": True})
+        close = {"task_id": "task-a", "request_id": "close-a", "disposition": "discarded"}
+        with store.transaction() as db:
+            db.execute("INSERT INTO operations VALUES(?,?,?,?,?)", ("S", "close-a", "close", canonical(close), "task-a"))
+        closes = []
+
+        class Transport:
+            def __init__(self, _host, _timeout):
+                pass
+
+            def status(self, _session_id, _request_id):
+                return {"status": "closed", "task_id": "task-a", "cleanup_pending": True, "cleanup_error": "busy"}
+
+            def close(self, payload):
+                closes.append(payload)
+                return {"status": "closed", "task_id": "task-a"}
+
+        runtime = Runtime.__new__(Runtime)
+        runtime.store = store
+        runtime.workers, runtime.lock = {}, threading.Lock()
+        runtime.control = SimpleNamespace(changed=threading.Event())
+        config = SimpleNamespace(hosts=(FleetHost("worker", "ssh", target="example"),), ssh_timeout_seconds=1)
+        with patch("router.fleet.load_fleet_config", return_value=config), \
+                patch("router.remote_child.RemoteChildTransport", Transport):
+            runtime.clean("task-a")
+        self.assertEqual(closes, [close])
+        task = store.get("task-a")
+        self.assertTrue(task["cleanup_pending"])
+        self.assertEqual(task["cleanup_error"], "Remote cleanup failed: busy")
 
 
 if __name__ == "__main__":
