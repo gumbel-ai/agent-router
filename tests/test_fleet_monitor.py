@@ -2430,7 +2430,8 @@ required = false
             self.assertEqual(ssh_snapshot(host, 15)["host"]["host_id"], "host-1")
         self.assertIsNotNone(launched[0].poll())
 
-        def run_script(source, timeout=.2):
+        # Output/error cases must allow interpreter startup; only the timeout case uses a short budget.
+        def run_script(source, timeout=15):
             processes = []
             def replacement(command, **kwargs):
                 process = actual_popen([sys.executable, "-c", source], **kwargs)
