@@ -250,6 +250,14 @@ class RemoteChildProtocolTests(unittest.TestCase):
         load.assert_not_called()
         self.assertEqual(task["status"], "awaiting_review")
 
+    def test_known_unsent_task_closes_without_fleet_config(self):
+        controller = Controller.__new__(Controller)
+        task = {"task_id": "task-a", "remote_host": "worker", "status": "failed", "execution_stopped": True}
+        with patch("router.fleet.load_fleet_config", side_effect=ValueError("Invalid fleet TOML")) as load:
+            self.assertIsNone(controller.forward_remote(task, "close", {"task_id": "task-a", "request_id": "r",
+                                                                        "disposition": "discarded"}))
+        load.assert_not_called()
+
     def test_restart_reconciles_interrupted_remote_task(self):
         task = {"task_id": "task-a", "remote_host": "worker", "status": "interrupted",
                 "execution_stopped": False}

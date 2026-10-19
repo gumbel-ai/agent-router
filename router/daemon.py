@@ -813,13 +813,15 @@ class Controller:
             db.execute("INSERT INTO operations VALUES(?,?,?,?,?)", (session, request_id, operation, encoded, task["task_id"]))
             return task
 
-    def forward_remote(self, task: dict, operation: str, payload: dict) -> None:
+    def forward_remote(self, task: dict, operation: str, payload: dict) -> dict | None:
         """Commit review/close remotely before changing the parent's state."""
         # Refuse a locally invalid transition before any remote mutation.
         if operation == "review":
             self.review(copy.deepcopy(task), payload)
         elif operation == "close":
             self.close(copy.deepcopy(task), payload)
+        if not task.get("remote_task_id") and task["execution_stopped"]:
+            return None  # The start was never sent; no remote task or config needed.
         from router.fleet import DEFAULT_CONFIG, load_fleet_config
         from router.remote_child import RemoteChildTransport
         host_name = task["remote_host"]
@@ -827,19 +829,16 @@ class Controller:
         hosts = [host for host in config.hosts if host.name == host_name]
         if len(hosts) != 1:
             raise ValueError("Remote task host is no longer configured; parent state unchanged")
-        if not task.get("remote_task_id") and task["execution_stopped"]:
-            return  # The start was never sent; there is no remote task to control.
         forwarded = dict(payload)
         # The snapshot task identity is the parent task_id on both hosts, so a
         # possibly admitted start whose reply was lost is still addressable.
         forwarded["task_id"] = task.get("remote_task_id", task["task_id"])
         transport = RemoteChildTransport(hosts[0], config.ssh_timeout_seconds)
         if operation == "review":
-            transport.review(forwarded)
-        elif operation == "cancel":
-            transport.cancel(forwarded)
-        else:
-            transport.close(forwarded)
+            return transport.review(forwarded)
+        if operation == "cancel":
+            return transport.cancel(forwarded)
+        return transport.close(forwarded)
 
     @staticmethod
     def envelope(payload: dict) -> None:
