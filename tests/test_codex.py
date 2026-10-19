@@ -36,7 +36,7 @@ class CodexTelemetryTests(unittest.TestCase):
         self.assertEqual(actual["CODEX_HOME"], environment["CODEX_HOME"])
 
     def test_opencode_child_uses_task_worktree_in_pwd(self):
-        environment = {"PWD": "/mnt/lab/stock-trading", "PATH": "/usr/bin"}
+        environment = {"PWD": "/parent/checkout", "PATH": "/usr/bin"}
         task = {"executor": "opencode", "worktree": "/tmp/router-child",
                 "permission_profile": {"*": "deny", "read": "allow"}}
         actual = child_environment(environment, task)
