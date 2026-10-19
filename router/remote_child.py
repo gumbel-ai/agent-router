@@ -90,13 +90,15 @@ def _receipt(value: object) -> dict:
 
 
 def _start_payload(payload: dict) -> dict:
-    if not isinstance(payload, dict) or set(payload) != {
-            "session_id", "request_id", "invocation", "resolved_model", "remote_repo", "remote_worktree",
-            "snapshot_receipt", "snapshot_base64", "tracing_requested"}:
+    required = {"session_id", "request_id", "invocation", "resolved_model", "remote_repo", "remote_worktree",
+                "snapshot_receipt", "snapshot_base64"}
+    # tracing_requested is optional so parents and serving Routers from before it
+    # existed still interoperate; absent means not requested.
+    if not isinstance(payload, dict) or set(payload) - {"tracing_requested"} != required:
         raise ValueError("Remote start has invalid fields")
     # Only the parent's request crosses SSH; the serving Router applies its own
     # repository tracing selection and startup credentials.
-    if type(payload["tracing_requested"]) is not bool:
+    if type(payload.get("tracing_requested", False)) is not bool:
         raise ValueError("Remote start tracing_requested must be a boolean")
     _text(payload["session_id"], "session_id")
     _text(payload["request_id"], "request_id")
@@ -124,7 +126,7 @@ def _start_payload(payload: dict) -> dict:
     receipt = payload["snapshot_receipt"]
     if len(bundle) != receipt["byte_count"]:
         raise ValueError("Remote snapshot bytes do not match the receipt")
-    return {**payload, "snapshot_bytes": bundle}
+    return {**payload, "tracing_requested": payload.get("tracing_requested", False), "snapshot_bytes": bundle}
 
 
 def _control_payload(operation: str, payload: dict) -> dict:
@@ -274,8 +276,10 @@ class RemoteChildTransport:
                    "resolved_model": resolved_model,
                    "remote_repo": remote_repo, "remote_worktree": remote_worktree,
                    "snapshot_receipt": snapshot_receipt,
-                   "snapshot_base64": base64.b64encode(snapshot_bundle).decode("ascii"),
-                   "tracing_requested": tracing_requested}
+                   "snapshot_base64": base64.b64encode(snapshot_bundle).decode("ascii")}
+        if tracing_requested:
+            # Sent only when requested, so an older serving Router still accepts untraced starts.
+            payload["tracing_requested"] = True
         # Validate and decode locally, but keep the wire payload base64 encoded.
         # Passing the decoded ``snapshot_bytes`` result to ``canonical`` would
         # fail before the SSH request is sent because bytes are not JSON values.

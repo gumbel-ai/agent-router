@@ -125,8 +125,10 @@ session/message/model/token records with its Langfuse generation and confirmed t
 three `resourceAttributes.router.*` values. Requested OpenCode tracing is recorded
 as `available: true` only when the required Langfuse public and secret keys are
 present in the startup environment; otherwise the route remains visible with
-`available: false` and an explicit credential diagnostic. A real remote-child
-trace has not yet been verified.
+`available: false` and an explicit credential diagnostic. A live remote check ran
+a Codex child on a Linux host over SSH from a parent on another machine; Langfuse
+received its trace with the parent's Router task ID, the serving host ID and the
+work-item ID.
 
 ## Explicit Claude candidate (live verification required)
 
