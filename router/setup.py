@@ -222,7 +222,9 @@ def init(args) -> None:
     timeout = choice(args.timeout, config.attempt_timeout_seconds, 600, "Per-attempt timeout seconds", float)
     attempts = choice(args.attempts, config.max_attempts, 3, "Maximum launches per task", int)
     profile = sandbox if args.executor == "codex" else permission if permission is not None else "existing opencode.json permissions"
-    tracing = "requested (recorded unavailable until a verified route exists)" if args.tracing else "off"
+    tracing = ("requested (OpenCode plugin route; live export and correlation remain unverified)"
+               if args.tracing and args.executor == "opencode"
+               else "requested (route unavailable for this executor)" if args.tracing else "off")
     confirm(f"Enable {args.executor} delegation for {repo} with {model}, permissions {profile}, setup {setup_command!r}, "
             f"limits {cap}/{timeout}s/{attempts}, and child tracing {tracing}?", args.yes)
     initialize(repo, model, setup_command, permission, cap, timeout, attempts, executor=args.executor, sandbox=sandbox,

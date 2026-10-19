@@ -17,6 +17,7 @@ from pathlib import Path
 
 from router.capacity import CapacitySampler
 from router.child import (
+    OPENCODE_LANGFUSE_PLUGIN,
     TRACING_UNAVAILABLE,
     child_environment,
     executor_command,
@@ -859,11 +860,15 @@ class Runtime:
         if configured is None or repo not in {root, common.parent}:
             raise ValueError("Repository/worktree is not an operator-configured target")
         tracing = {}
-        if "tracing" in configured:
+        tracing_requested = "tracing" in configured
+        if tracing_requested:
             if configured["tracing"] != "requested":
                 raise ValueError("Repository tracing must be exactly \"requested\" when present")
-            # Recorded, never silently dropped: the child runs with Router's usual isolation and counters.
-            tracing = {"tracing": {"requested": True, "available": False, "reason": TRACING_UNAVAILABLE[executor]}}
+            if executor in TRACING_UNAVAILABLE:
+                # Recorded, never silently dropped: these children run with their
+                # user/plugin configuration disabled, so credentials are stripped.
+                tracing = {"tracing": {"requested": True, "available": False,
+                                        "reason": TRACING_UNAVAILABLE[executor]}}
         if executor == "codex":
             sandbox = configured.get("codex_sandbox")
             if sandbox not in {"read-only", "workspace-write"}:
@@ -902,9 +907,20 @@ class Runtime:
             return all(noninteractive(v) for v in value.values()) if isinstance(value, dict) else value in {"allow", "deny"}
         if not isinstance(permission, dict) or not permission or not noninteractive(permission):
             raise ValueError("Permission profile must explicitly use allow/deny, never ask")
+        child_session_id = "ses" + uuid.uuid4().hex
+        if tracing_requested:
+            # The plugin route is configured for the child, but live export and
+            # Router-to-Langfuse correlation have not been reconciled yet. Keep
+            # this explicitly unavailable until an approved project proves both.
+            tracing = {"tracing": {"requested": True, "available": False,
+                                    "reason": "OpenCode plugin route is configured; live export and Router correlation are unverified",
+                                    "plugin": OPENCODE_LANGFUSE_PLUGIN,
+                                    "correlation": {"session_id": child_session_id,
+                                                     "router_task_id": task["task_id"],
+                                                     "host_id": self.control.host.host_id}}}
         return {"executor": "opencode", "requested_model": invocation["model"], "resolved_model": model,
                 "setup_command": configured["setup_command"], "permission_profile": permission,
-                "child_session_id": "ses" + uuid.uuid4().hex, **tracing}
+                "child_session_id": child_session_id, **tracing}
 
     def phase(self, task_id: str, name: str, command: list[str], cwd: Path, *, collecting: bool = False) -> dict:
         task = self.store.get(task_id)

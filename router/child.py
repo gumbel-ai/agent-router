@@ -48,12 +48,19 @@ def launch(command: list[str], cwd: Path, environment: dict[str, str], directory
             os.close(gate_write)
 
 
-# Why each runtime's own tracing plugin cannot run in a Router child. No route is
-# verified yet, so an opt-in is recorded as unavailable; Router never uploads traces.
+# These are the Langfuse plugin's documented environment inputs. Keep the allowlist
+# narrow: an off child must not inherit a credential or tracing identity by accident.
+LANGFUSE_ENVIRONMENT_KEYS = (
+    "LANGFUSE_PUBLIC_KEY", "LANGFUSE_SECRET_KEY", "LANGFUSE_BASE_URL", "LANGFUSE_BASEURL",
+    "LANGFUSE_ENVIRONMENT", "LANGFUSE_USER_ID",
+)
+OPENCODE_LANGFUSE_PLUGIN = "@langfuse/opencode-observability-plugin@0.5.0"
+
+# These runtimes deliberately discard their user/plugin configuration before launch.
+# Keep the reason explicit in the public task record until a supported route exists.
 TRACING_UNAVAILABLE = {
     "codex": "Codex children run with --ignore-user-config; tracing plugin hooks need trust from that ignored user layer",
     "claude": "Claude children run with --safe-mode and no setting sources; installed plugins and hooks do not load",
-    "opencode": "Router-launched OpenCode tracing has no verified route",
 }
 
 
@@ -102,8 +109,23 @@ def child_environment(environment: dict[str, str], task: dict) -> dict[str, str]
     for key in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR"):
         result.pop(key, None)
     result["PATH"] = str(worktree / ".venv" / "bin") + os.pathsep + environment.get("PATH", os.defpath)
+    # Langfuse credentials and identity are opt-in child inputs. Remove every
+    # LANGFUSE_* variable first, then restore only the documented values for the
+    # verified OpenCode route. This also protects Codex/Claude when their
+    # repository tracing flag is present.
+    for key in tuple(result):
+        if key.startswith("LANGFUSE_"):
+            result.pop(key, None)
     if task["executor"] == "opencode":
-        result["OPENCODE_CONFIG_CONTENT"] = json.dumps({"permission": task["permission_profile"]})
+        tracing = task.get("tracing", {})
+        requested = isinstance(tracing, dict) and tracing.get("requested") is True
+        config = {"permission": task["permission_profile"]}
+        if requested:
+            config["plugins"] = [OPENCODE_LANGFUSE_PLUGIN]
+            for key in LANGFUSE_ENVIRONMENT_KEYS:
+                if key in environment:
+                    result[key] = environment[key]
+        result["OPENCODE_CONFIG_CONTENT"] = json.dumps(config, separators=(",", ":"))
     elif task["executor"] == "codex":
         for key in ("OPENCODE_CONFIG_CONTENT", "OPENAI_BASE_URL", "CODEX_API_KEY", "OPENAI_API_KEY"):
             result.pop(key, None)
