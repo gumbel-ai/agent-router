@@ -20,13 +20,19 @@ from router.child import (
     child_environment,
     executor_command,
     langfuse_credentials_available,
+    launch,
     router_otel_resource_attributes,
     strip_langfuse_environment,
 )
+from router.daemon import Runtime
 from router.snapshot import apply_delta, capture_final, prepare
 
 CLAUDE_MODEL = "anthropic/claude-sonnet-4-6"
 CLAUDE_PROFILE = {"tools": ["Read", "Edit", "Write"], "allow": ["Read", "Edit", "Write"]}
+TEST_CREDENTIALS = {"LANGFUSE_PUBLIC_KEY": "pk-test", "LANGFUSE_SECRET_KEY": "sk-test",
+                    "LANGFUSE_BASE_URL": "https://langfuse.invalid"}
+AVAILABLE_REASON = "OpenCode plugin export and Router correlation verified via OpenTelemetry resource attributes"
+UNAVAILABLE_REASON = "OpenCode route is verified, but required Langfuse credentials are unavailable"
 
 
 class TracingTests(RuntimeHarness, unittest.TestCase):
@@ -47,6 +53,31 @@ class TracingTests(RuntimeHarness, unittest.TestCase):
             self.config.models["test"] = CLAUDE_MODEL
             config["claude_permissions"] = json.dumps(CLAUDE_PROFILE)
         return config
+
+    def set_credentials(self, present):
+        for key in LANGFUSE_ENVIRONMENT_KEYS:
+            self.control.environment.pop(key, None)
+        if present:
+            self.control.environment.update(TEST_CREDENTIALS)
+
+    def expected_tracing(self, task, available):
+        return {"requested": True, "available": available,
+                "reason": AVAILABLE_REASON if available else UNAVAILABLE_REASON,
+                "plugin": OPENCODE_LANGFUSE_PLUGIN,
+                "correlation": {"session_id": task["child_session_id"], "router_task_id": task["task_id"],
+                                "host_id": self.control.host.host_id}}
+
+    def record_child_credentials(self, launched):
+        def recording_launch(command, cwd, environment, directory, register, *, disposable=False):
+            if directory.name == "child":
+                launched.append(langfuse_credentials_available(environment))
+            return launch(command, cwd, environment, directory, register, disposable=disposable)
+        return patch("router.daemon.launch", side_effect=recording_launch)
+
+    def reject(self, task_id, request_id):
+        self.mutate("review", {"task_id": task_id, "request_id": request_id, "expected_attempt": 1,
+                               "outcome": "rejected", "feedback": "Correct the result"})
+        return self.wait(task_id, {"awaiting_review", "failed", "interrupted"})
 
     def test_requested_tracing_records_route_and_keeps_native_counters(self):
         for executor in ("opencode", "codex", "claude"):
@@ -108,13 +139,97 @@ class TracingTests(RuntimeHarness, unittest.TestCase):
         config.pop("tracing")
         self.assertFalse(self.runtime._tracing_requested(task))
 
+    def test_resumed_attempt_refreshes_availability_and_keeps_earlier_attempt(self):
+        config = self.configure("opencode")
+        config["tracing"] = "requested"
+        for before, after in ((True, False), (False, True)):
+            with self.subTest(before=before, after=after):
+                launched = []
+                self.set_credentials(before)
+                with self.record_child_credentials(launched):
+                    task_id = self.start("traced", f"resume-{before}-{after}")
+                    first = self.wait(task_id, {"awaiting_review", "failed", "interrupted"})
+                    self.assertEqual(first["status"], "awaiting_review", first)
+                    # Models a daemon restart with a changed credential environment.
+                    self.set_credentials(after)
+                    second = self.reject(task_id, f"reject-{before}-{after}")
+                self.assertEqual(second["status"], "awaiting_review", second)
+                self.assertEqual(second["attempts"], 2)
+                self.assertEqual(launched, [before, after])
+                self.assertEqual(second["child_session_id"], first["child_session_id"])
+                self.assertEqual(first["tracing"], self.expected_tracing(first, before))
+                self.assertEqual(second["tracing"], self.expected_tracing(first, after))
+                self.assertEqual([attempt["tracing"] for attempt in second["attempt_history"]],
+                                 [self.expected_tracing(first, before), self.expected_tracing(first, after)])
+
+    def test_opt_out_during_capture_keeps_launch_evidence(self):
+        config = self.configure("opencode")
+        config["tracing"] = "requested"
+        self.set_credentials(True)
+        snapshot_phase = self.runtime.snapshot_phase
+
+        def opt_out_before_capture(task_id, action):
+            if action == "capture":
+                config.pop("tracing", None)
+            return snapshot_phase(task_id, action)
+
+        launched = []
+        with patch.object(self.runtime, "snapshot_phase", side_effect=opt_out_before_capture), \
+                self.record_child_credentials(launched):
+            task_id = self.start("traced", "capture-opt-out")
+            first = self.wait(task_id, {"awaiting_review", "failed", "interrupted"})
+            self.assertEqual(first["status"], "awaiting_review", first)
+            self.assertNotIn("tracing", config)
+            second = self.reject(task_id, "reject-after-opt-out")
+        expected = self.expected_tracing(first, True)
+        self.assertEqual(first["tracing"], expected)
+        self.assertEqual(first["attempt_history"][0]["tracing"], expected)
+        # The opted-out resumed launch fails closed; the completed launch keeps its evidence.
+        self.assertEqual(second["status"], "awaiting_review", second)
+        self.assertEqual(launched, [True, False])
+        self.assertNotIn("tracing", second)
+        self.assertEqual(second["attempt_history"][0]["tracing"], expected)
+        self.assertNotIn("tracing", second["attempt_history"][1])
+
+    def test_recovered_child_capture_keeps_original_launch_evidence(self):
+        config = self.configure("opencode")
+        config["tracing"] = "requested"
+        self.set_credentials(True)
+        snapshot_phase = self.runtime.snapshot_phase
+        before_capture = {}
+
+        def record_before_capture(task_id, action):
+            if action == "capture":
+                before_capture.update(self.control.store.get(task_id))
+            return snapshot_phase(task_id, action)
+
+        with patch.object(self.runtime, "snapshot_phase", side_effect=record_before_capture):
+            task_id = self.start("traced", "recovered-capture")
+            first = self.wait(task_id, {"awaiting_review", "failed", "interrupted"})
+        self.assertEqual(first["status"], "awaiting_review", first)
+        self.assertEqual(before_capture["phase"], "child")
+        expected = self.expected_tracing(first, True)
+        self.runtime.stop()
+        # Persisted state of a daemon that stopped after the child exited and before capture.
+        with self.control.store.transaction() as db:
+            self.control.store.put(db, {**before_capture, "execution_stopped": False})
+        config.pop("tracing")
+        self.set_credentials(False)
+        self.runtime = Runtime(self.control)
+        self.runtime.start()
+        self.addCleanup(self.runtime.stop)
+        recovered = self.wait(task_id, {"awaiting_review", "failed", "interrupted"})
+        self.assertEqual(recovered["status"], "awaiting_review", recovered)
+        self.assertEqual(recovered["tracing"], expected)
+        self.assertEqual(recovered["attempt_history"][0]["tracing"], expected)
+
     def test_runtime_phase_only_restores_credentials_for_the_executor_child(self):
         config = self.configure("opencode")
         config["tracing"] = "requested"
         self.control.environment.update({"LANGFUSE_PUBLIC_KEY": "pk-secret", "LANGFUSE_SECRET_KEY": "sk-secret"})
         task_id = "phase-tracing"
         task = {"task_id": task_id, "session_id": "S", "executor": "opencode", "status": "running",
-                "attempt_number": 1, "artifact_dir": str(self.root / "artifacts"), "deadline_at": 9_999_999_999_999,
+                "attempts": 0, "attempt_number": 1, "artifact_dir": str(self.root / "artifacts"), "deadline_at": 9_999_999_999_999,
                 "invocation": {"parent_worktree": str(self.repo)}, "worktree": str(self.root / "child"),
                 "permission_profile": {"*": "allow"}, "tracing": {"requested": True, "available": True,
                                                                          "correlation": {"session_id": "ses-child",
