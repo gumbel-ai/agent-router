@@ -62,7 +62,8 @@ class CorrelationTests(unittest.TestCase):
                                                      "parent_cli": "claude"})["instruction_id"]
         invocation = {"request_version": "1", "request_id": "request-a", "instruction_id": instruction,
                       "executor": "opencode", "model": "test", "task": "fixture-private-content",
-                      "parent_repo": str(self.project), "parent_worktree": str(self.project), "mode": "write"}
+                      "parent_repo": str(self.project), "parent_worktree": str(self.project), "mode": "write",
+                      "work_item_id": "batch  α"}
         self.router.handle("authorize", {"session_id": "parent  session", "prompt_id": "prompt-a",
                                           "operation": "start", "invocation": invocation})
         task = self.router.handle("start", invocation)
@@ -74,7 +75,8 @@ class CorrelationTests(unittest.TestCase):
         managed = {"managed_id": "managed-batch-job", "label": "fixture-private-content", "session_id": "session  a",
                    "agent_id": "worker  a", "attribution": "exact", "wrapper_pid": 1,
                    "wrapper_identity": "fixture-identity", "pid": 2, "pgid": 2,
-                   "executable": "codex", "argument_count": 1, "started_at": self.at}
+                   "executable": "codex", "argument_count": 1, "started_at": self.at,
+                   "work_item_id": "batch  β"}
         self.router.managed.start(managed)
         self.router.managed.finish({"managed_id": managed["managed_id"], "finished_at": self.at + 1,
                                     "elapsed_ms": 1, "exit_code": 0, "group_outlived": False,
@@ -100,12 +102,15 @@ class CorrelationTests(unittest.TestCase):
         self.assertEqual(records["router_task"]["parent_runtime"], "claude")
         self.assertEqual(records["router_task"]["router_task_id"], task["task_id"])
         self.assertEqual(records["attempt"]["attempt_number"], 1)
+        for kind in ("router_task", "attempt"):
+            self.assertEqual(records[kind]["work_item_id"], invocation["work_item_id"])
         self.assertIsNone(records["managed"].get("runtime"), "An executable or label cannot establish runtime")
         self.assertEqual(records["completion"]["event_id"], "completion-1")
         self.assertFalse(result["partial"], result["errors"])
         for kind in ("managed", "completion"):
             self.assertEqual(records[kind]["session_id"], "session  a")
             self.assertEqual(records[kind]["agent_id"], "worker  a")
+            self.assertEqual(records[kind]["work_item_id"], managed["work_item_id"])
         self.assertTrue(all(record["traced"] == "unknown" for record in result["records"]))
         paged, cursor = [], None
         for _ in range(len(result["records"])):
@@ -114,6 +119,8 @@ class CorrelationTests(unittest.TestCase):
             cursor = page["next_cursor"]
         self.assertIsNone(cursor)
         self.assertEqual(paged, result["records"])
+        restarted = Controller(settings(self.project), {}, self.root / "state")
+        self.assertEqual(restarted.handle("correlation", {})["records"], result["records"])
         with self.router.store.transaction() as db:
             db.execute("UPDATE completion_events SET data=NULL")
         tombstone = next(record for record in self.export()["records"] if record["kind"] == "completion")

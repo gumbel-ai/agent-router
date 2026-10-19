@@ -9,7 +9,7 @@ from pathlib import Path
 
 from pydantic import ValidationError
 
-from router.client import request
+from router.client import CompletionBusy, CompletionRefused, request
 from router.codex_plugin import availability as codex_availability
 from router.config import load_settings, socket_path, state_dir
 from router.dispatch import MUTATIONS
@@ -273,6 +273,7 @@ def main() -> None:
     run.add_argument("--label", help="Short name shown in status and fleet views")
     run.add_argument("--session", help="Launching Claude Code or Codex session ID")
     run.add_argument("--agent", help="Launching agent ID (with --session: exact attribution)")
+    run.add_argument("--work-item-id", help="Explicit caller work-item identity; never inferred from the label")
     run.add_argument("argv", nargs=argparse.REMAINDER, help="-- command [arguments]")
     wait = commands.add_parser("wait", help="Wait for the oldest unacknowledged managed-command completion")
     wait.add_argument("--consumer", required=True)
@@ -284,6 +285,7 @@ def main() -> None:
     ack.add_argument("--host-id")
     ack.add_argument("--event-host-id")
     ack.add_argument("--subscription-id")
+    ack.add_argument("--json-errors", action="store_true", help="Emit typed acknowledgment refusal JSON; retain exit code 1")
     consumer = commands.add_parser("consumer", help="Inspect and remove completion subscriptions")
     consumer_commands = consumer.add_subparsers(dest="consumer_command", required=True)
     consumer_list = consumer_commands.add_parser("list")
@@ -344,15 +346,16 @@ def main() -> None:
     uninstall.add_argument("--yes", action="store_true")
     service = commands.add_parser("service", help="Manage the explicitly installed user service")
     service.add_argument("action", choices=["start", "stop", "restart", "status"])
-    recover = commands.add_parser("recover", help="Interactively acknowledge an inspected Codex shutdown; daemon must be stopped")
+    recover = commands.add_parser("recover", help="Interactively acknowledge an inspected executor shutdown; daemon must be stopped")
     recover.add_argument("task_id")
     recover.add_argument("--reason", required=True, help="What was inspected and stopped; retained in task history")
     init = commands.add_parser("init", help="Opt this Git project into external delegation")
-    init.add_argument("--executor", choices=["opencode", "codex"], default="opencode")
+    init.add_argument("--executor", choices=["opencode", "codex", "claude"], default="opencode",
+                      help="Execution adapter; Claude configuration accepts one executable path without arguments")
     init.add_argument("--sandbox", choices=["read-only", "workspace-write"], help="Explicit Codex sandbox; required for noninteractive Codex init")
     init.add_argument("--model", help="alias=provider/exact-model")
     init.add_argument("--setup-command", help="Child dependency setup command; not run during init")
-    init.add_argument("--permissions", help="Explicit allow/deny JSON; never overwrites existing permissions")
+    init.add_argument("--permissions", help="Explicit executor permission JSON; never overwrites OpenCode permissions")
     init.add_argument("--concurrency", type=int)
     init.add_argument("--timeout", type=float)
     init.add_argument("--attempts", type=int)
@@ -400,7 +403,7 @@ def main() -> None:
         elif args.command == "run":
             from router.managed import run as run_managed
             argv = args.argv[1:] if args.argv[:1] == ["--"] else args.argv
-            sys.exit(run_managed(argv, args.label, args.session, args.agent, state_dir()))
+            sys.exit(run_managed(argv, args.label, args.session, args.agent, state_dir(), work_item_id=args.work_item_id))
         elif args.command == "wait":
             from router.managed import wait as wait_managed
             failure_code = 1
@@ -436,7 +439,14 @@ def main() -> None:
                 payload.update(host_id=args.host_id, event_host_id=args.event_host_id)
             if args.subscription_id is not None:
                 payload["subscription_id"] = args.subscription_id
-            print(json.dumps(request("completion_ack", payload), separators=(",", ":")))
+            try:
+                result = request("completion_ack", payload)
+            except (CompletionBusy, CompletionRefused) as error:
+                if args.json_errors:
+                    code = "database_busy" if isinstance(error, CompletionBusy) else "acknowledgment_refused"
+                    print(json.dumps({"schema_version": 1, **payload, "error": {"code": code}}, separators=(",", ":")))
+                raise
+            print(json.dumps(result, separators=(",", ":")))
         elif args.command == "consumer":
             operation, payload = (("completion_consumer_list", {"limit": args.limit, "offset": args.offset})
                                   if args.consumer_command == "list" else

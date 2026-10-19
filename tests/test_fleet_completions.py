@@ -2,8 +2,10 @@ import errno
 import io
 import json
 import os
+import selectors
 import shlex
 import signal
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -26,7 +28,41 @@ class FleetCompletionTests(unittest.TestCase):
         self.event = {'status': 'completed', 'consumer': 'batch-job', 'host_id': 'host-b', 'subscription_id': 'subscription-b',
                       'event': {'event_id': 'completion-1', 'host_id': 'producing-host',
                                 'managed_id': 'managed-job', 'status': 'exited', 'exit_code': 0,
-                                'group_outlived': False, 'session_id': 'session  a', 'agent_id': 'worker  a'}}
+                                'group_outlived': False, 'session_id': 'session  a', 'agent_id': 'worker  a',
+                                'work_item_id': 'batch  α'}}
+
+    def test_ack_error_requires_failed_transport_and_exact_structured_binding(self):
+        from router.fleet import SSHQueryError
+        from router.fleet_completions import acknowledge_completion
+
+        binding = {'consumer': 'batch-job', 'event_id': 'completion-1', 'host_id': 'host-b',
+                   'event_host_id': 'producing-host', 'subscription_id': 'subscription-b'}
+        envelope = {'schema_version': 1, **binding, 'error': {'code': 'database_busy'}}
+        rows = [(envelope, 1, 'database_busy'),
+                ({**envelope, 'error': {'code': 'acknowledgment_refused'}}, 1, 'acknowledgment_refused'),
+                ({**envelope, 'error': {'code': 'fixture-private-value'}}, 1, 'exit_failed'),
+                ({**envelope, 'schema_version': True}, 1, 'exit_failed'),
+                ({**envelope, 'acknowledged': True}, 1, 'exit_failed'),
+                ({**binding, 'acknowledged': True}, 1, 'exit_failed'),
+                (envelope, 2, 'exit_failed'), (envelope, 255, 'exit_failed'),
+                ({**envelope, 'extra': 'fixture-private-value'}, 1, 'exit_failed'),
+                ('malformed', 1, 'exit_failed'), (' ' * (16 * 1024 + 1), 1, 'exit_failed'),
+                ('[' * 2000 + ']' * 2000, 1, 'exit_failed')]
+        rows.extend(({**envelope, key: 'mismatched'}, 1, 'exit_failed') for key in binding)
+        for value, exit_code, expected in rows:
+            error = SSHQueryError('exit_failed', 'fixture-private-value', exit_code=exit_code)
+            error.stdout = value.encode() if isinstance(value, str) else json.dumps(value).encode()
+            with self.subTest(value=value, exit_code=exit_code), \
+                    patch('router.fleet_completions.ssh_stdout', side_effect=error):
+                result = acknowledge_completion(self.config, 'worker-b', **binding)
+                self.assertFalse(result['ok'])
+                self.assertIsNone(result['host_id'])
+                self.assertEqual(result['error'], {'code': expected, 'exit_code': exit_code,
+                                                   'acknowledgment': 'unknown'})
+                self.assertNotIn('fixture-private-value', canonical(result))
+        with patch('router.fleet_completions.ssh_stdout', return_value=json.dumps(envelope).encode()):
+            result = acknowledge_completion(self.config, 'worker-b', **binding)
+        self.assertEqual(result['error']['code'], 'invalid_response')
 
     def test_wait_preserves_identities_and_projects_remote_payloads(self):
         from router.fleet_completions import query_completions
@@ -66,7 +102,7 @@ class FleetCompletionTests(unittest.TestCase):
 
     def test_optional_metadata_degrades_without_hiding_durable_event_identity(self):
         from router.fleet_completions import query_completions
-        for field, value in (('session_id', 'bad\n'), ('agent_id', []), ('managed_id', 'bad\n'),
+        for field, value in (('session_id', 'bad\n'), ('agent_id', []), ('managed_id', 'bad\n'), ('work_item_id', 'bad\n'),
                              ('attribution', 'unsupported'), ('finished_at', True), ('uncertain_at', float('nan'))):
             raw = {**self.event, 'event': {**self.event['event'], field: value}}
             with self.subTest(field=field), patch('router.fleet_completions.ssh_stdout',
@@ -81,6 +117,7 @@ class FleetCompletionTests(unittest.TestCase):
 
     def test_cli_wait_and_host_bound_ack_have_explicit_exit_contracts(self):
         from router.cli import main
+        from router.client import CompletionBusy, CompletionRefused
         from router.fleet_completions import query_completions
         cases = [(['fleet', 'wait', '--consumer', 'batch-job', '--timeout', '15'], False, 0),
                  (['fleet', 'wait', '--consumer', 'batch-job', '--timeout', '15'], True, 1)]
@@ -136,6 +173,26 @@ class FleetCompletionTests(unittest.TestCase):
                 main()
             self.assertEqual(caught.exception.code, 130)
             self.assertIn('unknown', errors.getvalue())
+        local_args = ['ack', '--consumer=batch-job', '--host-id=host-b', '--event-host-id=producing-host',
+                      '--subscription-id=subscription-b', 'completion-1']
+        for error, error_code in ((CompletionBusy('fixture-private-value'), 'database_busy'),
+                                  (CompletionRefused('fixture-private-value'), 'acknowledgment_refused'),
+                                  (ValueError('fixture-private-value'), None)):
+            for flags in ([], ['--json-errors']):
+                with self.subTest(error_code=error_code, flags=flags), \
+                        patch('sys.argv', ['router', *local_args, *flags]), \
+                        patch('router.cli.request', side_effect=error), \
+                        redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()), \
+                        self.assertRaises(SystemExit) as caught:
+                    main()
+                self.assertEqual(caught.exception.code, 1)
+                if flags and error_code is not None:
+                    self.assertEqual(json.loads(output.getvalue()), {
+                        'schema_version': 1, 'consumer': 'batch-job', 'host_id': 'host-b',
+                        'event_host_id': 'producing-host', 'subscription_id': 'subscription-b',
+                        'event_id': 'completion-1', 'error': {'code': error_code}})
+                else:
+                    self.assertEqual(output.getvalue(), '')
 
     def test_duplicate_hosts_deadlines_and_invalid_arguments_remain_explicit(self):
         from router.fleet_completions import acknowledge_completion, query_completions
@@ -212,6 +269,9 @@ main()
                                    AGENT_ROUTER_SOCKET=str(endpoint), AGENT_ROUTER_ENV_FILE=str(root / "missing.env"),
                                    PYTHONPATH=str(Path(__file__).resolve().parents[1]),
                                    FIXTURE_PENDING=str(root / f"pending-{number}"))
+                home = root / f'home-{number}'
+                home.mkdir(exist_ok=True)
+                environment['HOME'] = str(home)
                 process = popen([sys.executable, "-c", launcher, f"--emulated-host-{number}"], env=environment,
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
                 processes.append((process, endpoint))
@@ -231,7 +291,7 @@ main()
                                            env=environments[number], cwd=project, capture_output=True, timeout=15, check=False)
                 self.assertEqual(completed.returncode, 0, completed.stderr.decode(errors="replace"))
                 return completed.stdout
-            drop, route = [False], [1]
+            drop, fail_after_reply, route = [False], [False], [1]
             def remote(command, **options):
                 arguments = shlex.split(" ".join(command[command.index("--") + 2:]))
                 self.assertEqual(arguments[0], "router")
@@ -239,6 +299,10 @@ main()
                     drop[0] = False
                     source = "import io,sys;sys.stdout=io.StringIO();from router.cli import main;main()"
                     argv = [sys.executable, "-c", source, *arguments[1:]]
+                elif fail_after_reply[0]:
+                    fail_after_reply[0] = False
+                    argv = [sys.executable, '-c', 'from router.cli import main;main();raise SystemExit(1)',
+                            *arguments[1:]]
                 else:
                     argv = [sys.executable, "-m", "router.cli", *arguments[1:]]
                 process = popen(argv, env=environments[route[0]], **options)
@@ -270,6 +334,49 @@ main()
                     def ack():
                         return acknowledge_completion(self.config, 'worker-b', 'batch-job', event_id,
                                                       '--emulated-host-1', '--emulated-host-1', remote_event['subscription_id'])
+                    connection = sqlite3.connect(root / 'state-1' / 'router.sqlite3')
+                    try:
+                        connection.execute('BEGIN IMMEDIATE')
+                        busy = ack()
+                        self.assertEqual(busy['error'], {'code': 'database_busy', 'exit_code': 1,
+                                                         'acknowledgment': 'unknown'})
+                        self.assertFalse(busy['ok'])
+                        self.assertIsNone(busy['host_id'])
+                        arguments = ['ack', '--consumer=batch-job', '--host-id=--emulated-host-1',
+                                     '--event-host-id=--emulated-host-1',
+                                     '--subscription-id=' + remote_event['subscription_id'], event_id]
+                        for flags in ([], ['--json-errors']):
+                            with popen([sys.executable, '-m', 'router.cli', *arguments, *flags],
+                                       env=environments[1], cwd=project,
+                                       stdout=subprocess.PIPE, stderr=subprocess.PIPE) as direct:
+                                try:
+                                    output, diagnostic = direct.communicate(timeout=15)
+                                except subprocess.TimeoutExpired:
+                                    direct.kill()
+                                    direct.communicate()
+                                    raise
+                            self.assertEqual(direct.returncode, 1, diagnostic)
+                            self.assertIn(b'Completion database is busy', diagnostic)
+                            if flags:
+                                self.assertEqual(json.loads(output)['error']['code'], 'database_busy')
+                            else:
+                                self.assertEqual(output, b'')
+                    finally:
+                        connection.rollback()
+                        connection.close()
+                    refusal = {'consumer': 'batch-job', 'event_id': event_id, 'host_id': '--emulated-host-1',
+                               'event_host_id': '--emulated-host-1', 'subscription_id': remote_event['subscription_id']}
+                    for field, value in (('consumer', 'unknown-consumer'), ('event_id', 'completion-999999'),
+                                         ('event_id', 'completion-2'), ('host_id', 'wrong-host'),
+                                         ('event_host_id', 'wrong-producer'), ('subscription_id', 'wrong-subscription')):
+                        with self.subTest(refused_field=field, value=value):
+                            refused = acknowledge_completion(self.config, 'worker-b', **{**refusal, field: value})
+                            self.assertEqual(refused['error'], {'code': 'acknowledgment_refused', 'exit_code': 1,
+                                                                'acknowledgment': 'unknown'})
+                            self.assertFalse(refused['ok'])
+                            self.assertIsNone(refused['host_id'])
+                    self.assertEqual(query_completions(self.config, 'batch-job', 15, only='worker-b')
+                                     ['hosts'][0]['result'], remote_event)
                     drop[0] = True
                     self.assertTrue(query_completions(self.config, 'batch-job', 15, only='worker-b')['partial'])
                     stop(*processes[1])
@@ -279,7 +386,7 @@ main()
                     route[0] = 0
                     refused = ack()
                     self.assertFalse(refused['ok'])
-                    self.assertEqual(refused['error']['code'], 'exit_failed')
+                    self.assertEqual(refused['error']['code'], 'acknowledgment_refused')
                     self.assertEqual(refused['error']['exit_code'], 1)
                     local_replay = query_completions(self.config, 'batch-job', 15, only='worker-a')
                     self.assertEqual(local_replay['hosts'][0]['result'], first['hosts'][0]['result'])
@@ -291,6 +398,11 @@ main()
                     self.assertFalse(ack()['ok'])
                     self.assertTrue(ack()['ok'])
                     self.assertTrue(ack()['ok'])
+                    fail_after_reply[0] = True
+                    failed_reply = ack()
+                    self.assertFalse(failed_reply['ok'])
+                    self.assertEqual(failed_reply['error'], {'code': 'exit_failed', 'exit_code': 1,
+                                                            'acknowledgment': 'unknown'})
                     second = query_completions(self.config, 'batch-job', 15, only='worker-b')['hosts'][0]['result']
                     self.assertNotEqual(second['event']['event_id'], event_id)
                     self.assertTrue(acknowledge_completion(self.config, 'worker-b', 'batch-job',
@@ -451,3 +563,157 @@ main()
             ssh_stdout(config.hosts[0], 15, ['wait'], cancelled=cancelled)
         self.assertEqual(caught.exception.code, 'interrupted')
         self.assertIsNotNone(processes[-1].poll())
+
+    def test_interrupting_active_collection_cancels_readers_without_stopping_work(self):
+        from router.fleet import SSHQueryError, ssh_stdout
+        from router.fleet_completions import query_completions
+        from router.managed import wait
+        from router.paths import PROJECT_MARKER, PROJECT_MARKER_CONTENT
+
+        with tempfile.TemporaryDirectory(prefix='ar-active-wait-') as temporary:
+            root = Path(temporary)
+            project, home = root / 'project', root / 'home'
+            project.mkdir()
+            home.mkdir()
+            (project / PROJECT_MARKER).write_text(json.dumps(PROJECT_MARKER_CONTENT))
+            environment = {key: value for key, value in os.environ.items()
+                           if key in {'PATH', 'LANG', 'LC_ALL', 'TMPDIR', 'SHELL', 'USER', 'LOGNAME'}}
+            environment.update(HOME=str(home), AGENT_ROUTER_STATE_DIR=str(root / 'state'),
+                               AGENT_ROUTER_SOCKET=str(root / 'missing.sock'),
+                               AGENT_ROUTER_ENV_FILE=str(root / 'missing.env'),
+                               PYTHONPATH=str(Path(__file__).resolve().parents[1]))
+            release, ready, signals, launches = [root / name for name in ('release', 'ready', 'signals', 'launches')]
+            source = ("import os,signal,time;from pathlib import Path\n"
+                      f"release,ready,signals,launches=map(Path,{[str(path) for path in (release, ready, signals, launches)]!r})\n"
+                      "launches.write_text(launches.read_text()+'x' if launches.exists() else 'x')\n"
+                      "def signaled(number,frame): signals.write_text(str(number))\n"
+                      "signal.signal(signal.SIGTERM,signaled);signal.signal(signal.SIGINT,signaled)\n"
+                      "temporary=ready.with_suffix('.tmp');temporary.write_text(str(os.getpid()));temporary.replace(ready)\n"
+                      "while not release.exists(): time.sleep(.02)\n")
+            popen = subprocess.Popen
+            command = popen([sys.executable, '-m', 'router.cli', 'run', '--', sys.executable, '-c', source],
+                            env=environment, cwd=project, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            readers, local_results, remote_errors, forced_cleanup, failures = [], [], [], [], []
+            local_ready, local_done, reader_waiting, remote_done, abort = [threading.Event() for _ in range(5)]
+            observed = {}
+            remote_ready, child_ready = root / 'reader-ready', root / 'child-ready'
+            child_source = ("import os,time;from pathlib import Path;"
+                            f"ready=Path({str(child_ready)!r});temporary=ready.with_suffix('.tmp');"
+                            "temporary.write_text(str(os.getpid()));temporary.replace(ready);time.sleep(60)")
+            reader_source = ("import signal,subprocess,sys,time;from pathlib import Path\n"
+                             f"child=subprocess.Popen([sys.executable,'-c',{child_source!r}])\n"
+                             "def stopped(number,frame):\n child.wait(timeout=15)\n raise SystemExit(0)\n"
+                             "signal.signal(signal.SIGTERM,stopped)\n"
+                             f"ready=Path({str(child_ready)!r})\n"
+                             "while not ready.exists(): time.sleep(.02)\n"
+                             f"Path({str(remote_ready)!r}).touch()\n"
+                             "time.sleep(60)\n")
+
+            def start_reader(arguments, **options):
+                process = popen([sys.executable, '-c', reader_source], env=environment, **options)
+                readers.append(process)
+                return process
+
+            def request(operation, payload, **options):
+                self.assertIn(operation, {'completion_subscribe', 'completion_next'})
+                binding = {'consumer': 'batch-job', 'host_id': 'host-a', 'subscription_id': 'subscription-a'}
+                if operation == 'completion_subscribe':
+                    return binding
+                local_ready.set()
+                # Release a broken cancellation path without waiting for the production deadline.
+                return ({**self.event, **binding} if abort.is_set() else {**binding, 'status': 'pending'})
+
+            def local_wait(*arguments, **options):
+                observed['cancelled'] = options['cancelled']
+                try:
+                    result = wait(*arguments, **options)
+                    local_results.append(result)
+                    return result
+                finally:
+                    local_done.set()
+
+            def remote_wait(*arguments, **options):
+                try:
+                    return ssh_stdout(*arguments, **options)
+                except SSHQueryError as error:
+                    remote_errors.append(error.code)
+                    raise
+                finally:
+                    remote_done.set()
+
+            class ActiveSelector(selectors.DefaultSelector):
+                def select(self, timeout=None):
+                    events = super().select(timeout)
+                    reader_waiting.set()
+                    return events
+
+            def interrupt_when_active():
+                deadline = time.monotonic() + 15
+                while not (local_ready.is_set() and reader_waiting.is_set() and remote_ready.exists()):
+                    if time.monotonic() >= deadline:
+                        failures.append('Both readers did not become active')
+                        break
+                    time.sleep(.02)
+                else:
+                    observed['interrupted_at'] = time.monotonic()
+                    os.kill(os.getpid(), signal.SIGINT)
+                    deadline = time.monotonic() + 15
+                    if all(event.wait(max(0, deadline - time.monotonic()))
+                           for event in (observed['cancelled'], local_done, remote_done)):
+                        return
+                    failures.append('Active readers did not observe cancellation')
+                forced_cleanup.append(True)
+                abort.set()
+                for process in readers:
+                    if process.poll() is None:
+                        os.killpg(process.pid, signal.SIGTERM)
+
+            injector = None
+            previous = signal.signal(signal.SIGINT, signal.default_int_handler)
+            try:
+                deadline = time.monotonic() + 15
+                while not ready.exists() and command.poll() is None and time.monotonic() < deadline:
+                    time.sleep(.02)
+                self.assertTrue(ready.exists(), 'Managed command did not become active')
+                managed_pid = int(ready.read_text())
+                with patch('router.fleet.subprocess.Popen', side_effect=start_reader), \
+                        patch('router.fleet.selectors.DefaultSelector', ActiveSelector), \
+                        patch('router.managed.request', side_effect=request), \
+                        patch('router.fleet_completions.wait', side_effect=local_wait), \
+                        patch('router.fleet_completions.ssh_stdout', side_effect=remote_wait):
+                    injector = threading.Thread(target=interrupt_when_active)
+                    injector.start()
+                    with self.assertRaises(KeyboardInterrupt):
+                        query_completions(self.config, 'batch-job', 60)
+                    elapsed = time.monotonic() - observed['interrupted_at']
+                    injector.join(timeout=15)
+                self.assertFalse(injector.is_alive())
+                self.assertEqual(failures, [])
+                self.assertEqual(forced_cleanup, [])
+                self.assertLess(elapsed, 15, 'Interruption waited for a host deadline')
+                self.assertEqual(local_results, [{'status': 'unavailable', 'consumer': 'batch-job',
+                                                 'host_id': 'host-a', 'subscription_id': 'subscription-a'}])
+                self.assertEqual(remote_errors, ['interrupted'])
+                self.assertEqual(len(readers), 1)
+                self.assertIsNotNone(readers[0].poll())
+                child = int(child_ready.read_text())
+                with self.assertRaises(ProcessLookupError):
+                    os.kill(child, 0)
+                self.assertIsNone(command.poll())
+                os.kill(managed_pid, 0)
+                self.assertFalse(signals.exists(), 'The managed command received a signal')
+                self.assertEqual(launches.read_text(), 'x')
+            finally:
+                abort.set()
+                release.touch()
+                if injector is not None:
+                    injector.join(timeout=30)
+                for process in readers:
+                    if process.poll() is None:
+                        os.killpg(process.pid, signal.SIGTERM)
+                    process.wait(timeout=15)
+                command.communicate(timeout=15)
+                signal.signal(signal.SIGINT, previous)
+            self.assertEqual(command.returncode, 0)
+            self.assertEqual(launches.read_text(), 'x')
+            self.assertFalse(signals.exists())

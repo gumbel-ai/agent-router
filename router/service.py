@@ -63,9 +63,9 @@ def recover(task_id: str, reason: str) -> dict:
             raise ValueError("Stop the daemon with router daemon stop before recovery") from error
         store = Store(database)
         task = store.get(task_id)
-        if (task.get("executor") != "codex" or task["status"] != "interrupted" or
+        if (task.get("executor") not in {"codex", "claude"} or task["status"] != "interrupted" or
                 task["execution_stopped"] or not task.get("shutdown_unconfirmed")):
-            raise ValueError("Recovery requires an interrupted Codex task with unconfirmed shutdown")
+            raise ValueError("Recovery requires an interrupted Codex or Claude task with unconfirmed shutdown")
         record = task.get("process")
         if not record or owned_state(record) != "stopped":
             raise ValueError("The recorded process group must be verified stopped before recovery")

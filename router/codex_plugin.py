@@ -21,6 +21,7 @@ from websockets.exceptions import WebSocketException
 
 from router.observer_hook import CODEX_EVENTS
 from router.paths import observed_project
+from router.sanitize import bound_text
 
 PLUGIN_ID = "agent-router@agent-router"
 PLUGIN_CACHE = ("plugins", "cache", "agent-router", "agent-router")
@@ -31,17 +32,23 @@ READINESS_TIMEOUT = 5
 READINESS_OUTPUT_LIMIT = 1024 * 1024
 
 
+class _ReadinessConnectionUnavailable(OSError):
+    """The selected endpoint was missing or refused the initial connection."""
+
+
 async def _readiness_evidence(home: Path, cwd: Path) -> tuple[dict, dict, list[str]]:
     """Query the existing native daemon; never start one or refresh plugins."""
-    # Native Codex can advertise long paths through short rendezvous aliases.
-    endpoint = (home / "app-server-control" / "app-server-control.sock").resolve(strict=True)
     size = 0
     evidence = None
-    deadline = asyncio.timeout(READINESS_TIMEOUT)
+    connected = False
     try:
+        # Native Codex can advertise long paths through short rendezvous aliases.
+        endpoint = (home / "app-server-control" / "app-server-control.sock").resolve(strict=True)
+        deadline = asyncio.timeout(READINESS_TIMEOUT)
         async with deadline, unix_connect(endpoint, open_timeout=READINESS_TIMEOUT, close_timeout=1,
                                 max_size=READINESS_OUTPUT_LIMIT, max_queue=1,
                                 compression=None, ping_interval=None, proxy=None) as connection:
+            connected = True
             async def receive(identity):
                 nonlocal size
                 while True:
@@ -109,6 +116,10 @@ async def _readiness_evidence(home: Path, cwd: Path) -> tuple[dict, dict, list[s
                         raise ValueError("Codex readiness trusted Router hook has no current hash")
                     state[key]["trusted_hash"] = hook["currentHash"]
             evidence = result, state, data[0]["warnings"]
+    except (FileNotFoundError, ConnectionRefusedError) as error:
+        if not connected:
+            raise _ReadinessConnectionUnavailable(str(error)) from error
+        raise
     except TimeoutError:
         if evidence is None or not deadline.expired():
             raise
@@ -238,8 +249,12 @@ def availability(codex_home: Path | None = None) -> dict:
         config, state, warnings = asyncio.run(_readiness_evidence(home, cwd))
     except TimeoutError:
         return {"state": "unknown", "detail": "Codex readiness deadline exceeded; existing daemon did not reply"}
+    except _ReadinessConnectionUnavailable as error:
+        return {"state": "unknown", "detail": "Codex readiness unavailable; start Codex normally in the selected home: "
+                + (bound_text(str(error), 4096) or type(error.__cause__).__name__)}
     except (OSError, ValueError, TypeError, WebSocketException) as error:
-        return {"state": "unknown", "detail": f"Codex readiness unavailable; start Codex normally in the selected home: {error}"}
+        return {"state": "unknown", "detail": "Codex readiness unavailable: "
+                + (bound_text(str(error), 4096) or type(error).__name__)}
     # config/read represents absent optional TOML tables as JSON null.
     plugins, features, hooks = ({} if config.get(name) is None else config[name]
                                for name in ("plugins", "features", "hooks"))

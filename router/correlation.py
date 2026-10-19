@@ -108,6 +108,7 @@ def _record(kind: str, row, data: dict, host_id: str) -> tuple[dict, list[str]]:
                       parent_session_id=row["parent_session_id"], parent_runtime=row["parent_runtime"] if matching_parent else None,
                       parent_agent_id=data.get("parent_agent_id"), router_task_id=row["task_id"],
                       started_at=data.get("attempt_started_at"))
+        result["work_item_id"] = data.get("work_item_id")
         if not matching_parent and row["submission_session_id"] is not None:
             invalid.append("parent_runtime")
         authoritative = {"task_id": row["task_id"]}
@@ -120,12 +121,13 @@ def _record(kind: str, row, data: dict, host_id: str) -> tuple[dict, list[str]]:
             authoritative["attempt_number"] = row["number"]
     elif kind == "managed":
         result.update(runtime=None, managed_id=row["managed_id"], session_id=data.get("session_id"),
-                      agent_id=data.get("agent_id"))
+                      agent_id=data.get("agent_id"), work_item_id=data.get("work_item_id"))
         authoritative = {"managed_id": row["managed_id"]}
     elif kind == "completion":
         result.update(host_id=row["host_id"], runtime=None, managed_id=row["managed_id"],
                       event_id=f"completion-{row['sequence']}", timestamp=row["created_at"], created_at=row["created_at"],
-                      lifecycle_event=row["phase"], session_id=data.get("session_id"), agent_id=data.get("agent_id"))
+                      lifecycle_event=row["phase"], session_id=data.get("session_id"), agent_id=data.get("agent_id"),
+                      work_item_id=data.get("work_item_id"))
         authoritative = {"host_id": row["host_id"], "managed_id": row["managed_id"], "event_id": result["event_id"]}
     invalid.extend(field for field, value in authoritative.items() if data.get(field) is not None
                    and (type(data[field]) is not type(value) or data[field] != value))

@@ -303,6 +303,9 @@ item before requesting review.
   consume the rest of a field.
 - Validate identifiers structurally (no controls, no surrounding whitespace, bounded
   length). Do not reject them for looking like secrets.
+- Validate execution identity independently of usage and cost. A nonempty reported
+  model map that omits the selected model must fail even when malformed counters,
+  invalid entries, or accounting bounds make usage unavailable.
 - A value that fails a safety check should degrade only that value. For example, an
   unusable transcript path must not reject the whole lifecycle event.
 
@@ -312,6 +315,11 @@ item before requesting review.
   same-timestamp, result-watermark, and session-end cases.
 - Watermarks must advance on metadata-only paths as well as state-changing paths.
 - Same-timestamp ties must not reopen a terminal or ended state.
+- Derive lifecycle status from retained entity evidence on delayed, tied, and replayed
+  paths. Use each entity's own watermark for terminal precedence and each reset's
+  watermark for monotonic clearing; an unrelated latest event is not an ordering fence.
+- Replaying a reset must preserve newer evidence, including a same-timestamp waiter
+  delivered after the original reset. Test both completion orders with live siblings.
 - When a history map is bounded (for example the last 128 events), ordering checks
   must use every retained timestamp for that entity, not only the bounded map.
   Otherwise eviction lets a delayed event clear state that is still live.
@@ -332,8 +340,23 @@ item before requesting review.
   label. A record reclassified `unknown` after a restart must keep capacity `unknown`
   until evidence arrives or the window in which it would have counted as active
   expires. A warning shown next to `available` is a contradiction, not a caveat.
+- Include already-unknown lifecycle records in restart admission tests. Preserve an
+  existing uncertainty deadline across repeated restarts and delayed or tied waiter
+  changes; derive new deadlines from retained evidence, never from restart time.
+- Resolve each uncertainty cause when its own accepted evidence arrives. Check delayed
+  root evidence after missing-root warnings and fresh child evidence after restart;
+  stale, tied, replayed, or rejected evidence must not retire a restart fence, and a
+  resolved cause must not clear unrelated uncertainty or fence a later unknown state.
 - Use one threshold for a classification and for every alert or `partial` flag derived
   from it.
+- A cached state derived from another entity must expire with that entity's evidence,
+  not a newer unrelated event. Check silent expiry without another hook, replay
+  equivalence, and the same read-time predicate in rendering and complete totals,
+  including empty and truncated display pages.
+- Fresh missing-root uncertainty must invalidate exact active totals and capacity,
+  then expire at the same freshness boundary. During clock rollback, retain future
+  live evidence in durable status; check the state again after the clock catches up
+  without delivering another event.
 
 **Ownership of nested data**
 
@@ -354,6 +377,12 @@ item before requesting review.
 
 **Persistence and upgrades**
 
+- Validate cumulative usage per model and token bucket before aggregation. Growth
+  in one bucket must not hide another bucket's disappearance or decrease; legacy
+  aggregate-only baselines cannot establish that continuity. Bound the cumulative
+  sums in current and persisted maps as well as each contributor and attempt delta.
+  Revalidate retained flat accounting frames and final public totals on read; a
+  collector guard alone cannot protect completed records written by older versions.
 - Version any change to a persisted digest or format. Verify legacy values once, then
   upgrade them, and test the upgrade from the previously pushed format. This applies
   even before merge, because a pushed branch may already be running.
@@ -368,6 +397,9 @@ item before requesting review.
 
 - When enabling a platform, trace installation, reconfiguration, and uninstall together;
   platform-specific service management must not leak into manual-daemon paths.
+- Bind native version inspection and execution to the same resolved executable for
+  each new attempt. Recovery consumes its persisted binding; changed configuration
+  or a worktree PATH must not select an uninspected executable.
 - Validate every native inventory diagnostic channel and compare required entries
   before classifying trust. Missing entries are incomplete evidence; warnings must
   retain their cause without invalidating complete, unrelated evidence.
@@ -389,6 +421,13 @@ item before requesting review.
   the new state in one swap.
 - A process-group leader exiting does not prove the group exited. After a failure,
   check the group and SIGKILL any members that remain.
+- A disappeared process can raise `ProcessLookupError` when signaled or
+  `FileNotFoundError` when reading Linux `/proc`. Cleanup must handle both while
+  preserving ownership checks and surfacing permission or malformed-state errors.
+- Publish fixture PID payloads atomically, after signal handlers and foreground
+  groups are initialized. Output/session files are not readiness. Register cleanup
+  before publication, PID parsing, identity probes and group assertions; cleanup
+  must also account for foreground groups outside the launcher group.
 - Keep failure state independent of diagnostic text. An exception or sanitized stderr
   can have an empty message; it must still trigger failed delivery and owned-process
   cleanup, with a nonempty diagnostic fallback.

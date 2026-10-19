@@ -16,7 +16,8 @@ import time
 import uuid
 from pathlib import Path
 
-from router.client import CompletionBusy, request
+from router.client import CompletionBusy, CompletionRefused, request
+from router.correlation import identifier
 from router.dispatch import canonical
 from router.paths import observed_project
 from router.processes import parent_and_identity
@@ -46,10 +47,13 @@ def completion_directory(state: Path) -> Path:
     return state / "managed"
 
 
-def run(argv: list[str], label: str | None, session_id: str | None, agent_id: str | None, state: Path) -> int:
+def run(argv: list[str], label: str | None, session_id: str | None, agent_id: str | None, state: Path,
+        *, work_item_id: str | None = None) -> int:
     """Run argv to completion and return its exit status (128 + signal when signalled)."""
     if not argv:
         raise ValueError("router run needs a command after --")
+    if work_item_id is not None:
+        identifier(work_item_id, "work_item_id")
     for name, value in (("session", session_id), ("agent", agent_id)):
         if value is not None:
             _identifier(value, name)
@@ -68,6 +72,8 @@ def run(argv: list[str], label: str | None, session_id: str | None, agent_id: st
                 "attribution": _attribution(session_id, agent_id), "wrapper_pid": os.getpid(),
                 "wrapper_identity": _identity(os.getpid()), "executable": Path(argv[0]).name,
                 "argument_count": len(argv) - 1, "cwd": os.getcwd()}
+    if work_item_id is not None:
+        metadata["work_item_id"] = work_item_id
     started_at, started = _now(), time.monotonic()
     launched: list[int] = []  # The command's PID (its group), once it exists.
     pending: list[int] = []
@@ -166,6 +172,7 @@ def _report(operation: str, payload: dict) -> bool:
 
 # Field -> kind. Text is bounded; integers must fit the wire; flags must be real booleans.
 START_FIELDS = {"managed_id": "id", "label": "text", "session_id": "identifier", "agent_id": "identifier",
+                "work_item_id": "identifier",
                 "attribution": "attribution", "pid": "pid", "pgid": "pid", "wrapper_pid": "pid",
                 "wrapper_identity": "text", "executable": "text", "argument_count": "count",
                 "cwd": "path", "started_at": "count"}
@@ -185,6 +192,9 @@ def _checked(payload: object, fields: dict[str, str]) -> dict:
     checked = {}
     for key, value in payload.items():
         kind = fields[key]
+        if key == "work_item_id":
+            checked[key] = identifier(value, "work_item_id")
+            continue
         if kind == "start":
             checked[key] = _checked(value, START_FIELDS)
             continue
@@ -304,7 +314,7 @@ class ManagedProcesses:
 
     def _completion(self, db, record: dict) -> None:
         fields = {"host_id", "managed_id", "session_id", "agent_id", "attribution", "status",
-                  "exit_code", "signal", "finished_at", "uncertain_at", "group_outlived"}
+                  "exit_code", "signal", "finished_at", "uncertain_at", "group_outlived", "work_item_id"}
         event = {key: value for key, value in record.items() if key in fields}
         if "group_outlived" not in event and isinstance(record.get("shutdown_uncertain"), bool):
             event["group_outlived"] = record["shutdown_uncertain"]
@@ -387,7 +397,7 @@ class ManagedProcesses:
             raise ValueError("completion_ack needs consumer and event_id, with optional host_id and event_host_id together")
         if "host_id" in payload:
             if _identifier(payload["host_id"], "host") != self.host_id:
-                raise ValueError("Completion serving host ID does not match")
+                raise CompletionRefused("Completion serving host ID does not match")
             _identifier(payload["event_host_id"], "event host")
         consumer = _identifier(payload["consumer"], "consumer")
         event_id = payload["event_id"]
@@ -396,19 +406,19 @@ class ManagedProcesses:
         with self.store.transaction(timeout=.1) as db:
             row = db.execute("SELECT cursor,subscription_id FROM completion_consumers WHERE name=?", (consumer,)).fetchone()
             if row is None:
-                raise ValueError("Unknown completion consumer; wait first")
+                raise CompletionRefused("Unknown completion consumer; wait first")
             if subscription is not None and row["subscription_id"] != subscription:
-                raise ValueError("Completion consumer subscription was removed, replaced, or belongs to another database")
+                raise CompletionRefused("Completion consumer subscription was removed, replaced, or belongs to another database")
             event = db.execute("SELECT host_id FROM completion_events WHERE sequence=?", (sequence,)).fetchone()
             if event is None:
-                raise ValueError("Unknown completion event ID")
+                raise CompletionRefused("Unknown completion event ID")
             if "event_host_id" in payload and event["host_id"] != payload["event_host_id"]:
-                raise ValueError("Completion producing host ID does not match")
+                raise CompletionRefused("Completion producing host ID does not match")
             if sequence > row["cursor"]:
                 pending = db.execute("SELECT MIN(sequence) FROM completion_events WHERE data IS NOT NULL AND sequence>?",
                                      (row["cursor"],)).fetchone()[0]
                 if sequence != pending:
-                    raise ValueError("Acknowledge the oldest pending event first")
+                    raise CompletionRefused("Acknowledge the oldest pending event first")
                 db.execute("UPDATE completion_consumers SET cursor=? WHERE name=?", (sequence, consumer))
         result = {"acknowledged": True, "event_id": event_id, "consumer": consumer, "host_id": self.host_id}
         if subscription is not None:

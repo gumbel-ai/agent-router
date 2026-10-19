@@ -58,7 +58,7 @@ class ControlTests(unittest.TestCase):
 
     def test_binding_consumption_and_idempotent_replay(self):
         first = self.submission()
-        payload = self.payload(first)
+        payload = {**self.payload(first), "work_item_id": "batch  α".ljust(240, "x")}
         with self.assertRaisesRegex(ValueError, "authorization"):
             self.router.handle("start", payload)
         self.authorize(payload)
@@ -70,6 +70,12 @@ class ControlTests(unittest.TestCase):
             copies = list(pool.map(lambda _: self.router.handle("start", payload), range(5)))
         self.assertEqual(len({copy["task_id"] for copy in copies}), 1)
         task = copies[0]
+        self.assertEqual(task["work_item_id"], payload["work_item_id"])
+        self.assertEqual(self.router.handle("status", {"task_id": task["task_id"]})["work_item_id"], payload["work_item_id"])
+        self.assertEqual(self.router.handle("status", {})[0]["work_item_id"], payload["work_item_id"])
+        changed_identity = {**payload, "work_item_id": "other-job"}
+        with self.assertRaises(ValueError):
+            self.router.handle("start", changed_identity)
         second = self.submission(prompt="P2")
         self.assertEqual(self.router.handle("start", payload)["task_id"], task["task_id"])
         with self.assertRaises(ValueError):
@@ -83,9 +89,19 @@ class ControlTests(unittest.TestCase):
             self.authorize(parallel, prompt="P2")
             self.router.handle("start", parallel)
         self.assertEqual(len(self.router.store.all()), 3)
+        self.assertNotIn("work_item_id", self.router.store.all()[-1])
         with self.router.store.connect() as db:
             self.assertEqual(db.execute("SELECT sum(consumed) FROM authorizations").fetchone()[0], 3)
             self.assertNotIn("prompt", [row[1] for row in db.execute("PRAGMA table_info(submissions)")])
+
+    def test_declared_work_item_id_refuses_invalid_values_without_registration(self):
+        instruction = self.submission()
+        for index, value in enumerate((None, True, 1, [], {}, "", " leading", "trailing ", "line\nbreak", "x" * 241)):
+            payload = {**self.payload(instruction, f"invalid-{index}"), "work_item_id": value}
+            self.authorize(payload)
+            with self.subTest(value=value), self.assertRaisesRegex(ValueError, "work_item_id"):
+                self.router.handle("start", payload)
+        self.assertEqual(self.router.store.all(), [])
 
     def test_review_guards_and_failed_artifact_salvage(self):
         instruction = self.submission()

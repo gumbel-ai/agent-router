@@ -13,6 +13,10 @@ class CompletionBusy(ValueError):
     """A completion request can be retried without changing command ownership."""
 
 
+class CompletionRefused(ValueError):
+    """The daemon rejected an acknowledgment's identity or cursor binding."""
+
+
 def request(operation: str, payload: dict, endpoint: Path | None = None, *, timeout: float = 15,
             deadline: bool = False) -> dict | list:
     """With deadline=True, timeout bounds the whole request rather than each socket operation."""
@@ -55,5 +59,7 @@ def request(operation: str, payload: dict, endpoint: Path | None = None, *, time
             if operation in {"completion_next", "completion_ack", "completion_subscribe",
                              "completion_consumer_list", "completion_consumer_remove"} and response.get("retryable") is True:
                 raise CompletionBusy(response.get("error", "Completion database is busy; retry delivery"))
+            if operation == "completion_ack" and response.get("code") == "acknowledgment_refused":
+                raise CompletionRefused(response.get("error", "Completion acknowledgment refused"))
             raise ValueError(response.get("error", "Router request failed"))
         return response["result"]

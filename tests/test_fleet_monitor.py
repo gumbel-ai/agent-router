@@ -49,10 +49,14 @@ from router.fleet import (
 )
 from router.fleet_snapshot import MAX_SNAPSHOT_BYTES, AlertHistory, bound, compose
 from router.host import HostIdentity, current_boot_id, stable_host_id
-from router.native import NativeObserver
+from router.native import STALE_AFTER_MS, NativeObserver
 from router.paths import PROJECT_MARKER, PROJECT_MARKER_CONTENT
 from router.sanitize import bound_text
-from router.sessions import MAX_EXACT_INFLIGHT_TOOLS, SessionObserver
+from router.sessions import (
+    MAX_EXACT_INFLIGHT_TOOLS,
+    MAX_INFLIGHT_AGE_MS,
+    SessionObserver,
+)
 from router.validation import HOST_STRING_LIMITS
 
 
@@ -300,12 +304,55 @@ class SessionAndCapacityTests(unittest.TestCase):
         self.assertEqual(active, 1)
 
     def test_delayed_pre_restart_tool_start_stays_active_after_restart_window(self):
-        self.event("prompt", observed_at=self.now - 3000)
-        self.event("notification", notification_type="agent_completed", observed_at=self.now - 1000)
-        self.observer.reconcile_restart()
-        self.event("tool_start", tool_use_id="late", activity="Bash", observed_at=self.now - 2000)
-        with patch("router.sessions.now_ms", return_value=self.now + 61_000):
-            self.assertEqual(self.observer.fleet_records(10)[1], 1)
+        now = 10_000_000
+        with patch("router.sessions.now_ms", return_value=now):
+            self.event("prompt", observed_at=now - 3000)
+            self.event("notification", notification_type="agent_completed", observed_at=now - 1000)
+            self.observer.reconcile_restart()
+            self.event("tool_start", tool_use_id="late", activity="Bash", observed_at=now - 2000)
+        with self.store.connect() as db:
+            before = db.execute("SELECT data FROM sessions").fetchone()[0]
+        stored = json.loads(before)
+        original = now - 1000 + STALE_AFTER_MS
+        tool_until = now - 2000 + MAX_INFLIGHT_AGE_MS
+        self.assertEqual(stored["status"], "unknown")
+        self.assertEqual(stored["last_event_at"], now - 1000)
+        self.assertEqual(stored["restart_uncertain_until"], original)
+        self.assertEqual(stored["tool_active_until"], tool_until)
+        self.assertEqual(stored["active_tool_times"], {"late": now - 2000})
+        capacity = CapacitySampler(self.store.path.parent)
+
+        class Host:
+            def view(self, at):
+                return {**snapshot("host")["host"], "observed_at": at}
+
+        controller = type("Controller", (), {"host": Host(), "sessions": self.observer,
+                                             "native": NativeObserver(self.store, "host"), "capacity": capacity})()
+        for checked_at in sorted({deadline + offset for deadline in (original, tool_until) for offset in (-1, 0, 1)}):
+            expected = None if checked_at <= max(original, tool_until) else 0
+            capacity._latest = {"logical_cpus": 8, "load_1m": 0, "cpu_busy_pct": 0,
+                                "memory_available_bytes": 32 * 1024**3, "disk_available_bytes": 64 * 1024**3,
+                                "observed_at": checked_at - 100, "partial": False}
+            with self.subTest(checked_at=checked_at), \
+                    patch("router.sessions.now_ms", return_value=checked_at), \
+                    patch("router.native.now_ms", return_value=checked_at), \
+                    patch("router.fleet_snapshot.now_ms", return_value=checked_at), \
+                    patch("router.capacity.time.time", return_value=checked_at / 1000):
+                for limit in (0, 1, 100):
+                    records, active = self.observer.fleet_records(limit)
+                    self.assertEqual(active, expected)
+                    self.assertEqual(len(records), int(limit > 0))
+                    if records:
+                        self.assertEqual(records[0]["status"], "unknown")
+                        self.assertEqual(records[0]["inflight_tool_count"], 1)
+                    result = compose(controller, history_limit=limit)
+                    self.assertEqual(result["capacity"]["active_claude_sessions"], expected)
+                    self.assertEqual(result["capacity"]["active_agents"], 0)
+                    self.assertEqual(result["capacity"]["capacity_state"],
+                                     "unknown" if expected is None else "available")
+                self.assertEqual(compose(controller), result)
+                with self.store.connect() as db:
+                    self.assertEqual(db.execute("SELECT data FROM sessions").fetchone()[0], before)
 
     def test_delayed_tool_start_after_agent_completed_counts_once_as_active(self):
         self.event("prompt", observed_at=self.now - 3000)
@@ -2430,7 +2477,8 @@ required = false
             self.assertEqual(ssh_snapshot(host, 15)["host"]["host_id"], "host-1")
         self.assertIsNotNone(launched[0].poll())
 
-        def run_script(source, timeout=.2):
+        # Output/error cases must allow interpreter startup; only the timeout case uses a short budget.
+        def run_script(source, timeout=15):
             processes = []
             def replacement(command, **kwargs):
                 process = actual_popen([sys.executable, "-c", source], **kwargs)
@@ -2803,7 +2851,7 @@ class RouterTaskFleetTests(unittest.TestCase):
         return task["task_id"]
 
     def test_router_tasks_reach_fleet_status_as_lifecycle_only(self):
-        running = self.task("running", attempt_started_at=int(time.time() * 1000) - 1000)
+        running = self.task("running", attempt_started_at=int(time.time() * 1000) - 1000, work_item_id="batch  α")
         self.task("closed", at=1)  # Long finished: outside the fleet window.
         local = compose(self.control)
         self.assertEqual([task["task_id"] for task in local["router_tasks"]], [running])
@@ -2812,6 +2860,7 @@ class RouterTaskFleetTests(unittest.TestCase):
         self.assertEqual((record["status"], record["executor"], record["parent_session_id"]),
                          ("running", "codex", "parent-session"))
         self.assertEqual(record["task"], "PRIVATE TASK TEXT")
+        self.assertEqual(record["work_item_id"], "batch  α")
         self.assertFalse({"cost", "usage", "worktree", "cwd"} & record.keys())
         self.assertNotIn("router_tasks", projected.get("errors", {}))
         # A peer on an older version sends no Router tasks; that is not a partial snapshot.
@@ -2826,10 +2875,11 @@ class RouterTaskFleetTests(unittest.TestCase):
         self.assertIn("router:parent-sess", table)
 
     def test_router_task_text_follows_fleet_text_sharing(self):
-        self.task("failed", failure_reason="[Errno 2] No such file: '/Users/me/worktree'")
+        self.task("failed", failure_reason="[Errno 2] No such file: '/work/example-project'", work_item_id="batch  α")
         self.control.settings = Settings(AGENT_ROUTER_FLEET_SHARE_TEXT="false")
         [record] = compose(self.control)["router_tasks"]
         self.assertEqual((record["task"], record["failure_reason"]), (None, None))
+        self.assertEqual(record["work_item_id"], "batch  α")
 
     def test_one_odd_router_task_cannot_take_the_host_out_of_the_fleet(self):
         self.assertNotIn("router_tasks", compose(self.control))  # Older viewers never see an empty section.
@@ -2863,10 +2913,12 @@ class RouterTaskFleetTests(unittest.TestCase):
         self.task("running")
         local = compose(self.control)
         local["router_tasks"].append({**local["router_tasks"][0], "task_id": "bad", "attempts": -1})
+        local["router_tasks"].extend({**local["router_tasks"][0], "work_item_id": value}
+                                   for value in ("", " leading", "bad\n", [], "x" * 241))
         projected = _validate_snapshot(json.dumps(local).encode())
         self.assertEqual(len(projected["router_tasks"]), 1)
         self.assertTrue(projected["partial"])
-        self.assertIn("1 invalid record(s) omitted", projected["errors"]["router_tasks"])
+        self.assertIn("6 invalid record(s) omitted", projected["errors"]["router_tasks"])
         self.assertTrue(projected["sessions"] == local["sessions"] and "capacity" in projected)
 
 

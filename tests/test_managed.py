@@ -8,6 +8,7 @@ import tempfile
 import threading
 import time
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import redirect_stderr
 from itertools import chain, repeat
 from pathlib import Path
@@ -15,6 +16,7 @@ from unittest.mock import patch
 
 from test_control import settings
 
+from router.cli import main
 from router.client import CompletionBusy
 from router.daemon import Controller
 from router.fleet import _validate_snapshot
@@ -47,14 +49,20 @@ class ManagedRunTests(unittest.TestCase):
     def run_command(self, script, **options):
         with patch("router.managed.request", side_effect=self.request):
             return run([sys.executable, "-c", script], options.get("label"), options.get("session"),
-                       options.get("agent"), self.state)
+                       options.get("agent"), self.state, **({"work_item_id": options["work_item_id"]}
+                                                          if "work_item_id" in options else {}))
 
     def managed(self):
         records, _ = self.control.managed.records()
         return {record["label"]: record for record in records}
 
     def test_completion_evidence_for_exit_codes_signals_and_survivors(self):
-        self.assertEqual(self.run_command("pass", label="ok", session="S", agent="A"), 0)
+        with patch("sys.argv", ["router", "run", "--label", "ok", "--session", "S", "--agent", "A",
+                                "--work-item-id", "batch  α", "--", sys.executable, "-c", "pass"]), \
+                patch("router.cli.state_dir", return_value=self.state), \
+                patch("router.managed.request", side_effect=self.request), self.assertRaises(SystemExit) as completed:
+            main()
+        self.assertEqual(completed.exception.code, 0)
         self.assertEqual(self.run_command("raise SystemExit(3)", label="failed", session="S"), 3)
         self.assertEqual(self.run_command("import os, signal; os.kill(os.getpid(), signal.SIGTERM)",
                                           label="signaled"), 128 + signal.SIGTERM)
@@ -72,6 +80,10 @@ class ManagedRunTests(unittest.TestCase):
         self.assertEqual(records["signaled"]["signal"], signal.SIGTERM)
         self.assertTrue(records["survivor"]["group_outlived"])
         self.assertFalse(records["ok"]["group_outlived"])
+        self.assertEqual(records["ok"]["work_item_id"], "batch  α")
+        self.assertNotIn("work_item_id", records["failed"])
+        snapshot = _validate_snapshot(json.dumps(compose(self.control)).encode())
+        self.assertEqual(next(row for row in snapshot["managed_processes"] if row["label"] == "ok")["work_item_id"], "batch  α")
         self.assertGreater(records["ok"]["max_process_rss_bytes"], 1_000_000)
         self.assertEqual(records["ok"]["executable"], Path(sys.executable).name)
         # Argument text is never kept, only its count and hash.
@@ -79,9 +91,19 @@ class ManagedRunTests(unittest.TestCase):
         outcomes = []
         for _ in range(4):
             event = self.next_completion()
+            if not outcomes:
+                self.assertEqual(event["event"]["work_item_id"], "batch  α")
+            else:
+                self.assertNotIn("work_item_id", event["event"])
             outcomes.append(event["status"])
             self.ack_completion(event)
         self.assertEqual(outcomes, ["completed", "failed", "failed", "uncertain"])
+
+    def test_declared_work_item_id_is_refused_before_command_launch(self):
+        with patch("router.managed.subprocess.Popen", side_effect=AssertionError("must not launch")):
+            for value in (True, 1, [], {}, "", " leading", "trailing ", "line\nbreak", "x" * 241):
+                with self.subTest(value=value), self.assertRaises(ValueError):
+                    self.run_command("pass", work_item_id=value)
 
     def test_evidence_survives_a_daemon_that_is_down_at_completion(self):
         def down_after_start(operation, payload, timeout):
@@ -92,9 +114,10 @@ class ManagedRunTests(unittest.TestCase):
 
         with patch("router.managed.request", side_effect=down_after_start):
             self.assertEqual(run([sys.executable, "-c", "raise SystemExit(4)"], "offline", None, None,
-                                 self.state), 4)
+                                 self.state, work_item_id="batch  α"), 4)
         self.assertEqual(len(list(completion_directory(self.state).glob("*.json"))), 1)
         self.assertEqual(self.managed()["offline"]["exit_code"], 4)  # Read back from the completion file.
+        self.assertEqual(self.managed()["offline"]["work_item_id"], "batch  α")
         self.assertEqual(list(completion_directory(self.state).glob("*.json")), [])
 
     def test_lost_start_and_finish_replies_replay_evidence_without_duplicate_events(self):
@@ -103,9 +126,11 @@ class ManagedRunTests(unittest.TestCase):
             raise OSError("reply lost after commit")
 
         with patch("router.managed.request", side_effect=lose_reply):
-            self.assertEqual(run([sys.executable, "-c", "pass"], "batch-job", None, None, self.state), 0)
+            self.assertEqual(run([sys.executable, "-c", "pass"], "batch-job", None, None, self.state,
+                                 work_item_id="batch  α"), 0)
         event = self.next_completion()
         self.assertEqual(event["status"], "completed")
+        self.assertEqual(event["event"]["work_item_id"], "batch  α")
         self.assertEqual(len(self.managed()), 1)
         self.ack_completion(event)
         self.assertEqual(self.next_completion()["status"], "pending")
@@ -163,7 +188,9 @@ class ManagedRunTests(unittest.TestCase):
 
     def test_malformed_evidence_is_refused_and_completion_is_recorded_once(self):
         for bad in ({"managed_id": "managed-x"}, {**self.start_payload("managed-x"), "pid": True},
-                    {**self.start_payload("managed-x"), "pid": 0}, {**self.start_payload("managed-x"), "pid": None}):
+                    {**self.start_payload("managed-x"), "pid": 0}, {**self.start_payload("managed-x"), "pid": None},
+                    *({**self.start_payload("managed-x"), "work_item_id": value}
+                      for value in (None, {}, "", "bad\n", "x" * 241))):
             with self.subTest(bad=bad), self.assertRaises(ValueError):
                 self.control.handle("managed_start", bad)
         finish = {"managed_id": "managed-y", "finished_at": int(time.time() * 1000), "elapsed_ms": 5, "exit_code": 2,
@@ -176,9 +203,11 @@ class ManagedRunTests(unittest.TestCase):
             self.control.handle("managed_finish", {**finish, "start": self.start_payload("managed-y")})
         # A start that never reached the daemon is recovered from the finish evidence.
         self.control.handle("managed_finish", {**finish, "group_outlived": False,
-                                               "start": self.start_payload("managed-y")})
-        self.control.handle("managed_finish", {**finish, "exit_code": 0, "group_outlived": False})
+                                               "start": {**self.start_payload("managed-y"), "work_item_id": "batch  β"}})
+        self.control.handle("managed_finish", {**finish, "exit_code": 0, "group_outlived": False,
+                                               "start": {**self.start_payload("managed-y"), "work_item_id": "other-job"}})
         self.assertEqual(self.managed()["y"]["exit_code"], 2)
+        self.assertEqual(self.managed()["y"]["work_item_id"], "batch  β")
 
     def start_payload(self, managed_id):
         return {"managed_id": managed_id, "label": managed_id.removeprefix("managed-"), "attribution": "host",
@@ -357,10 +386,11 @@ class ManagedRunTests(unittest.TestCase):
         self.assertEqual(self.control.handle("completion_subscribe", {"consumer": "worker-a"}), binding)
 
     def test_completion_backlog_replays_until_acknowledged_across_restart(self):
-        self.run_command("pass", label="same-label")
-        self.run_command("raise SystemExit(2)", label="same-label")
+        self.run_command("pass", label="same-label", work_item_id="batch-a")
+        self.run_command("raise SystemExit(2)", label="same-label", work_item_id="batch-b")
         first = self.next_completion()
         self.assertEqual(first["status"], "completed")
+        self.assertEqual(first["event"]["work_item_id"], "batch-a")
         self.assertEqual(self.next_completion(), first)  # A lost reply or interrupted consumer changes nothing.
         self.control = Controller(settings(self.state.parent / "repo"), {}, self.state)
         self.assertEqual(self.next_completion(), first)
@@ -369,6 +399,7 @@ class ManagedRunTests(unittest.TestCase):
         self.ack_completion(first)  # Including after restarting the consumer.
         second = self.next_completion()
         self.assertEqual(second["status"], "failed")
+        self.assertEqual(second["event"]["work_item_id"], "batch-b")
         self.assertNotEqual(second["event"]["event_id"], first["event"]["event_id"])
         self.assertNotEqual(second["event"]["managed_id"], first["event"]["managed_id"])
         self.assertEqual(self.next_completion("worker-b")["event"], first["event"])
@@ -702,27 +733,34 @@ class ManagedRunTests(unittest.TestCase):
                     consumer.join(15)
 
     def test_a_start_the_daemon_missed_is_recovered_while_the_command_runs(self):
-        fifo = self.state.parent / "running"
-        os.mkfifo(fifo)
-        seen = []
+        ready, release = self.state.parent / "ready", self.state.parent / "release"
+        command = ("import pathlib,time; "
+                   f"ready=pathlib.Path({str(ready)!r}); release=pathlib.Path({str(release)!r}); "
+                   "ready.touch(); deadline=time.monotonic()+45; "
+                   "exec('while not release.exists():\\n"
+                   " if time.monotonic() >= deadline: raise TimeoutError(\"fixture release not received\")\\n"
+                   " time.sleep(.02)')")
 
         def daemon_returns_then_release():
-            deadline = time.monotonic() + 10
-            while not list(completion_directory(self.state).glob("start-*.json")) and time.monotonic() < deadline:
-                time.sleep(0.02)
-            self.daemon_up = True  # The daemon is back while the command still runs.
-            records, active = self.control.managed.records()
-            seen.append(([record["label"] for record in records], active))
-            with open(fifo, "w"):
-                pass  # Let the command finish.
+            try:
+                deadline = time.monotonic() + 15
+                while not ready.exists() or not list(completion_directory(self.state).glob("start-*.json")):
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError("managed fixture readiness or start evidence not received")
+                    time.sleep(0.02)
+                self.daemon_up = True  # The daemon is back while the command still runs.
+                records, active = self.control.managed.records()
+                return [record["label"] for record in records], active
+            finally:
+                release.touch()  # The release remains visible even before the child reads it.
 
         self.daemon_up = False
-        helper = threading.Thread(target=daemon_returns_then_release)
-        helper.start()
-        with patch("router.managed.request", side_effect=self.request):
-            run([sys.executable, "-c", f"open({str(fifo)!r}).read()"], "missed", None, None, self.state)
-        helper.join(10)
-        self.assertEqual(seen, [(["missed"], 1)])
+        with ThreadPoolExecutor(max_workers=1) as helpers:
+            helper = helpers.submit(daemon_returns_then_release)
+            with patch("router.managed.request", side_effect=self.request):
+                code = run([sys.executable, "-c", command], "missed", None, None, self.state)
+            self.assertEqual(helper.result(timeout=15), (["missed"], 1))
+        self.assertEqual(code, 0)
         self.assertEqual(self.managed()["missed"]["status"], "exited")
 
     def test_identities_are_refused_not_rewritten(self):

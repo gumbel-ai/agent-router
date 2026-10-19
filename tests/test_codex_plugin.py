@@ -1,7 +1,9 @@
 import asyncio
+import hashlib
 import io
 import json
 import os
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -29,6 +31,28 @@ from router.setup import register_codex_marketplace
 
 ROOT = Path(__file__).resolve().parent.parent
 HOOKS = json.loads((ROOT / HOOKS_FILE).read_text())
+
+
+def native_inventory(declarations):
+    """Codex rust-v0.163.0 discovery.rs hashes and keys each normalized handler."""
+    events = {"SessionStart": "session_start", "SessionEnd": "session_end", "UserPromptSubmit": "user_prompt_submit",
+              "PreToolUse": "pre_tool_use", "PostToolUse": "post_tool_use", "PermissionRequest": "permission_request",
+              "SubagentStart": "subagent_start", "SubagentStop": "subagent_stop", "Stop": "stop", "Interrupt": "interrupt"}
+    entries = []
+    for event, groups in declarations["hooks"].items():
+        for group_index, group in enumerate(groups):
+            for handler_index, handler in enumerate(group["hooks"]):
+                timeout = handler["timeout"]
+                timeout = min(3, max(1, timeout)) if event in {"SessionEnd", "Interrupt"} else max(1, timeout)
+                identity = {"event_name": events[event], "hooks": [{"type": "command", "command": handler["command"],
+                                                                    "timeout": timeout, "async": False}]}
+                if "matcher" in group:
+                    identity["matcher"] = group["matcher"]
+                digest = hashlib.sha256(json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+                entries.append({"key": f"{PLUGIN_ID}:{HOOKS_FILE}:{events[event]}:{group_index}:{handler_index}",
+                                "pluginId": PLUGIN_ID, "enabled": True, "trustStatus": "trusted",
+                                "currentHash": "sha256:" + digest})
+    return entries
 
 
 class CodexPluginTests(unittest.TestCase):
@@ -116,7 +140,8 @@ class CodexPluginTests(unittest.TestCase):
                             connection.send("not JSON")
                             continue
                         if mode == "error":
-                            response = {"error": {"code": -32601, "message": "fixture method unavailable"}}
+                            response = {"error": {"code": -32601, "message": options.get(
+                                "error_message", "fixture method unavailable")}}
                         else:
                             connection.send(json.dumps({"method": "fixture/notification"}))
                             response = {"result": {"config": options.get("config", config)}}
@@ -158,14 +183,19 @@ class CodexPluginTests(unittest.TestCase):
     def test_plugin_manifest_points_at_hooks_whose_command_exists(self):
         manifest = json.loads((ROOT / ".codex-plugin" / "plugin.json").read_text())
         self.assertEqual(manifest["hooks"], "./" + HOOKS_FILE)
+        claude = json.loads((ROOT / ".claude-plugin" / "plugin.json").read_text())
+        self.assertEqual(manifest["skills"], claude["skills"])
+        self.assertTrue((ROOT / manifest["skills"][0] / "agent-router" / "SKILL.md").is_file())
         commands = {handler["command"] for groups in HOOKS["hooks"].values()
                     for group in groups for handler in group["hooks"]}
-        self.assertEqual(commands, {'sh "${PLUGIN_ROOT}/router/plugin/codex/hook.sh"'})
+        self.assertEqual(commands, {'sh "${PLUGIN_ROOT}/router/plugin/codex/hook.sh"',
+                                    'sh "${PLUGIN_ROOT}/router/plugin/codex/hook.sh" submit',
+                                    'sh "${PLUGIN_ROOT}/router/plugin/codex/hook.sh" authorize'})
         # Router stamps events on receipt; background hooks could arrive out of order.
         self.assertFalse(any(handler.get("async") for groups in HOOKS["hooks"].values()
                              for group in groups for handler in group["hooks"]))
         self.assertTrue((ROOT / "router" / "plugin" / "codex" / "hook.sh").is_file())
-        self.assertEqual(len(expected_trust(HOOKS)), len(HOOKS["hooks"]))
+        self.assertEqual(len(expected_trust(HOOKS)), sum(len(groups) for groups in HOOKS["hooks"].values()))
         # Codex caches the plugin under its manifest version; keep it tied to the package.
         project = tomllib.loads((ROOT / "pyproject.toml").read_text())
         self.assertEqual(manifest["version"], project["project"]["version"])
@@ -220,16 +250,55 @@ class CodexPluginTests(unittest.TestCase):
 
     def test_hook_answers_codex_even_without_router(self):
         state = self.home / "state"
+        state.mkdir()
         environment = {"PATH": "/usr/bin:/bin", "HOME": str(self.home), "AGENT_ROUTER_STATE_DIR": str(state)}
-        for pointer in (None, str(self.home / "removed" / "python")):
-            if pointer:
-                state.mkdir()
+        (self.home / "unmarked").mkdir()
+        executable = self.home / "selected-hook"
+        executable.write_text('#!/bin/sh\necho "not a hook response"\necho "selected integration unavailable" >&2\nexit 1\n')
+        executable.chmod(0o700)
+        stale = self.home / "stale-hook"
+        stale.write_text('#!/bin/sh\necho "unsupported hook mode" >&2\nexit 2\n')
+        stale.chmod(0o700)
+        without_package = self.home / "python-without-router"
+        without_package.write_text(f'#!/bin/sh\nexec {shlex.quote(sys.executable)} -S "$@"\n')
+        without_package.chmod(0o700)
+        fallback = self.home / "bin" / "router-host-hook"
+        fallback.parent.mkdir()
+        called = self.home / "fallback-called"
+        fallback.write_text(f'#!/bin/sh\ntouch {shlex.quote(str(called))}\necho \'{{"partial":\'\necho "entrypoint failed" >&2\nexit 1\n')
+        fallback.chmod(0o700)
+        (fallback.parent / "router-observe").symlink_to(fallback.name)
+        cases = [("missing", None, False), ("broken-pointer", str(self.home / "removed" / "python"), True),
+                 ("failing-interpreter", str(executable), True), ("stale-interpreter", str(stale), True),
+                 ("missing-module", str(without_package), True), ("failing-entrypoint", None, True)]
+        for name, pointer, has_fallback in cases:
+            (state / "python-path").unlink(missing_ok=True)
+            if pointer is not None:
                 (state / "python-path").write_text(pointer + "\n")
-            with self.subTest(pointer=pointer):
-                result = subprocess.run(["sh", str(ROOT / "router" / "plugin" / "codex" / "hook.sh")], env=environment,
-                                        input='{"hook_event_name":"Stop"}', capture_output=True, text=True,
-                                        timeout=30, check=False)
-                self.assertEqual((result.returncode, result.stdout.strip()), (0, "{}"), result.stderr)
+            current = {**environment, "PATH": str(fallback.parent) + ":/usr/bin:/bin" if has_fallback else environment["PATH"]}
+            for mode in ([], ["submit"], ["authorize"]):
+                for command in ("git status", "router start --json '{}'"):
+                    with self.subTest(integration=name, mode=mode, command=command):
+                        called.unlink(missing_ok=True)
+                        event = {"hook_event_name": "PreToolUse" if mode == ["authorize"] else "UserPromptSubmit",
+                                 "session_id": "parent-session", "turn_id": "turn-a", "cwd": str(self.home / "unmarked"),
+                                 "tool_name": "Bash", "tool_input": {"command": command}}
+                        result = subprocess.run(["sh", str(ROOT / "router" / "plugin" / "codex" / "hook.sh"), *mode],
+                                                env=current, input=json.dumps(event), capture_output=True, text=True,
+                                                timeout=30, check=False)
+                        self.assertEqual((result.returncode, result.stdout.strip()), (0, "{}"), result.stderr)
+                        self.assertTrue(result.stderr.strip(), "missing diagnostic")
+                        self.assertEqual(called.exists(), name == "failing-entrypoint")
+        # A working integration's response passes through exactly, including explicit native denial.
+        for body in ({}, {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
+                                                "permissionDecisionReason": "current submission required"}}):
+            called.unlink(missing_ok=True)
+            executable.write_text('#!/bin/sh\nprintf \'%s\\n\' ' + shlex.quote(json.dumps(body)) + '\n')
+            (state / "python-path").write_text(str(executable) + "\n")
+            result = subprocess.run(["sh", str(ROOT / "router" / "plugin" / "codex" / "hook.sh"), "authorize"],
+                                    env=environment, input='{}', capture_output=True, text=True, timeout=30, check=False)
+            self.assertEqual((result.returncode, result.stdout.strip(), result.stderr), (0, json.dumps(body), ""))
+            self.assertFalse(called.exists())
 
     def test_readiness_uses_codex_effective_project_configuration(self):
         self.install("0.9.0")
@@ -253,6 +322,20 @@ class CodexPluginTests(unittest.TestCase):
         for config, state, expected in cases:
             with self.subTest(expected=expected):
                 (self.home / "rpc.json").write_text(json.dumps({"config": config, "state": state}))
+                self.assertEqual(availability(self.home)["state"], expected)
+        # Build native evidence independently: the fixture's default helper shares Router's implementation.
+        complete = native_inventory(HOOKS)
+        self.assertEqual(len(complete), 12)
+        variants = [(complete, "ready")]
+        for event in ("user_prompt_submit", "pre_tool_use"):
+            key = f"{PLUGIN_ID}:{HOOKS_FILE}:{event}:1:0"
+            variants.extend((([entry for entry in complete if entry["key"] != key], "unknown"),
+                             ([{**entry, "trustStatus": "untrusted"} if entry["key"] == key else entry
+                               for entry in complete], "hooks_untrusted")))
+        for entries, expected in variants:
+            with self.subTest(native_inventory=expected, entries=len(entries)):
+                inventory = {"data": [{"cwd": str(self.project), "hooks": entries, "errors": [], "warnings": []}]}
+                (self.home / "rpc.json").write_text(json.dumps({"config": enabled, "inventory": inventory}))
                 self.assertEqual(availability(self.home)["state"], expected)
         self.assertEqual((self.home / "config.toml").read_bytes(), original)
         self.assertTrue((self.home / "rpc.log").is_file(), "readiness did not consult Codex")
@@ -309,6 +392,8 @@ class CodexPluginTests(unittest.TestCase):
                  (("exit", "fixture transport unavailable"), ("timeout", "deadline"),
                   ("oversize", "1009"), ("invalid_json", "JSON"), ("error", "fixture method unavailable"))]
         cases += [
+            ({"mode": "error", "error_message": "fixture method unavailable\n\x1b[31m" + "x" * 5000},
+             "fixture method unavailable"),
             ({"initialize": {}}, "daemon home"),
             ({"initialize": {"codexHome": "relative-home"}}, "daemon home"),
             ({"initialize": {"codexHome": str(self.home / "other-home")}}, "different Codex home"),
@@ -334,6 +419,10 @@ class CodexPluginTests(unittest.TestCase):
                 result = availability(self.home)
                 self.assertEqual(result["state"], "unknown")
                 self.assertIn(detail, result["detail"])
+                self.assertNotIn("start Codex normally", result["detail"])
+                self.assertLessEqual(len(result["detail"]), len("Codex readiness unavailable: ") + 4096)
+                self.assertNotIn("\x1b", result["detail"])
+                self.assertNotIn("\n", result["detail"])
                 (self.home / "rpc.json").unlink()
                 self.assertEqual(availability(self.home)["state"], "ready")
         inventory = {"data": [{"cwd": str(self.project), "hooks": complete, "errors": [],
@@ -347,6 +436,27 @@ class CodexPluginTests(unittest.TestCase):
                 (self.home / "rpc.json").write_text(json.dumps({"inventory": inventory}))
                 self.assertEqual(availability(self.home)["state"], "hooks_untrusted")
         (self.home / "rpc.json").unlink()
+        for phase, failure, startup, diagnostic in (
+                ("connect", ConnectionRefusedError("fixture endpoint refused"), True, "fixture endpoint refused"),
+                ("connect", ConnectionRefusedError("\x00"), True, "ConnectionRefusedError"),
+                ("connect", PermissionError("fixture endpoint inaccessible"), False, "fixture endpoint inaccessible"),
+                ("close", FileNotFoundError("fixture close unavailable"), False, "fixture close unavailable"),
+                ("close", ConnectionRefusedError("fixture close refused"), False, "fixture close refused"),
+                ("close", ValueError("\x1b[31m"), False, "ValueError")):
+            @asynccontextmanager
+            async def connect(*args, phase=phase, failure=failure, **kwargs):
+                if phase == "connect":
+                    raise failure
+                async with unix_connect(*args, **kwargs) as connection:
+                    yield connection
+                    raise failure
+
+            with self.subTest(phase=phase, connection=failure), \
+                    patch("router.codex_plugin.unix_connect", side_effect=connect):
+                result = availability(self.home)
+            self.assertEqual(result["state"], "unknown")
+            self.assertEqual("start Codex normally" in result["detail"], startup)
+            self.assertIn(diagnostic, result["detail"])
         endpoint = self.home / "app-server-control" / "app-server-control.sock"
         endpoint.unlink()
         result = availability(self.home)

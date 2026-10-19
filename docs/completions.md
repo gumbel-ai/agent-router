@@ -1,5 +1,14 @@
 # Durable managed-command completions
 
+`router run --work-item-id batch-job -- command args` attaches an optional caller
+work-item identity to the command, retained completion evidence, snapshots and
+local/fleet correlation exports. It must be a nonempty printable string of at most
+240 characters with no surrounding whitespace; Router preserves its exact spelling.
+Labels remain display text and never supply an identity. Without this option the
+field stays absent from managed records and completion events. This declaration
+does not enable observation outside an enabled project or grant control authority.
+Use identifiers, never prompts, instructions or credentials, in this field.
+
 An active agent can use a blocking shell/tool call to wait for commands launched with
 `router run` in an observed project:
 
@@ -38,8 +47,12 @@ the database namespace requirements below. Malformed
 managed IDs remain absent rather than blocking the stream. Labels are display
 text and are never used to establish identity. No command
 arguments, environment, output, working directory, or label appear in these events.
-`deadline` and `unavailable` results contain only `status` and `consumer`; they carry
-no event or host identity.
+By default, local `deadline` and `unavailable` results contain only `status` and
+`consumer`; they carry no event or host identity. Opting into
+`wait --include-subscription` adds the serving `host_id` and persisted
+`subscription_id` after subscription admission, including on a normal `deadline`.
+Neither form includes an event when none is delivered. Ctrl-C returns the minimal
+`unavailable` result without binding fields, even after admission, and exits 130.
 
 Delivery is ordered by durable insertion, one event per result. Reading never advances
 the persisted cursor. After **durably recording handling**, acknowledge that event:
@@ -193,16 +206,27 @@ neither repairs machine-ID clones nor distinguishes copies of the same database 
 subscription state. Local `router ack` also accepts `--host-id` and `--event-host-id`
 together, with optional `--subscription-id`, for these checks; its existing syntax and
 output stay valid. A confirmed bound acknowledgment echoes `subscription_id`.
-Older Router installations that lack these flags refuse the request.
+Fleet acknowledgment also requests `router ack --json-errors`. This opt-in flag emits
+a versioned, bounded error object on stdout for known database contention or an
+identity/cursor refusal, while retaining exit code 1 and the diagnostic on stderr.
+Without the flag, failed local acknowledgments keep their existing empty stdout.
+Older Router installations that lack these flags refuse the request; Router does not
+fall back to an unbound acknowledgment. Upgrade the remote CLI and daemon together.
 
 A failed or interrupted acknowledgment has an unknown commit outcome. Failure wrappers
 include `error.acknowledgment: "unknown"`. Retry the same configured host, consumer,
 serving ID, producing ID, subscription ID, and event ID. Router makes no automatic
-acknowledgment retry. If the remote CLI refuses the request (`exit_failed` with code 1),
-the wrapper cannot distinguish database contention from a permanent refusal. After
-durably recording handling, run the same bound acknowledgment directly on that host
-to inspect its stderr; this is idempotent. Blindly repeating a permanent identity mismatch
-cannot repair it. Restore or verify changed host mappings. After explicit consumer removal,
+acknowledgment retry. Known database contention reports `database_busy`; an invalid
+serving host, producing host, subscription, consumer, event, or pending-event order
+reports `acknowledgment_refused`. Verify the binding or ordering before retrying a
+refusal: repetition cannot repair it. SSH errors retain numeric `exit_code` when known.
+A structured refusal is accepted only from exit 1, with the supported schema version
+and every expected binding echoed exactly; those echoes do not establish the actual
+serving host, so a failed wrapper retains `host_id: null`. Nonzero success-shaped,
+malformed, mismatched, or unsupported replies remain `exit_failed`, with no free-form
+remote error text forwarded. After durably recording handling, the same bound local
+acknowledgment can provide stderr diagnostics on the host; it remains idempotent.
+Restore or verify changed host mappings. After explicit consumer removal,
 a new wait receives a new subscription ID; verify that the event matches durable handling
 before acknowledging under that new binding. Waits do not
 acknowledge. Restart, dropped SSH replies, or killed wait clients replay unacknowledged
@@ -228,7 +252,8 @@ Router adds no trust bypass and never starts a remote daemon.
 | Error code | Meaning |
 | --- | --- |
 | `unavailable` | The daemon cannot supply a wait result or the local socket is unreachable. |
-| `database_busy` | A local acknowledgment encountered database contention; retry the same tuple. |
+| `database_busy` | A local or remote acknowledgment encountered known database contention; retry the same tuple after durable handling. |
+| `acknowledgment_refused` | The daemon rejected the acknowledgment's identity, subscription, event, or pending-event order. Verify the binding/order before retrying. |
 | `request_failed` | A local delivery request was refused or could not provide usable evidence. |
 | `invalid_response` | Missing, malformed, inconsistent, or oversized reply. |
 | `output_limit` | SSH stdout exceeded its one-MiB collection limit. Replies above the separate 16-KiB acceptance limit yield `invalid_response`. |
@@ -252,8 +277,9 @@ Router adds no trust bypass and never starts a remote daemon.
 Separate-process simulated hosts exercise distinct state directories, real daemon
 sockets and CLI readers, replay after restart and lost replies, and host-routing
 mismatches. Component tests cover subscription fences and malformed evidence;
-local SSH-reader fixtures cover failed-reader descendants. Interruption during an
-already-running fleet collection is **NOT CHECKED** by these tests.
+local SSH-reader fixtures cover failed-reader descendants. An active-collection
+interruption test synchronizes a local wait and an SSH-reader process before Ctrl-C,
+then checks reader and descendant cleanup while the managed command continues once.
 Physical SSH, host-key negotiation, independent machine reboot, and the
 two-host live smoke test are **NOT CHECKED** by these tests.
 
@@ -265,7 +291,7 @@ This table applies to `wait` and `ack`; other commands keep their existing exit 
 | --- | --- | --- |
 | 0 | One JSON result: `completed`, `failed`, `uncertain`, or `deadline`. | Acknowledgment confirmed by JSON containing `acknowledged: true`. |
 | 1 | `unavailable` JSON, with a diagnostic on stderr. | Delivery failed or the daemon refused the acknowledgment; diagnostic on stderr. |
-| 2 | Invalid consumer, timeout, or command-line syntax; stderr, no result JSON. | Invalid consumer, event ID syntax, or command-line syntax; stderr, no result JSON. |
+| 2 | Invalid consumer, timeout, or command-line syntax; stderr, no result JSON. | Invalid consumer, event ID, host or subscription identity, binding flag combinations, or command-line syntax; stderr, no result JSON. |
 | 130 | Interrupted while waiting: `unavailable` JSON and an interruption diagnostic. | Interrupted: commit state is unknown; diagnostic on stderr, no reliable result JSON. |
 
 An interrupted acknowledgment may already have committed, or may commit after the

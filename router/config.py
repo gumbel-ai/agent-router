@@ -17,6 +17,9 @@ class Settings(BaseSettings):
     max_attempts: int | None = Field(default=None, gt=0, validation_alias="AGENT_ROUTER_MAX_ATTEMPTS")
     opencode_command: list[str] | None = Field(default=None, min_length=1, validation_alias="AGENT_ROUTER_OPENCODE_COMMAND")
     codex_command: list[str] | None = Field(default=None, min_length=1, validation_alias="AGENT_ROUTER_CODEX_COMMAND")
+    claude_command: list[str] | None = Field(default=None, min_length=1, max_length=1,
+        description="One Claude executable path without arguments; use an operator forwarding wrapper if needed",
+        validation_alias="AGENT_ROUTER_CLAUDE_COMMAND")
     models: dict[str, str] = Field(default_factory=dict, validation_alias="AGENT_ROUTER_MODELS")
     repositories: dict[str, dict[str, str]] = Field(default_factory=dict, validation_alias="AGENT_ROUTER_REPOSITORIES")
     model_prices: dict[str, list[PriceTier]] = Field(default_factory=dict, validation_alias="AGENT_ROUTER_MODEL_PRICES")
@@ -25,12 +28,12 @@ class Settings(BaseSettings):
 
     @property
     def delegation_enabled(self) -> bool:
-        return bool(self.models and self.repositories and (self.opencode_command or self.codex_command) and self.concurrency_cap
+        return bool(self.models and self.repositories and (self.opencode_command or self.codex_command or self.claude_command) and self.concurrency_cap
                     and self.attempt_timeout_seconds and self.max_attempts)
 
     @model_validator(mode="after")
     def complete_delegation(self):
-        values = (self.models, self.repositories, self.opencode_command, self.codex_command, self.concurrency_cap,
+        values = (self.models, self.repositories, self.opencode_command, self.codex_command, self.claude_command, self.concurrency_cap,
                   self.attempt_timeout_seconds, self.max_attempts)
         if any(values) and not self.delegation_enabled:
             raise ValueError("Delegation requires models, repositories, executor command, concurrency, timeout, and attempt limits; run router init")
@@ -52,7 +55,7 @@ class Settings(BaseSettings):
             raise ValueError("Each model alias requires an exact provider/model ID")
         return value
 
-    @field_validator("opencode_command", "codex_command")
+    @field_validator("opencode_command", "codex_command", "claude_command")
     @classmethod
     def command_parts(cls, value: list[str] | None) -> list[str] | None:
         if value is not None and any(not part.strip() for part in value):
