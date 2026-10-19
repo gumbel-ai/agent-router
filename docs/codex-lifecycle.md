@@ -116,7 +116,10 @@ This namespace is shared with the Langfuse correlation bridge (TODO item 9): run
   future child work remains evidence when deriving durable session status; clock
   rollback makes its rendered state and total unknown until the clock catches up. A fresh unknown
   session with missing root hooks makes the session total and capacity unknown;
-  that uncertainty expires after the normal lifecycle freshness window.
+  that uncertainty expires after the normal lifecycle freshness window. Accepted root
+  evidence clears its missing-root warning. Fresh accepted lifecycle evidence retires
+  the prior restart fence; later missing-root uncertainty remains independent, and a
+  later restart derives its deadline from the newer retained evidence.
 
 ## Gaps (shown as unavailable, never inferred)
 

@@ -279,6 +279,9 @@ class SessionObserver:
             record["status"] = "idle"
         else:
             record.update(status="unknown", visibility_reason="Root turn state was not observed")
+        if (isinstance(record.get("root_turn_open"), bool)
+                and record.get("visibility_reason") == "Root turn state was not observed"):
+            record["visibility_reason"] = None
         if record.get("visibility_reason") in {None, WAITING_REASON}:
             record["visibility_reason"] = WAITING_REASON if record.get("needs_input") else None
         return before != (record["status"], record.get("visibility_reason"))
@@ -415,6 +418,13 @@ class SessionObserver:
                 if evidence_changed:
                     self._put_session(db, record)
                 return self.view(record, max(now_ms(), at))
+            if (source == "codex" and at > record["last_event_at"]
+                    and (kind not in {"notification", "teammate_idle"}
+                         or safe_text(event.get("notification_type"), 240)
+                         in WAITING_NOTIFICATIONS | {"agent_completed"})):
+                # Only newly accepted lifecycle evidence resolves a restart. A later
+                # missing-root state has its own uncertainty, without this old fence.
+                record.pop("restart_uncertain_until", None)
             record["last_event_at"] = at
             record["last_event"] = kind
             self._observe_process_chain(record, event, kind)

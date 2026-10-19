@@ -124,9 +124,12 @@ class CodexObservationTests(unittest.TestCase):
         self.assertFalse(session["needs_input"])
 
     def test_restart_marks_running_codex_work_uncertain(self):
-        cases = (("known root", True, False, False), ("missing root", False, False, False),
-                 ("historical unknown", False, False, True), ("tool uncertainty", False, True, False))
-        for name, root_observed, live_tool, historical in cases:
+        cases = (("known root", True, False, False, None), ("missing root", False, False, False, None),
+                 ("historical unknown", False, False, True, None),
+                 ("tool uncertainty", False, True, False, None),
+                 *((f"fresh child then {kind}", False, False, False, kind)
+                   for kind in ("Stop", "UserPromptSubmit", "SessionStart", "restart")))
+        for name, root_observed, live_tool, historical, resolution in cases:
             with self.subTest(name=name):
                 self.control = Controller(settings(self.root / "repo"), {}, self.root / f"restart-{name}")
                 self.control.start_lifecycle_writer()
@@ -147,8 +150,9 @@ class CodexObservationTests(unittest.TestCase):
                 for offset in (-15, -10):
                     # Older and tied pre-restart evidence cannot resolve the restart.
                     self.clock = latest + offset
-                    self.hook("Stop", turn_id="t1", stop_hook_active=False)
-                    self.assertEqual(self.agent()["status"], "unknown")
+                    self.hook("SubagentStop" if resolution else "Stop", turn_id="t1",
+                              agent_id=CHILD if resolution else None, stop_hook_active=False)
+                    self.assertEqual(self.agent()["status"], "idle" if resolution and self.clock == latest else "unknown")
                     self.assertEqual(self.session()["status"], "unknown")
                     self.assertIn("restart", self.session()["visibility_reason"].lower())
                 if live_tool:
@@ -183,6 +187,37 @@ class CodexObservationTests(unittest.TestCase):
                         self.assertEqual(snapshot["capacity"]["active_claude_sessions"], active)
                         self.assertEqual(snapshot["capacity"]["capacity_state"],
                                          "unknown" if active is None else "available")
+                if resolution is not None:
+                    self.clock = latest + 290
+                    self.hook("SubagentStart", turn_id="t2", agent_id=CHILD, agent_type="default")
+                    self.assertEqual(self.session()["status"], "running")
+                    self.clock = latest + 390
+                    self.hook("SubagentStop", turn_id="t2", agent_id=CHILD, agent_type="default")
+                    self.assertEqual(self.session()["status"], "unknown")
+                    self.assertEqual(self.session()["visibility_reason"], "Root turn state was not observed")
+                    with self.control.store.connect() as db:
+                        stored = json.loads(db.execute(
+                            "SELECT data FROM sessions WHERE source='codex' AND session_id=?", (SESSION,),
+                        ).fetchone()[0])
+                    self.assertNotIn("restart_uncertain_until", stored)
+                    if resolution == "restart":
+                        for _ in range(2):
+                            self.control.sessions.reconcile_restart()
+                            self.control.native.reconcile_restart()
+                            with self.control.store.connect() as db:
+                                stored = json.loads(db.execute(
+                                    "SELECT data FROM sessions WHERE source='codex' AND session_id=?", (SESSION,),
+                                ).fetchone()[0])
+                            self.assertEqual(stored["restart_uncertain_until"], latest + 400 + STALE_AFTER_MS)
+                        self.clock = latest + 340
+                        self.hook("Stop", turn_id="t1")
+                        self.assertIn("restart", self.session()["visibility_reason"].lower())
+                    else:
+                        self.clock = latest + 340
+                        self.hook(resolution, source="compact", turn_id="t1")
+                        self.assertEqual(self.session()["status"], "idle" if resolution == "Stop" else "running")
+                        self.assertIsNone(self.session()["visibility_reason"])
+                        self.assertEqual(self.control.sessions.fleet_records(0)[1], int(resolution != "Stop"))
                 self.clock = int(time.time() * 1000) - 1000
                 self.hook("Stop", turn_id="t1", stop_hook_active=False)
                 self.hook("SubagentStop", turn_id="t2", agent_id=CHILD, agent_type="default")
@@ -448,6 +483,11 @@ class CodexObservationTests(unittest.TestCase):
                 ("PreToolUse", 50, {**child, "tool_use_id": "c1"}), ("PermissionRequest", 60, sibling),
                 ("SubagentStop", 70, child)], "idle", True, 1, 1),
         })
+        for opening in ("Stop", "UserPromptSubmit", "SessionStart"):
+            cases[f"missing root resolved by delayed {opening}"] = (
+                False, [("SubagentStop", 60, child), (opening, 40, {"source": "compact"})],
+                "idle" if opening == "Stop" else "running", False, 0, int(opening != "Stop"),
+            )
         for name, (root_observed, events, status, waiting, tools, active) in cases.items():
             for reordered in (False, True):
                 self.clock = int(time.time() * 1000) - 10_000
@@ -473,6 +513,11 @@ class CodexObservationTests(unittest.TestCase):
                     self.assertEqual(session["last_event_at"], start + max(item[1] for item in events) + 10)
                     self.assertEqual((session["status"], session["needs_input"], session["inflight_tool_count"]),
                                      (status, waiting, tools))
+                    if root_observed or any(kind in {"Stop", "UserPromptSubmit", "SessionStart"}
+                                            and fields.get("agent_id") is None for kind, _, fields in events):
+                        self.assertNotEqual(session["visibility_reason"], "Root turn state was not observed")
+                    elif status == "unknown":
+                        self.assertEqual(session["visibility_reason"], "Root turn state was not observed")
                     with patch("router.sessions.now_ms", return_value=start + 100):
                         self.assertEqual(self.control.sessions.fleet_records(10)[1], active)
                     if name in reset_cases:
@@ -514,6 +559,9 @@ class CodexObservationTests(unittest.TestCase):
                 session = self.session()
                 self.assertEqual((session["status"], session["tool_visibility_partial"], session["inflight_tool_count"]),
                                  expected)
+                if timing != "older":
+                    self.assertEqual(session["visibility_reason"],
+                                     "Inflight tool correlation exceeded the exact tracking bound")
                 with patch("router.sessions.now_ms", return_value=start + 100):
                     self.assertEqual(self.control.sessions.fleet_records(10)[1], 0 if timing == "older" else None)
                 self.clock = start + 200

@@ -340,6 +340,10 @@ item before requesting review.
 - Include already-unknown lifecycle records in restart admission tests. Preserve an
   existing uncertainty deadline across repeated restarts and delayed or tied waiter
   changes; derive new deadlines from retained evidence, never from restart time.
+- Resolve each uncertainty cause when its own accepted evidence arrives. Check delayed
+  root evidence after missing-root warnings and fresh child evidence after restart;
+  stale, tied, replayed, or rejected evidence must not retire a restart fence, and a
+  resolved cause must not clear unrelated uncertainty or fence a later unknown state.
 - Use one threshold for a classification and for every alert or `partial` flag derived
   from it.
 - Fresh missing-root uncertainty must invalidate exact active totals and capacity,
