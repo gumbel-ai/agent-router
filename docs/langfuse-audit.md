@@ -31,6 +31,7 @@ Source support does not establish that a host has enabled, trusted or exercised 
 ### Claude plugin 1.2.1
 
 Pin: [`langfuse/Claude-Observability-Plugin` at `b5b7cc364996467e856dc17575b5674f4799ad87`](https://github.com/langfuse/Claude-Observability-Plugin/tree/b5b7cc364996467e856dc17575b5674f4799ad87).
+Router now pins the fork [`gumbel-ai/claude-observability-plugin` at `d5829be6628cb67dc45eca699575348a152ae565`](https://github.com/gumbel-ai/claude-observability-plugin/tree/d5829be6628cb67dc45eca699575348a152ae565): this source plus one change that saves hook state only after a successful flush.
 
 The [hook source](https://github.com/langfuse/Claude-Observability-Plugin/blob/b5b7cc364996467e856dc17575b5674f4799ad87/hooks/langfuse_hook.py)
 propagates the native session ID as Langfuse `session_id`, with `metadata.session_id`

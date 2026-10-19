@@ -139,7 +139,9 @@ An operator repository entry may contain one `claude_tracing` JSON string:
 ```
 
 The directory must be outside the delegated repository and contain the exact
-audited Langfuse Observability Plugin 1.2.1 source. Router verifies the pinned
+audited Langfuse Observability Plugin 1.2.1 source from the durable-export fork:
+`git clone https://github.com/gumbel-ai/claude-observability-plugin` and check out
+`d5829be6628cb67dc45eca699575348a152ae565`. Router verifies the pinned
 manifest, hooks and digest, freezes the private selection per task, and refuses
 launch if the source changes. The candidate uses `--restricted`, `--plugin-dir`
 and empty setting sources.
