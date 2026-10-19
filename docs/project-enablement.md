@@ -66,8 +66,12 @@ are resolved, including a long selected-home path pointing to a short native
 rendezvous socket. An existing native control socket is required. Whether an
 ordinary Codex session creates that socket is **NOT CHECKED**; launching Codex is
 not a verified remedy for its absence. A missing or unreachable endpoint reports
-`unknown`; Router does not start a daemon as a fallback. The current generic
-startup advice in transport/protocol errors is tracked in [issue #35](https://github.com/gumbel-ai/agent-router/issues/35).
+`unknown`; Router does not start a daemon as a fallback. Only a missing endpoint or
+an initially refused connection suggests starting Codex normally in the selected
+home. Access, handshake, protocol and hook-discovery failures retain their cause
+without startup advice. These failure diagnostics render the cause as single-line
+terminal-safe text bounded to 4096 characters; they never classify native error
+messages by their wording.
 The daemon's initialization reply must identify the selected home; an alias into
 another home's daemon reports `unknown` before its configuration or hooks are read.
 The native control socket/API was verified with Codex 0.163.0. Unsupported clients

@@ -113,7 +113,8 @@ class CodexPluginTests(unittest.TestCase):
                             connection.send("not JSON")
                             continue
                         if mode == "error":
-                            response = {"error": {"code": -32601, "message": "fixture method unavailable"}}
+                            response = {"error": {"code": -32601, "message": options.get(
+                                "error_message", "fixture method unavailable")}}
                         else:
                             connection.send(json.dumps({"method": "fixture/notification"}))
                             response = {"result": {"config": options.get("config", config)}}
@@ -271,6 +272,8 @@ class CodexPluginTests(unittest.TestCase):
                  (("exit", "fixture transport unavailable"), ("timeout", "deadline"),
                   ("oversize", "1009"), ("invalid_json", "JSON"), ("error", "fixture method unavailable"))]
         cases += [
+            ({"mode": "error", "error_message": "fixture method unavailable\n\x1b[31m" + "x" * 5000},
+             "fixture method unavailable"),
             ({"initialize": {}}, "daemon home"),
             ({"initialize": {"codexHome": "relative-home"}}, "daemon home"),
             ({"initialize": {"codexHome": str(self.home / "other-home")}}, "different Codex home"),
@@ -296,6 +299,10 @@ class CodexPluginTests(unittest.TestCase):
                 result = availability(self.home)
                 self.assertEqual(result["state"], "unknown")
                 self.assertIn(detail, result["detail"])
+                self.assertNotIn("start Codex normally", result["detail"])
+                self.assertLessEqual(len(result["detail"]), len("Codex readiness unavailable: ") + 4096)
+                self.assertNotIn("\x1b", result["detail"])
+                self.assertNotIn("\n", result["detail"])
                 (self.home / "rpc.json").unlink()
                 self.assertEqual(availability(self.home)["state"], "ready")
         inventory = {"data": [{"cwd": str(self.project), "hooks": complete, "errors": [],
@@ -309,6 +316,27 @@ class CodexPluginTests(unittest.TestCase):
                 (self.home / "rpc.json").write_text(json.dumps({"inventory": inventory}))
                 self.assertEqual(availability(self.home)["state"], "hooks_untrusted")
         (self.home / "rpc.json").unlink()
+        for phase, failure, startup, diagnostic in (
+                ("connect", ConnectionRefusedError("fixture endpoint refused"), True, "fixture endpoint refused"),
+                ("connect", ConnectionRefusedError("\x00"), True, "ConnectionRefusedError"),
+                ("connect", PermissionError("fixture endpoint inaccessible"), False, "fixture endpoint inaccessible"),
+                ("close", FileNotFoundError("fixture close unavailable"), False, "fixture close unavailable"),
+                ("close", ConnectionRefusedError("fixture close refused"), False, "fixture close refused"),
+                ("close", ValueError("\x1b[31m"), False, "ValueError")):
+            @asynccontextmanager
+            async def connect(*args, phase=phase, failure=failure, **kwargs):
+                if phase == "connect":
+                    raise failure
+                async with unix_connect(*args, **kwargs) as connection:
+                    yield connection
+                    raise failure
+
+            with self.subTest(phase=phase, connection=failure), \
+                    patch("router.codex_plugin.unix_connect", side_effect=connect):
+                result = availability(self.home)
+            self.assertEqual(result["state"], "unknown")
+            self.assertEqual("start Codex normally" in result["detail"], startup)
+            self.assertIn(diagnostic, result["detail"])
         endpoint = self.home / "app-server-control" / "app-server-control.sock"
         endpoint.unlink()
         result = availability(self.home)
