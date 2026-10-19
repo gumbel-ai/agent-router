@@ -12,7 +12,10 @@ from pathlib import Path
 def main() -> None:
     fd = int(sys.argv[1])
     destination = Path(sys.argv[2])
-    command = sys.argv[3:]
+    disposable = sys.argv[3] == "--dispose-group"
+    command = sys.argv[4:] if disposable else sys.argv[3:]
+    if disposable and os.getpgrp() != os.getpid():
+        raise RuntimeError("Disposable phase requires an independently owned process group")
     try:
         release = os.read(fd, 1)
     finally:
@@ -31,6 +34,12 @@ def main() -> None:
     temporary = destination.with_suffix(".tmp")
     temporary.write_text(json.dumps(result))
     temporary.replace(destination)
+    if disposable:
+        # Keep the identifiable leader until the entire disposable group is killed.
+        # Completion remains durable if the daemon dies during bounded cleanup.
+        os.killpg(os.getpid(), signal.SIGTERM)
+        time.sleep(0.5)
+        os.killpg(os.getpid(), signal.SIGKILL)
     sys.exit(0)
 
 

@@ -112,14 +112,17 @@ def initialize(repo: Path, model: str, setup_command: str, permission: dict | No
     alias, exact = model.split("=", 1)
     if not alias.strip() or "/" not in exact or not exact.strip():
         raise ValueError("Model must be alias=provider/exact-model, without substitution")
-    if executor not in {"opencode", "codex"}:
+    if executor not in {"opencode", "codex", "claude"}:
         raise ValueError("Unsupported executor; no fallback")
     if executor == "codex" and (not exact.startswith("openai/") or not exact.removeprefix("openai/").strip()):
         raise ValueError("Codex requires an exact openai/model ID; custom providers are unsupported")
     if executor == "codex" and (sandbox not in {"read-only", "workspace-write"} or permission is not None):
         raise ValueError("Codex requires an explicit read-only/workspace-write sandbox, not OpenCode permissions")
-    if executor == "opencode" and sandbox is not None:
-        raise ValueError("--sandbox is for Codex; OpenCode uses explicit permissions")
+    if executor != "codex" and sandbox is not None:
+        raise ValueError("--sandbox is for Codex; other executors use explicit permissions")
+    if executor == "claude":
+        from router.claude_executor import validate
+        validate(exact, permission)
     executable = shutil.which(executor)
     if not executable:
         raise ValueError(f"Install {executor} and configure its provider access before enabling delegation")
@@ -159,6 +162,8 @@ def initialize(repo: Path, model: str, setup_command: str, permission: dict | No
         target = {**values.get("AGENT_ROUTER_REPOSITORIES", {}).get(str(repo), {}), "setup_command": setup_command}
         if executor == "codex":
             target["codex_sandbox"] = sandbox
+        if executor == "claude":
+            target["claude_permissions"] = json.dumps(permission)
         values.setdefault("AGENT_ROUTER_REPOSITORIES", {})[str(repo)] = target
         effective, _ = load_settings(values)
         for key, actual in (("AGENT_ROUTER_CONCURRENCY_CAP", effective.concurrency_cap),
@@ -198,6 +203,10 @@ def init(args) -> None:
         if args.yes:
             raise ValueError("Noninteractive init requires --permissions or an existing explicit opencode.json")
         permission = json.loads(input('OpenCode permission object (explicit allow/deny JSON): '))
+    if args.executor == "claude" and permission is None:
+        if args.yes:
+            raise ValueError("Noninteractive Claude init requires --permissions with tools and allow lists")
+        permission = json.loads(input('Claude permission object (tools and allow JSON lists): '))
     def choice(value, previous, fallback, label, cast):
         if value is not None:
             return value

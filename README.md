@@ -7,7 +7,7 @@ Delegate coding tasks to another agent while the parent stays in control.
 
 ## What you get
 
-- Delegate across agent CLIs: Claude Code to OpenCode or Codex.
+- Delegate across agent CLIs: Claude Code to OpenCode, Codex, or another Claude Code session.
 - Choose the exact child model, with no silent substitution.
 - Run tasks in parallel while the parent keeps working.
 - Watch native Claude Code and Codex sessions and subagents, and Router-launched children, across projects with `router status --watch`.
@@ -62,7 +62,9 @@ For Codex instead, install and sign in to the Codex CLI, then run `router init -
 
 `router service stop` stops the idle managed service; `router service start` starts it again and lets it recover interrupted work. `router uninstall` removes the plugin, service, and CLI while retaining configuration and history. Installation/configuration changes refuse active Router work or pending cleanup; failed cleanup stays visible without blocking maintenance. Native subagents remain Claude-owned.
 
-If a Codex shutdown stays unconfirmed, an operator must inspect and stop its remaining commands. Stop the daemon with `router daemon stop`, then run `router recover TASK_ID --reason 'what you inspected'` in an interactive terminal. Recovery requires the recorded process group to be stopped and a typed acknowledgement; it releases the slot but preserves uncertainty evidence and the worktree. Restart the service afterward. Agents must not perform recovery.
+For Claude children, see [Claude executor configuration and verification](docs/claude-executor.md).
+
+If a Codex or Claude shutdown stays unconfirmed, an operator must inspect and stop its remaining commands. Stop the daemon with `router daemon stop`, then run `router recover TASK_ID --reason 'what you inspected'` in an interactive terminal. Recovery requires the recorded process group to be stopped and a typed acknowledgement; it releases the slot but preserves uncertainty evidence and the worktree. Restart the service afterward. Agents must not perform recovery.
 
 The plugin is also installable through Claude's normal marketplace command after the Router runtime is installed:
 
