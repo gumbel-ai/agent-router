@@ -116,7 +116,9 @@ is absent. Setup, default and Codex children and
 all Git subprocesses still remove `LANGFUSE_*`. As with OpenCode, the secret is
 present in the child process environment, so child tools can read it. Router
 does not read credential files or persist credential values. `tracing.available`
-is true only when the startup environment has the public and secret keys.
+is true only when the startup environment has the public and secret keys. Like
+OpenCode, each child launch, including a rejected or resumed attempt, refreshes
+the flag and reason for the environment that child receives.
 
 Selected children strip ambient plugins, hooks, plugin options, `CC_LANGFUSE_*`
 variables and attached trace context, while preserving native authentication.

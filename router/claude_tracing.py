@@ -60,6 +60,14 @@ def _inspect(directory: Path) -> str:
         raise ValueError("Claude tracing plugin is unavailable, invalid or changed; inspect the selected source") from error
 
 
+def availability(credentials_available: bool) -> dict:
+    """Same rule as the OpenCode route: true only when the child's startup environment has the keys."""
+    return {"available": credentials_available,
+            "reason": ("Claude plugin selected; Langfuse credentials are forwarded from Router's startup environment"
+                       if credentials_available else
+                       "Claude plugin selected, but required Langfuse credentials are unavailable")}
+
+
 def configure(raw: str, task: dict, host_id: str, repository: Path, credentials_available: bool) -> dict:
     try:
         if not isinstance(raw, str) or len(raw) > 16384:
@@ -74,13 +82,8 @@ def configure(raw: str, task: dict, host_id: str, repository: Path, credentials_
     correlation = {"session_id": task["child_session_id"], "router_task_id": task["task_id"], "host_id": host_id}
     if "work_item_id" in task:
         correlation["work_item_id"] = task["work_item_id"]
-    # Same availability rule as the OpenCode route: true only when Router's
-    # startup environment has the required keys. Real exports remain unverified.
-    tracing = {"requested": True, "available": credentials_available,
-               "reason": ("Claude plugin selected; Langfuse credentials are forwarded from Router's startup environment"
-                          if credentials_available else
-                          "Claude plugin selected, but required Langfuse credentials are unavailable"),
-               "plugin": PLUGIN_ID, "correlation": correlation}
+    # Real exports remain unverified; availability only reflects credentials.
+    tracing = {"requested": True, **availability(credentials_available), "plugin": PLUGIN_ID, "correlation": correlation}
     if "work_item_id" in correlation and len("work_item_id:" + correlation["work_item_id"]) > 200:
         tracing["omitted_tags"] = {"work_item_id": "exceeds_plugin_200_character_limit"}
     return {"_claude_tracing": {**config, "plugin_dir": str(directory), "schema_version": 2,

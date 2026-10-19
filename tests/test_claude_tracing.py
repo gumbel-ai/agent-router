@@ -15,7 +15,13 @@ from unittest.mock import patch
 from test_runtime import RuntimeHarness
 
 from router import claude_tracing
-from router.child import LANGFUSE_ENVIRONMENT_KEYS, child_environment, executor_command
+from router.child import (
+    LANGFUSE_ENVIRONMENT_KEYS,
+    child_environment,
+    executor_command,
+    langfuse_credentials_available,
+    launch,
+)
 
 MODEL = "anthropic/claude-sonnet-4-6"
 PROFILE = {"tools": ["Read", "Edit", "Write"], "allow": ["Read", "Edit", "Write"]}
@@ -264,6 +270,40 @@ class ClaudeTracingTests(RuntimeHarness, unittest.TestCase):
         # A Claude selection never authorizes another executor's tracing route.
         self.repository["claude_tracing"] = json.dumps(self.selection)
         self.assertFalse(self.runtime._tracing_requested({"invocation": task["invocation"]}))
+
+    def test_resumed_attempt_refreshes_availability_and_keeps_earlier_attempt(self):
+        def set_credentials(present):
+            for key in LANGFUSE_ENVIRONMENT_KEYS:
+                self.control.environment.pop(key, None)
+            if present:
+                self.control.environment.update(self.credentials)
+
+        def recording_launch(command, cwd, environment, directory, register, *, disposable=False):
+            if directory.name == "child":
+                launched.append(langfuse_credentials_available(environment))
+            return launch(command, cwd, environment, directory, register, disposable=disposable)
+
+        for before, after in ((True, False), (False, True)):
+            with self.subTest(before=before, after=after):
+                launched = []
+                set_credentials(before)
+                with patch("router.daemon.launch", side_effect=recording_launch):
+                    task_id = self.start("finished", f"resume-{before}-{after}", executor="claude")
+                    first = self.wait(task_id, {"awaiting_review", "failed", "interrupted"})
+                    self.assertEqual(first["status"], "awaiting_review", first)
+                    # Models a daemon restart with a changed credential environment.
+                    set_credentials(after)
+                    self.mutate("review", {"task_id": task_id, "request_id": f"reject-{before}-{after}",
+                                           "expected_attempt": 1, "outcome": "rejected", "feedback": "Correct it"})
+                    second = self.wait(task_id, {"awaiting_review", "failed", "interrupted"})
+                self.assertEqual(second["status"], "awaiting_review", second)
+                self.assertEqual(second["attempts"], 2)
+                self.assertEqual(launched, [before, after])
+                self.assertEqual(second["child_session_id"], first["child_session_id"])
+                expected = [{**first["tracing"], **claude_tracing.availability(value)} for value in (before, after)]
+                self.assertEqual(first["tracing"], expected[0])
+                self.assertEqual(second["tracing"], expected[1])
+                self.assertEqual([attempt["tracing"] for attempt in second["attempt_history"]], expected)
 
     def test_opted_claude_validation_git_subprocesses_strip_credentials(self):
         self.runtime.stop()

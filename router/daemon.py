@@ -951,9 +951,10 @@ class Runtime:
                 # A task can outlive a repository config reload. Fail closed for
                 # the next launch and remove the stale child opt-in.
                 self.store.update(task_id, lambda current: current.pop("tracing", None))
-            elif name == "child" and task["executor"] == "opencode":
+            elif name == "child" and (task["executor"] == "opencode" or "_claude_tracing" in task):
                 # Rejection/resume skips validate(); record what this child receives.
-                availability = opencode_tracing_availability(phase_environment)
+                availability = (opencode_tracing_availability(phase_environment) if task["executor"] == "opencode"
+                                else claude_tracing.availability(langfuse_credentials_available(phase_environment)))
                 self.store.update(task_id, lambda current: current["tracing"].update(availability))
             task = self.store.get(task_id)
         started = now_ms()
