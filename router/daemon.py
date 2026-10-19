@@ -16,7 +16,12 @@ import uuid
 from pathlib import Path
 
 from router.capacity import CapacitySampler
-from router.child import child_environment, executor_command, launch
+from router.child import (
+    TRACING_UNAVAILABLE,
+    child_environment,
+    executor_command,
+    launch,
+)
 from router.claude_executor import collect as collect_claude
 from router.claude_executor import public_usage as claude_public_usage
 from router.claude_executor import (
@@ -853,6 +858,12 @@ class Runtime:
         configured = self.control.settings.repositories.get(str(root))
         if configured is None or repo not in {root, common.parent}:
             raise ValueError("Repository/worktree is not an operator-configured target")
+        tracing = {}
+        if "tracing" in configured:
+            if configured["tracing"] != "requested":
+                raise ValueError("Repository tracing must be exactly \"requested\" when present")
+            # Recorded, never silently dropped: the child runs with Router's usual isolation and counters.
+            tracing = {"tracing": {"requested": True, "available": False, "reason": TRACING_UNAVAILABLE[executor]}}
         if executor == "codex":
             sandbox = configured.get("codex_sandbox")
             if sandbox not in {"read-only", "workspace-write"}:
@@ -877,11 +888,11 @@ class Runtime:
             profile = validate_claude(model, permission)
             return {"executor": executor, "requested_model": invocation["model"], "resolved_model": model,
                     "setup_command": configured["setup_command"], "permission_profile": profile,
-                    "child_session_id": str(uuid.uuid4())}
+                    "child_session_id": str(uuid.uuid4()), **tracing}
         if executor == "codex":
             return {"executor": executor, "requested_model": invocation["model"], "resolved_model": model,
                     "setup_command": configured["setup_command"], "permission_profile": {"sandbox": sandbox},
-                    **price_metadata(model, self.control.settings.model_prices)}
+                    **price_metadata(model, self.control.settings.model_prices), **tracing}
         permission_file = root / "opencode.json"
         try:
             permission = json.loads(permission_file.read_text())["permission"]
@@ -893,7 +904,7 @@ class Runtime:
             raise ValueError("Permission profile must explicitly use allow/deny, never ask")
         return {"executor": "opencode", "requested_model": invocation["model"], "resolved_model": model,
                 "setup_command": configured["setup_command"], "permission_profile": permission,
-                "child_session_id": "ses" + uuid.uuid4().hex}
+                "child_session_id": "ses" + uuid.uuid4().hex, **tracing}
 
     def phase(self, task_id: str, name: str, command: list[str], cwd: Path, *, collecting: bool = False) -> dict:
         task = self.store.get(task_id)

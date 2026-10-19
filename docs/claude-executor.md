@@ -70,8 +70,8 @@ Router retains the normal Claude login or configured API key and selected
 `CLAUDE_CODE_CHILD_SESSION`, and alternate model/provider/endpoint overrides.
 Configured option prefixes such as `--no-session-persistence` are refused, and a
 nonempty `CLAUDE_CODE_SKIP_PROMPT_HISTORY` is refused before version inspection: resumable children cannot honor that
-privacy policy, and Router does not silently override it. Tracing opt-in is a
-separate capability.
+privacy policy, and Router does not silently override it. The
+[tracing opt-in](tracing.md) is separate and currently records Claude tracing as unavailable.
 
 Claude may launch ordinary foreground tools in separate process groups. Router
 first interrupts the harness so it can close them. A negative CLI exit, missing

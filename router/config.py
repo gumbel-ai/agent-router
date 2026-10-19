@@ -71,6 +71,8 @@ class Settings(BaseSettings):
                 raise ValueError("Each repository requires an absolute path and setup_command")
             if "codex_sandbox" in config and config["codex_sandbox"] not in {"read-only", "workspace-write"}:
                 raise ValueError("Codex sandbox must be read-only or workspace-write; unrestricted access is unsupported")
+            if "tracing" in config and config["tracing"] != "requested":
+                raise ValueError("Repository tracing must be exactly \"requested\" when present; omit it to leave tracing off")
             result[str(Path(root).expanduser().resolve())] = config
         return result
 

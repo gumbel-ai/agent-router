@@ -48,6 +48,15 @@ def launch(command: list[str], cwd: Path, environment: dict[str, str], directory
             os.close(gate_write)
 
 
+# Why each runtime's own tracing plugin cannot run in a Router child. No route is
+# verified yet, so an opt-in is recorded as unavailable; Router never uploads traces.
+TRACING_UNAVAILABLE = {
+    "codex": "Codex children run with --ignore-user-config; tracing plugin hooks need trust from that ignored user layer",
+    "claude": "Claude children run with --safe-mode and no setting sources; installed plugins and hooks do not load",
+    "opencode": "Router-launched OpenCode tracing has no verified route",
+}
+
+
 def executor_command(settings: Settings, task: dict) -> list[str]:
     invocation = task["invocation"]
     prompt = invocation["task"]

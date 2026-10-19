@@ -64,6 +64,8 @@ For Codex instead, install and sign in to the Codex CLI, then run `router init -
 
 For Claude children, see [Claude executor configuration and verification](docs/claude-executor.md).
 
+`router init --tracing` records a child tracing request; see [child tracing](docs/tracing.md) for current availability.
+
 If a Codex or Claude shutdown stays unconfirmed, an operator must inspect and stop its remaining commands. Stop the daemon with `router daemon stop`, then run `router recover TASK_ID --reason 'what you inspected'` in an interactive terminal. Recovery requires the recorded process group to be stopped and a typed acknowledgement; it releases the slot but preserves uncertainty evidence and the worktree. Restart the service afterward. Agents must not perform recovery.
 
 The plugin is also installable through Claude's normal marketplace command after the Router runtime is installed:
