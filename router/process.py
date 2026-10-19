@@ -127,6 +127,9 @@ def _stop_group(record: dict, process: subprocess.Popen | None = None) -> None:
             os.killpg(record["pgid"], signal.SIGINT)
         except ProcessLookupError:
             return
+        except PermissionError as error:
+            _await_refusing_group(record, process, error)
+            return
         limit = time.monotonic() + 3
         while time.monotonic() < limit:
             if supervised_state(record, process) == "stopped":
@@ -148,6 +151,9 @@ def _stop_group(record: dict, process: subprocess.Popen | None = None) -> None:
         os.killpg(record["pgid"], signal.SIGTERM)
     except ProcessLookupError:
         return
+    except PermissionError as error:
+        _await_refusing_group(record, process, error)
+        return
     limit = time.monotonic() + 0.5
     while time.monotonic() < limit:
         if supervised_state(record, process) == "stopped":
@@ -155,9 +161,22 @@ def _stop_group(record: dict, process: subprocess.Popen | None = None) -> None:
         time.sleep(0.02)
     state = supervised_state(record, process)
     if state == "live":
-        os.killpg(record["pgid"], signal.SIGKILL)
+        try:
+            os.killpg(record["pgid"], signal.SIGKILL)
+        except PermissionError as error:
+            _await_refusing_group(record, process, error)
+            return
     elif state not in {"stopped", "exiting"}:
         raise UncertainProcess("Ownership became uncertain during termination; artifacts retained")
+    _await_group(record, process)
+
+
+def _await_refusing_group(record: dict, process: subprocess.Popen | None, error: PermissionError) -> None:
+    # The leader can start exiting after a live probe; Darwin then refuses the
+    # signal with EPERM (see supervised_state). Only a leader that is our own
+    # child cannot be reaped and reused elsewhere, so await it; otherwise keep the error.
+    if process is None:
+        raise error
     _await_group(record, process)
 
 

@@ -2,6 +2,7 @@ import fcntl
 import json
 import os
 import queue
+import signal
 import subprocess
 import sys
 import tempfile
@@ -1071,6 +1072,54 @@ class RuntimeTests(RuntimeHarness, unittest.TestCase):
                 stop_owned(record, leader)
                 self.assertIsNotNone(process.returncode)
                 self.assertEqual(owned_state(record), "stopped")
+
+    def test_leader_exiting_after_live_probe_refuses_signal_and_is_awaited(self):
+        refusing, killpg = {}, os.killpg
+        def refuse(pgid, signal_number):
+            row = refusing.get(pgid)
+            if row is None or signal_number != row["signal"]:
+                return killpg(pgid, signal_number)
+            # The leader exits on its own right after the live probe; Darwin then refuses the signal with EPERM.
+            (row["cwd"] / "exit").touch()
+            end = time.monotonic() + 15
+            while not row["completion"].exists() and time.monotonic() < end:
+                time.sleep(0.02)
+            row["refused"] += 1
+            raise PermissionError(1, "Operation not permitted")
+        patcher = patch("router.process.os.killpg", side_effect=refuse)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        wait = "from pathlib import Path; import time; Path('ready').touch()\nwhile not Path('exit').exists(): time.sleep(0.02)"
+        ignore_terminate = "import signal; signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+        # Name, script, interrupt first, refused signal, own child handle.
+        rows = (("refused interrupt", wait, True, signal.SIGINT, True),
+                ("refused terminate", wait, False, signal.SIGTERM, True),
+                ("refused kill", ignore_terminate + wait, False, signal.SIGKILL, True),
+                ("refused without child handle", wait, False, signal.SIGTERM, False))
+        for index, (name, script, interrupt_first, refused, own) in enumerate(rows):
+            with self.subTest(name):
+                cwd = self.root / f"refusing-{index}"
+                cwd.mkdir()
+                process, record = launch([sys.executable, "-c", script], cwd, os.environ.copy(),
+                                         self.root / f"refusing-group-{index}", lambda record: None)
+                self.addCleanup(lambda cwd=cwd, process=process: ((cwd / "exit").touch(), process.wait(timeout=15)))
+                record.update(interrupt_first=interrupt_first, executor="codex")
+                row = refusing[record["pgid"]] = {"cwd": cwd, "completion": Path(record["completion"]),
+                                                  "signal": refused, "refused": 0}
+                end = time.monotonic() + 15
+                while not (cwd / "ready").exists() and time.monotonic() < end:
+                    time.sleep(0.02)
+                self.assertTrue((cwd / "ready").exists())
+                if own:
+                    stop_owned(record, process)
+                    self.assertIsNotNone(process.returncode)
+                    self.assertEqual(owned_state(record), "stopped")
+                else:
+                    # Without our own unreaped leader, the group's identity is unproven: keep the error.
+                    with self.assertRaises(PermissionError):
+                        stop_owned(record)
+                self.assertEqual(row["refused"], 1)
+                self.assertEqual(json.loads(row["completion"].read_text())["exit_code"], 0)
 
     def test_uncertain_execution_reserves_admission_until_cancel(self):
         self.runtime.stop()

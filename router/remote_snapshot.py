@@ -99,6 +99,12 @@ def _git(root, *arguments, data=None, environment=None, statuses=(0,), limit=MAX
                 os.killpg(process.pid, signal.SIGKILL)
             except ProcessLookupError:
                 pass
+            except PermissionError:
+                # Darwin refuses signals to a group whose leader is exiting but not yet
+                # reapable. Our unreaped child's PID and group cannot be reused; the
+                # bounded wait below confirms its exit.
+                if process.returncode is not None:
+                    raise
             finally:
                 try:
                     process.wait(timeout=GIT_CLEANUP_TIMEOUT)
