@@ -370,7 +370,7 @@ class CodexPluginTests(unittest.TestCase):
                 self.configure(entries=entries)
                 (self.home / "rpc.json").write_text(json.dumps(options))
                 result = status("--codex", "--json")
-                self.assertEqual(result, {"codex_observation": availability(self.home)})
+                self.assertEqual(result, {"codex_observation": availability(self.home), "supports_work_item_id": True})
                 self.assertEqual(result["codex_observation"]["state"], expected)
         with patch("router.codex_plugin.shutil.which", return_value=None):
             self.assertEqual(status("--codex", "--json")["codex_observation"]["state"], "codex_not_installed")
@@ -380,6 +380,22 @@ class CodexPluginTests(unittest.TestCase):
             with self.subTest(flags=flags), self.assertRaises(SystemExit) as raised:
                 status(*flags)
             self.assertEqual(raised.exception.code, 2)
+
+    def test_status_codex_json_reports_work_item_id_support_from_the_run_parser(self):
+        output = io.StringIO()
+        with patch.object(sys, "argv", ["router", "status", "--codex", "--json"]), \
+                patch("router.codex_plugin.shutil.which", return_value=None), \
+                patch("router.cli.request", side_effect=AssertionError("daemon contacted")), \
+                redirect_stdout(output), redirect_stderr(io.StringIO()):
+            cli_main()
+        self.assertIs(json.loads(output.getvalue())["supports_work_item_id"], True)
+        # The same CLI parser accepts the option it advertises and passes it to the managed command.
+        with patch.object(sys, "argv", ["router", "run", "--work-item-id", "item-1", "--", "true"]), \
+                patch("router.cli.state_dir", return_value=self.home), \
+                patch("router.managed.run", return_value=0) as managed, self.assertRaises(SystemExit) as finished:
+            cli_main()
+        self.assertEqual(finished.exception.code, 0)
+        self.assertEqual(managed.call_args.kwargs, {"work_item_id": "item-1"})
 
     def test_readiness_bounds_protocol_failures_and_preserves_daemon(self):
         self.install("0.9.0")

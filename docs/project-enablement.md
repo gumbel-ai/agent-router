@@ -67,7 +67,8 @@ object, without contacting the Router daemon:
   "codex_observation": {
     "state": "hooks_untrusted",
     "detail": "10 Router hook(s) not trusted for the current version; open Codex and run /hooks"
-  }
+  },
+  "supports_work_item_id": true
 }
 ```
 
@@ -77,6 +78,11 @@ object, without contacting the Router daemon:
 `codex_not_installed`; JSON reports it so the caller decides. The command exits 0 for
 every state. Plain `router status --json` remains the unchanged task and native-session
 list; it does not carry readiness.
+
+`supports_work_item_id` is `true` when this installed CLI accepts
+`router run --work-item-id`; it is read from the `run` argument parser, not from the
+daemon or state. Treat an absent field, `false`, or a failed `status --codex --json`
+(an older Router exits 2 on the unknown option) as no support, and omit the option.
 
 The probe starts no process, agent turn or daemon, refreshes no plugins and writes
 no hook trust. It uses Codex's native non-originating daemon-probe handshake, which

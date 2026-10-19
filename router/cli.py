@@ -273,7 +273,7 @@ def main() -> None:
     run.add_argument("--label", help="Short name shown in status and fleet views")
     run.add_argument("--session", help="Launching Claude Code or Codex session ID")
     run.add_argument("--agent", help="Launching agent ID (with --session: exact attribution)")
-    run.add_argument("--work-item-id", help="Explicit caller work-item identity; never inferred from the label")
+    work_item_id = run.add_argument("--work-item-id", help="Explicit caller work-item identity; never inferred from the label")
     run.add_argument("argv", nargs=argparse.REMAINDER, help="-- command [arguments]")
     wait = commands.add_parser("wait", help="Wait for the oldest unacknowledged managed-command completion")
     wait.add_argument("--consumer", required=True)
@@ -521,7 +521,9 @@ def main() -> None:
             # A separate document: plain `status --json` is a list whose shape stays unchanged.
             if not args.json or args.task_id is not None or args.filter or args.watch or args.native_offset is not None:
                 parser.error("status --codex requires --json and no task ID, --filter, --watch or --native-offset")
-            print(json.dumps({"codex_observation": codex_availability()}, indent=2))
+            # Read from the `run` parser's own option, so the capability cannot drift from what `run` accepts.
+            print(json.dumps({"codex_observation": codex_availability(),
+                              "supports_work_item_id": "--work-item-id" in work_item_id.option_strings}, indent=2))
         elif args.command == "status":
             payload = {key: value for key, value in {"task_id": args.task_id, "filter": args.filter, "native_offset": args.native_offset}.items() if value}
             while True:
