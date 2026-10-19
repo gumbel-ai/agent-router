@@ -86,7 +86,33 @@ class SessionObserver:
                 "tool_history_partial": False}
 
     @staticmethod
-    def _reset_tools(record: dict) -> None:
+    def _reset_tools(record: dict, at: int | None = None) -> None:
+        if at is not None:
+            # A delayed root reset supersedes older tools, but not child work
+            # timestamped after it. Unknown starts have the same fixed lifetime.
+            active = {key: value for key, value in SessionObserver._active_tool_times(record).items() if value > at}
+            partial_until = record.get("tool_correlation_partial_until")
+            partial = bool(record.get("tool_correlation_partial") and (
+                not is_wire_integer(partial_until)
+                or partial_until > min(MAX_WIRE_INTEGER, at + MAX_INFLIGHT_AGE_MS)))
+            deadlines = [min(MAX_WIRE_INTEGER, value + MAX_INFLIGHT_AGE_MS) for value in active.values()]
+            if partial and is_wire_integer(partial_until):
+                deadlines.append(partial_until)
+            record.update(
+                inflight_tools=[item for item in record.get("inflight_tools", [])
+                                if item.get("tool_use_id") in active],
+                tool_event_at={key: value for key, value in record.get("tool_event_at", {}).items() if value > at},
+                tool_finished_at={key: value for key, value in record.get("tool_finished_at", {}).items()
+                                  if value > at},
+                active_tool_times=active, tool_active_until=max(deadlines, default=None),
+                tool_overflow_until=None, tool_overflow_active=False,
+                tool_correlation_partial=partial, tool_correlation_partial_until=partial_until if partial else None,
+                tool_history_partial=bool(record.get("tool_history_partial")
+                                          and record.get("tool_terminal_floor", -1) > at),
+                tool_terminal_floor=record.get("tool_terminal_floor", -1)
+                if record.get("tool_terminal_floor", -1) > at else -1,
+            )
+            return
         record.update(
             inflight_tools=[], tool_event_at={}, tool_finished_at={},
             active_tool_times={}, tool_active_until=None, tool_overflow_until=None,
@@ -191,11 +217,40 @@ class SessionObserver:
             state = False
         else:
             return False
-        if at < record.get("root_turn_at", -1):
+        if (at < record.get("root_turn_at", -1)
+                or at == record.get("root_turn_at") and record.get("root_turn_open") is False and state):
             return False
         changed = record.get("root_turn_open") is not state or record.get("root_turn_at") != at
         record.update(root_turn_open=state, root_turn_at=at)
         return changed
+
+    def _reconcile_codex_turn(self, db, record: dict, event: dict, at: int) -> bool:
+        """Derive turn status without resetting newer child tools or waiters."""
+        if (record["source"] != "codex" or record["status"] == "stopped"
+                or record["status"] == "unknown" and record.get("restart_uncertain_until") is not None):
+            return False
+        before = record["status"], record.get("visibility_reason")
+        checked_at = now_ms()
+        stopping_agent = event.get("agent_id") if event["kind"] == "subagent_stop" else None
+        running_child = db.execute("""SELECT 1 FROM observations WHERE
+                json_extract(data,'$.host_id')=? AND json_extract(data,'$.source')='codex'
+                AND session_id=? AND json_extract(data,'$.status')='running'
+                AND json_extract(data,'$.last_event_at') BETWEEN ? AND ?
+                AND NOT (json_extract(data,'$.agent_id') IS ? AND json_extract(data,'$.state_at')<=?)
+                LIMIT 1""", (self.host_id, record["session_id"], checked_at - STALE_AFTER_MS, checked_at,
+                              stopping_agent, at)).fetchone() is not None
+        running = (self._has_active_tool(record, checked_at) or running_child
+                   or record.get("root_turn_open") is True and not record.get("needs_input"))
+        if record.get("needs_input") and record["status"] == "idle":
+            running = False  # Keep newer waiting evidence; live tools still count as active.
+        # Missing root hooks cannot establish that the root turn stopped.
+        if running:
+            record["status"] = "running"
+        elif record.get("root_turn_open") is False:
+            record["status"] = "idle"
+        if record.get("visibility_reason") in {None, WAITING_REASON}:
+            record["visibility_reason"] = WAITING_REASON if record.get("needs_input") else None
+        return before != (record["status"], record.get("visibility_reason"))
 
     @staticmethod
     def _waiter_history_partial(record: dict) -> bool:
@@ -284,6 +339,13 @@ class SessionObserver:
                 # Keep the reason consistent with the waiters whatever the arrival order.
                 record["visibility_reason"] = WAITING_REASON if record["needs_input"] else None
             if at < record["last_event_at"]:
+                if (root_changed and source == "codex"
+                        and kind in {"session_start", "prompt", "stop", "stop_failure"}):
+                    self._reset_waiters(record, at)
+                    self._reset_tools(record, at)
+                    record["tool_reset_at"] = max(record.get("tool_reset_at", -1), at)
+                if root_changed or kind == "subagent_stop":
+                    evidence_changed |= self._reconcile_codex_turn(db, record, event, at)
                 if evidence_changed:
                     self._put_session(db, record)
                 return self.view(record, max(now_ms(), at))
@@ -300,7 +362,8 @@ class SessionObserver:
                     and kind != "session_end"
                     # A same-time tie must not reopen a turn that already ended.
                     or at == record["last_event_at"] and record.get("last_event") in {"stop", "stop_failure"}
-                    and kind in {"task_created", "task_completed", "subagent_start", "subagent_stop"}):
+                    and (kind in {"task_created", "task_completed", "subagent_start", "subagent_stop"}
+                         or source == "codex" and kind in {"session_start", "prompt"})):
                 if waiter_changed:
                     self._put_session(db, record)
                 return self.view(record, max(now_ms(), at))
@@ -398,6 +461,8 @@ class SessionObserver:
                 raise ValueError("Unsupported session observation")
             if kind in {"session_start", "session_end", "prompt", "stop", "stop_failure"}:
                 record["tool_reset_at"] = max(record.get("tool_reset_at", -1), at)
+            if root_changed or kind == "subagent_stop":
+                self._reconcile_codex_turn(db, record, event, at)
             self._put_session(db, record)
         return self.view(record, max(now_ms(), at))
 

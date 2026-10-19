@@ -18,6 +18,7 @@ from test_control import observe_every_session, settings
 from router import observer_hook
 from router.cli import fleet_table, sessions_table
 from router.daemon import Controller
+from router.native import STALE_AFTER_MS
 
 SESSION = "019a0000-0000-7000-8000-000000000001"
 CHILD = "019a0000-0000-7000-8000-000000000002"
@@ -122,12 +123,39 @@ class CodexObservationTests(unittest.TestCase):
         self.assertFalse(session["needs_input"])
 
     def test_restart_marks_running_codex_work_uncertain(self):
+        for root_observed in (True, False):
+            with self.subTest(root_observed=root_observed):
+                self.control = Controller(settings(self.root / "repo"), {}, self.root / f"restart-{root_observed}")
+                self.control.start_lifecycle_writer()
+                self.addCleanup(self.control.stop_lifecycle_writer)
+                if root_observed:
+                    self.hook("SessionStart", source="startup")
+                self.hook("SubagentStart", turn_id="t2", agent_id=CHILD, agent_type="default")
+                self.hook("SubagentStop", turn_id="t2", agent_id=CHILD, agent_type="default")
+                latest = self.clock
+                self.control.sessions.reconcile_restart()
+                self.control.native.reconcile_restart()
+                self.clock = latest - 15  # A pre-restart root stop arrives after newer child evidence.
+                self.hook("Stop", turn_id="t1", stop_hook_active=False)
+                self.assertEqual(self.agent()["status"], "unknown")
+                self.assertEqual(self.session()["status"], "unknown")
+                self.assertIn("restart", self.session()["visibility_reason"].lower())
+                with patch("router.sessions.now_ms", return_value=latest + 1):
+                    self.assertIsNone(self.control.sessions.fleet_records(10)[1])
+                self.clock = latest + 100
+
+    def test_delayed_root_stop_keeps_clock_rollback_uncertain(self):
         self.hook("SessionStart", source="startup")
         self.hook("SubagentStart", turn_id="t2", agent_id=CHILD, agent_type="default")
-        self.control.sessions.reconcile_restart()
-        self.control.native.reconcile_restart()
-        self.assertEqual(self.agent()["status"], "unknown")
-        self.assertIn("restart", self.session()["visibility_reason"].lower())
+        self.hook("SubagentStop", turn_id="t2", agent_id=CHILD, agent_type="default")
+        latest = self.clock
+        self.clock = latest - 15
+        with patch("router.sessions.now_ms", return_value=latest - 1):
+            self.hook("Stop", turn_id="t1", stop_hook_active=False)
+            session = self.session()
+            self.assertEqual(session["status"], "unknown")
+            self.assertIn("clock", session["visibility_reason"])
+            self.assertIsNone(self.control.sessions.fleet_records(10)[1])
 
     def test_session_end_closes_subagents_left_unknown_by_a_restart(self):
         self.hook("SessionStart", source="startup")
@@ -212,30 +240,122 @@ class CodexObservationTests(unittest.TestCase):
 
     def test_root_turn_state_is_ordered_by_root_events(self):
         child = {"agent_id": CHILD, "turn_id": "t2"}
+        sibling = {"agent_id": "worker-b", "turn_id": "t3"}
         cases = {
-            # Root tool activity after Stop reopens the root turn.
             "root tool after stop": ([("Stop", 30, {}), ("PreToolUse", 40, {"tool_use_id": "r1"}),
                                       ("PostToolUse", 50, {"tool_use_id": "r1"}), ("SubagentStop", 60, child)],
-                                     "running"),
-            # A delayed root Stop still closes the turn despite newer child events.
+                                     "running", False, 0, 1),
             "delayed root stop": ([("PreToolUse", 45, {**child, "tool_use_id": "c1"}),
                                    ("PostToolUse", 50, {**child, "tool_use_id": "c1"}),
-                                   ("Stop", 40, {}), ("SubagentStop", 60, child)], "idle"),
+                                   ("SubagentStop", 60, child), ("Stop", 40, {})], "idle", False, 0, 0),
+            "delayed root prompt": ([("Stop", 30, {}), ("SubagentStop", 60, child),
+                                     ("UserPromptSubmit", 40, {})], "running", False, 0, 1),
+            "delayed session start": ([("Stop", 30, {}), ("SubagentStop", 60, child),
+                                       ("SessionStart", 40, {"source": "compact"})], "running", False, 0, 1),
+            "older child tool": ([("PreToolUse", 35, {**child, "tool_use_id": "c1"}),
+                                  ("SubagentStop", 60, child), ("Stop", 40, {})], "idle", False, 0, 0),
+            "newer child tool": ([("PreToolUse", 50, {**child, "tool_use_id": "c1"}),
+                                  ("SubagentStop", 60, child), ("Stop", 40, {})], "running", False, 1, 1),
+            "waiting with live child tool": ([("PreToolUse", 50, {**child, "tool_use_id": "c1"}),
+                                              ("PermissionRequest", 60, child), ("Stop", 40, {})],
+                                             "idle", True, 1, 1),
+            "older child waiter": ([("PermissionRequest", 35, child), ("SubagentStop", 60, sibling),
+                                    ("Stop", 40, {})], "idle", False, 0, 0),
+            "newer child waiter": ([("SubagentStop", 60, child), ("PermissionRequest", 50, sibling),
+                                    ("Stop", 40, {})], "idle", True, 0, 1),
+            "running sibling": ([("SubagentStart", 50, sibling), ("SubagentStop", 60, child),
+                                 ("Stop", 40, {})], "running", False, 0, 1),
+            "delayed sibling stop": ([("SubagentStart", 35, sibling), ("Stop", 40, {}),
+                                      ("SubagentStop", 60, child), ("SubagentStop", 50, sibling)],
+                                     "idle", False, 0, 0),
+            "terminal prompt tie": ([("SubagentStop", 35, child), ("Stop", 40, {}),
+                                     ("UserPromptSubmit", 40, {})], "idle", False, 0, 0),
+            "terminal start tie": ([("SubagentStop", 35, child), ("Stop", 40, {}),
+                                    ("SessionStart", 40, {"source": "compact"})], "idle", False, 0, 0),
+            "terminal tie": ([("Stop", 40, {}), ("SubagentStop", 60, child),
+                              ("UserPromptSubmit", 40, {})], "idle", False, 0, 0),
         }
-        for name, (events, status) in cases.items():
-            with self.subTest(name):
-                self.control = Controller(settings(self.root / "repo"), {}, self.root / f"state-{name}")
+        for age in (STALE_AFTER_MS - 1, STALE_AFTER_MS, STALE_AFTER_MS + 1):
+            fresh = age <= STALE_AFTER_MS
+            cases[f"child freshness {age}"] = (
+                [("SubagentStart", 90 - age, sibling), ("SubagentStop", 60, child), ("Stop", 40, {})],
+                "running" if fresh else "idle", False, 0, 1 if fresh else 0,
+            )
+        cases = {name: (True, *case) for name, case in cases.items()}
+        cases.update({
+            "missing root child completion": (False, [("SubagentStart", 35, child),
+                                                       ("SubagentStop", 60, child)], "running", False, 0, 1),
+            "missing root lone completion": (False, [("SubagentStop", 60, child)], "unknown", False, 0, 0),
+            "missing root stale child": (False, [("SubagentStart", -STALE_AFTER_MS, child),
+                                                  ("SubagentStop", 60, child)], "running", False, 0, 1),
+            "missing root live sibling": (False, [("SubagentStart", 50, sibling),
+                                                   ("SubagentStop", 60, child)], "running", False, 0, 1),
+            "missing root live tool": (False, [("PreToolUse", 50, {**child, "tool_use_id": "c1"}),
+                                                ("SubagentStop", 60, child)], "running", False, 1, 1),
+            "missing root newer waiter": (False, [("PermissionRequest", 60, sibling),
+                                                   ("SubagentStop", 50, child)], "idle", True, 0, 1),
+            "missing root waiting with live tool": (False, [
+                ("PreToolUse", 50, {**child, "tool_use_id": "c1"}), ("PermissionRequest", 60, sibling),
+                ("SubagentStop", 70, child)], "idle", True, 1, 1),
+        })
+        for name, (root_observed, events, status, waiting, tools, active) in cases.items():
+            for reordered in (False, True):
+                with self.subTest(name=name, reordered=reordered), \
+                        patch("router.sessions.now_ms", return_value=self.clock + 100):
+                    self.control = Controller(settings(self.root / "repo"), {},
+                                              self.root / f"state-{name}-{reordered}")
+                    self.control.start_lifecycle_writer()
+                    self.addCleanup(self.control.stop_lifecycle_writer)
+                    start = self.clock
+                    if root_observed:
+                        self.hook("SessionStart", source="startup")
+                        self.hook("UserPromptSubmit", turn_id="t1", prompt=CONTENT)
+                        self.hook("SubagentStart", agent_type="default", **child)
+                    ordered = events if reordered else sorted(events, key=lambda item: item[1])
+                    for hook_name, offset, fields in ordered:
+                        self.clock = start + offset
+                        self.hook(hook_name, tool_name="Bash", tool_input={}, tool_response="", **fields)
+                    session = self.session()
+                    self.assertEqual(session["last_event_at"], start + max(item[1] for item in events) + 10)
+                    self.assertEqual((session["status"], session["needs_input"], session["inflight_tool_count"]),
+                                     (status, waiting, tools))
+                    with patch("router.sessions.now_ms", return_value=start + 100):
+                        self.assertEqual(self.control.sessions.fleet_records(10)[1], active)
+                    if name == "older child tool":
+                        self.clock = start + 35
+                        self.hook("PreToolUse", **child, tool_use_id="c1", tool_name="Bash", tool_input={})
+                        self.assertEqual(self.session()["inflight_tool_count"], 0)
+                    self.clock = start + 200
+
+    def test_delayed_root_reset_preserves_unresolved_tool_uncertainty(self):
+        child = {"agent_id": CHILD, "turn_id": "t2"}
+        cases = {"older": ("idle", False, 0), "newer": ("unknown", True, 1), "unorderable": ("unknown", True, 0)}
+        for timing, expected in cases.items():
+            with self.subTest(timing=timing), patch("router.sessions.MAX_EXACT_INFLIGHT_TOOLS", 1):
+                self.control = Controller(settings(self.root / "repo"), {}, self.root / f"overflow-{timing}")
                 self.control.start_lifecycle_writer()
                 self.addCleanup(self.control.stop_lifecycle_writer)
                 start = self.clock
                 self.hook("SessionStart", source="startup")
-                self.hook("UserPromptSubmit", turn_id="t1", prompt=CONTENT)
                 self.hook("SubagentStart", agent_type="default", **child)
-                for hook_name, offset, fields in events:
-                    self.clock = start + offset
-                    self.hook(hook_name, tool_name="Bash", tool_input={}, tool_response="", **fields)
-                self.assertEqual(self.session()["status"], status)
-                self.clock = start + 100
+                for number in range(2):
+                    self.clock = start + (50 if timing == "newer" else 30) + number
+                    self.hook("PreToolUse", **child, tool_use_id=f"tool-{number}", tool_name="Bash", tool_input={})
+                self.clock = start + 60
+                self.hook("SubagentStop", **child)
+                if timing == "unorderable":
+                    # An unresolved overflow without a deadline cannot be ordered against a root reset.
+                    with self.control.store.transaction() as db:
+                        db.execute("""UPDATE sessions SET data=json_set(data,'$.tool_correlation_partial_until',NULL)
+                            WHERE source='codex' AND session_id=?""", (SESSION,))
+                self.clock = start + 40
+                self.hook("Stop", stop_hook_active=False)
+                session = self.session()
+                self.assertEqual((session["status"], session["tool_visibility_partial"], session["inflight_tool_count"]),
+                                 expected)
+                with patch("router.sessions.now_ms", return_value=start + 100):
+                    self.assertEqual(self.control.sessions.fleet_records(10)[1], 0 if timing == "older" else None)
+                self.clock = start + 200
 
     def test_status_and_fleet_tables_label_the_source(self):
         self.hook("SessionStart", source="startup")

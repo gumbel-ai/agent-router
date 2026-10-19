@@ -96,6 +96,16 @@ This namespace is shared with the Langfuse correlation bridge (TODO item 9): run
   `PreToolUse` with no `PostToolUse` in the captured session. Router's existing tool
   deadline handles this; the tool must not stay active forever. [V]
 - **Parent and subagent events interleave** in one Codex process. [V]
+  Router orders the root turn independently of child events. A delayed root stop,
+  prompt, or session start reconciles session status without replacing the newest
+  event timestamp, discarding newer child tools, or clearing newer input requests.
+  With an observed closed root turn and no recently running child or live tool,
+  session status becomes idle. Missing root hooks do not establish that the root
+  stopped; child completion alone does not establish idle. Newer input requests
+  retain their waiting state. Same-time root starts and prompts cannot
+  reopen a stopped turn. Pre-restart delayed evidence keeps restart uncertainty
+  until fresh evidence arrives; no elapsed-time inference establishes continued
+  execution.
 
 ## Gaps (shown as unavailable, never inferred)
 
