@@ -266,7 +266,9 @@ def main() -> None:
     status.add_argument("--filter", choices=["needs_decision"])
     status.add_argument("--json", action="store_true")
     status.add_argument("--watch", action="store_true")
-    status.add_argument("--native-offset", type=int, default=0, help="Native observation page offset (100 per page)")
+    status.add_argument("--native-offset", type=int, help="Native observation page offset (100 per page)")
+    status.add_argument("--codex", action="store_true",
+                        help="With --json only: print Codex observation readiness for this directory, without the daemon")
     task_diff = commands.add_parser("task-diff", help="Read one retained task patch as a bounded JSON receipt")
     task_diff.add_argument("task_id")
     task_diff.add_argument("--attempt", type=int, required=True)
@@ -360,15 +362,16 @@ def main() -> None:
     uninstall.add_argument("--yes", action="store_true")
     service = commands.add_parser("service", help="Manage the explicitly installed user service")
     service.add_argument("action", choices=["start", "stop", "restart", "status"])
-    recover = commands.add_parser("recover", help="Interactively acknowledge an inspected Codex shutdown; daemon must be stopped")
+    recover = commands.add_parser("recover", help="Interactively acknowledge an inspected executor shutdown; daemon must be stopped")
     recover.add_argument("task_id")
     recover.add_argument("--reason", required=True, help="What was inspected and stopped; retained in task history")
     init = commands.add_parser("init", help="Opt this Git project into external delegation")
-    init.add_argument("--executor", choices=["opencode", "codex"], default="opencode")
+    init.add_argument("--executor", choices=["opencode", "codex", "claude"], default="opencode",
+                      help="Execution adapter; Claude configuration accepts one executable path without arguments")
     init.add_argument("--sandbox", choices=["read-only", "workspace-write"], help="Explicit Codex sandbox; required for noninteractive Codex init")
     init.add_argument("--model", help="alias=provider/exact-model")
     init.add_argument("--setup-command", help="Child dependency setup command; not run during init")
-    init.add_argument("--permissions", help="Explicit allow/deny JSON; never overwrites existing permissions")
+    init.add_argument("--permissions", help="Explicit executor permission JSON; never overwrites OpenCode permissions")
     init.add_argument("--concurrency", type=int)
     init.add_argument("--timeout", type=float)
     init.add_argument("--attempts", type=int)
@@ -552,6 +555,11 @@ def main() -> None:
                 if not getattr(args, "watch", False):
                     break
                 time.sleep(config.refresh_seconds)
+        elif args.command == "status" and args.codex:
+            # A separate document: plain `status --json` is a list whose shape stays unchanged.
+            if not args.json or args.task_id is not None or args.filter or args.watch or args.native_offset is not None:
+                parser.error("status --codex requires --json and no task ID, --filter, --watch or --native-offset")
+            print(json.dumps({"codex_observation": codex_availability()}, indent=2))
         elif args.command == "status":
             payload = {key: value for key, value in {"task_id": args.task_id, "filter": args.filter, "native_offset": args.native_offset}.items() if value}
             while True:

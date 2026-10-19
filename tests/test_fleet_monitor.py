@@ -49,10 +49,14 @@ from router.fleet import (
 )
 from router.fleet_snapshot import MAX_SNAPSHOT_BYTES, AlertHistory, bound, compose
 from router.host import HostIdentity, current_boot_id, stable_host_id
-from router.native import NativeObserver
+from router.native import STALE_AFTER_MS, NativeObserver
 from router.paths import PROJECT_MARKER, PROJECT_MARKER_CONTENT
 from router.sanitize import bound_text
-from router.sessions import MAX_EXACT_INFLIGHT_TOOLS, SessionObserver
+from router.sessions import (
+    MAX_EXACT_INFLIGHT_TOOLS,
+    MAX_INFLIGHT_AGE_MS,
+    SessionObserver,
+)
 from router.validation import HOST_STRING_LIMITS
 
 
@@ -300,12 +304,55 @@ class SessionAndCapacityTests(unittest.TestCase):
         self.assertEqual(active, 1)
 
     def test_delayed_pre_restart_tool_start_stays_active_after_restart_window(self):
-        self.event("prompt", observed_at=self.now - 3000)
-        self.event("notification", notification_type="agent_completed", observed_at=self.now - 1000)
-        self.observer.reconcile_restart()
-        self.event("tool_start", tool_use_id="late", activity="Bash", observed_at=self.now - 2000)
-        with patch("router.sessions.now_ms", return_value=self.now + 61_000):
-            self.assertEqual(self.observer.fleet_records(10)[1], 1)
+        now = 10_000_000
+        with patch("router.sessions.now_ms", return_value=now):
+            self.event("prompt", observed_at=now - 3000)
+            self.event("notification", notification_type="agent_completed", observed_at=now - 1000)
+            self.observer.reconcile_restart()
+            self.event("tool_start", tool_use_id="late", activity="Bash", observed_at=now - 2000)
+        with self.store.connect() as db:
+            before = db.execute("SELECT data FROM sessions").fetchone()[0]
+        stored = json.loads(before)
+        original = now - 1000 + STALE_AFTER_MS
+        tool_until = now - 2000 + MAX_INFLIGHT_AGE_MS
+        self.assertEqual(stored["status"], "unknown")
+        self.assertEqual(stored["last_event_at"], now - 1000)
+        self.assertEqual(stored["restart_uncertain_until"], original)
+        self.assertEqual(stored["tool_active_until"], tool_until)
+        self.assertEqual(stored["active_tool_times"], {"late": now - 2000})
+        capacity = CapacitySampler(self.store.path.parent)
+
+        class Host:
+            def view(self, at):
+                return {**snapshot("host")["host"], "observed_at": at}
+
+        controller = type("Controller", (), {"host": Host(), "sessions": self.observer,
+                                             "native": NativeObserver(self.store, "host"), "capacity": capacity})()
+        for checked_at in sorted({deadline + offset for deadline in (original, tool_until) for offset in (-1, 0, 1)}):
+            expected = None if checked_at <= max(original, tool_until) else 0
+            capacity._latest = {"logical_cpus": 8, "load_1m": 0, "cpu_busy_pct": 0,
+                                "memory_available_bytes": 32 * 1024**3, "disk_available_bytes": 64 * 1024**3,
+                                "observed_at": checked_at - 100, "partial": False}
+            with self.subTest(checked_at=checked_at), \
+                    patch("router.sessions.now_ms", return_value=checked_at), \
+                    patch("router.native.now_ms", return_value=checked_at), \
+                    patch("router.fleet_snapshot.now_ms", return_value=checked_at), \
+                    patch("router.capacity.time.time", return_value=checked_at / 1000):
+                for limit in (0, 1, 100):
+                    records, active = self.observer.fleet_records(limit)
+                    self.assertEqual(active, expected)
+                    self.assertEqual(len(records), int(limit > 0))
+                    if records:
+                        self.assertEqual(records[0]["status"], "unknown")
+                        self.assertEqual(records[0]["inflight_tool_count"], 1)
+                    result = compose(controller, history_limit=limit)
+                    self.assertEqual(result["capacity"]["active_claude_sessions"], expected)
+                    self.assertEqual(result["capacity"]["active_agents"], 0)
+                    self.assertEqual(result["capacity"]["capacity_state"],
+                                     "unknown" if expected is None else "available")
+                self.assertEqual(compose(controller), result)
+                with self.store.connect() as db:
+                    self.assertEqual(db.execute("SELECT data FROM sessions").fetchone()[0], before)
 
     def test_delayed_tool_start_after_agent_completed_counts_once_as_active(self):
         self.event("prompt", observed_at=self.now - 3000)

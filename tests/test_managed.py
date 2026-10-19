@@ -8,6 +8,7 @@ import tempfile
 import threading
 import time
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import redirect_stderr
 from itertools import chain, repeat
 from pathlib import Path
@@ -732,27 +733,34 @@ class ManagedRunTests(unittest.TestCase):
                     consumer.join(15)
 
     def test_a_start_the_daemon_missed_is_recovered_while_the_command_runs(self):
-        fifo = self.state.parent / "running"
-        os.mkfifo(fifo)
-        seen = []
+        ready, release = self.state.parent / "ready", self.state.parent / "release"
+        command = ("import pathlib,time; "
+                   f"ready=pathlib.Path({str(ready)!r}); release=pathlib.Path({str(release)!r}); "
+                   "ready.touch(); deadline=time.monotonic()+45; "
+                   "exec('while not release.exists():\\n"
+                   " if time.monotonic() >= deadline: raise TimeoutError(\"fixture release not received\")\\n"
+                   " time.sleep(.02)')")
 
         def daemon_returns_then_release():
-            deadline = time.monotonic() + 10
-            while not list(completion_directory(self.state).glob("start-*.json")) and time.monotonic() < deadline:
-                time.sleep(0.02)
-            self.daemon_up = True  # The daemon is back while the command still runs.
-            records, active = self.control.managed.records()
-            seen.append(([record["label"] for record in records], active))
-            with open(fifo, "w"):
-                pass  # Let the command finish.
+            try:
+                deadline = time.monotonic() + 15
+                while not ready.exists() or not list(completion_directory(self.state).glob("start-*.json")):
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError("managed fixture readiness or start evidence not received")
+                    time.sleep(0.02)
+                self.daemon_up = True  # The daemon is back while the command still runs.
+                records, active = self.control.managed.records()
+                return [record["label"] for record in records], active
+            finally:
+                release.touch()  # The release remains visible even before the child reads it.
 
         self.daemon_up = False
-        helper = threading.Thread(target=daemon_returns_then_release)
-        helper.start()
-        with patch("router.managed.request", side_effect=self.request):
-            run([sys.executable, "-c", f"open({str(fifo)!r}).read()"], "missed", None, None, self.state)
-        helper.join(10)
-        self.assertEqual(seen, [(["missed"], 1)])
+        with ThreadPoolExecutor(max_workers=1) as helpers:
+            helper = helpers.submit(daemon_returns_then_release)
+            with patch("router.managed.request", side_effect=self.request):
+                code = run([sys.executable, "-c", command], "missed", None, None, self.state)
+            self.assertEqual(helper.result(timeout=15), (["missed"], 1))
+        self.assertEqual(code, 0)
         self.assertEqual(self.managed()["missed"]["status"], "exited")
 
     def test_identities_are_refused_not_rewritten(self):

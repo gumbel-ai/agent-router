@@ -303,6 +303,9 @@ item before requesting review.
   consume the rest of a field.
 - Validate identifiers structurally (no controls, no surrounding whitespace, bounded
   length). Do not reject them for looking like secrets.
+- Validate execution identity independently of usage and cost. A nonempty reported
+  model map that omits the selected model must fail even when malformed counters,
+  invalid entries, or accounting bounds make usage unavailable.
 - A value that fails a safety check should degrade only that value. For example, an
   unusable transcript path must not reject the whole lifecycle event.
 
@@ -374,6 +377,12 @@ item before requesting review.
 
 **Persistence and upgrades**
 
+- Validate cumulative usage per model and token bucket before aggregation. Growth
+  in one bucket must not hide another bucket's disappearance or decrease; legacy
+  aggregate-only baselines cannot establish that continuity. Bound the cumulative
+  sums in current and persisted maps as well as each contributor and attempt delta.
+  Revalidate retained flat accounting frames and final public totals on read; a
+  collector guard alone cannot protect completed records written by older versions.
 - Version any change to a persisted digest or format. Verify legacy values once, then
   upgrade them, and test the upgrade from the previously pushed format. This applies
   even before merge, because a pushed branch may already be running.
@@ -388,6 +397,9 @@ item before requesting review.
 
 - When enabling a platform, trace installation, reconfiguration, and uninstall together;
   platform-specific service management must not leak into manual-daemon paths.
+- Bind native version inspection and execution to the same resolved executable for
+  each new attempt. Recovery consumes its persisted binding; changed configuration
+  or a worktree PATH must not select an uninspected executable.
 - Validate every native inventory diagnostic channel and compare required entries
   before classifying trust. Missing entries are incomplete evidence; warnings must
   retain their cause without invalidating complete, unrelated evidence.
@@ -409,6 +421,13 @@ item before requesting review.
   the new state in one swap.
 - A process-group leader exiting does not prove the group exited. After a failure,
   check the group and SIGKILL any members that remain.
+- A disappeared process can raise `ProcessLookupError` when signaled or
+  `FileNotFoundError` when reading Linux `/proc`. Cleanup must handle both while
+  preserving ownership checks and surfacing permission or malformed-state errors.
+- Publish fixture PID payloads atomically, after signal handlers and foreground
+  groups are initialized. Output/session files are not readiness. Register cleanup
+  before publication, PID parsing, identity probes and group assertions; cleanup
+  must also account for foreground groups outside the launcher group.
 - Keep failure state independent of diagnostic text. An exception or sanitized stderr
   can have an empty message; it must still trigger failed delivery and owned-process
   cleanup, with a nonempty diagnostic fallback.

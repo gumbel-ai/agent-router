@@ -99,6 +99,24 @@ class SetupTests(unittest.TestCase):
             self.assertIsNotNone(config.opencode_command)
 
 
+    def test_claude_opt_in_records_its_explicit_profile_and_preserves_other_executors(self):
+        repo = self.repository("claude")
+        profile = {"tools": ["Read", "Edit"], "allow": ["Read", "Edit"]}
+        with patch("router.setup.shutil.which", side_effect=lambda name: "/usr/bin/" + name), patch("router.setup.refresh_service"):
+            initialize(repo, "worker=anthropic/claude-sonnet-4-6", "true", profile, 2, 120, 2, executor="claude")
+            config, _ = load_settings()
+            self.assertTrue(config.delegation_enabled)
+            self.assertIsNone(config.opencode_command)
+            self.assertIsNone(config.codex_command)
+            self.assertEqual(config.claude_command, ["/usr/bin/claude"])
+            self.assertEqual(json.loads(config.repositories[str(repo.resolve())]["claude_permissions"]), profile)
+            self.assertFalse((repo / "opencode.json").exists())
+            initialize(repo, "codex=openai/gpt-5.3-codex", "true", None, 2, 120, 2,
+                       executor="codex", sandbox="workspace-write")
+            config, _ = load_settings()
+            self.assertEqual(json.loads(config.repositories[str(repo.resolve())]["claude_permissions"]), profile)
+            self.assertIsNotNone(config.codex_command)
+
     def test_launch_agent_uses_explicit_runtime_and_shared_private_state(self):
         interpreter = self.root / "managed" / "bin" / "python"
         interpreter.parent.mkdir(parents=True)

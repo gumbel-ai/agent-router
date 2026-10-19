@@ -106,7 +106,11 @@ This namespace is shared with the Langfuse correlation bridge (TODO item 9): run
   reopen a stopped turn. Pre-restart delayed evidence keeps restart uncertainty
   until fresh evidence arrives, including sessions already unknown before restart.
   Repeated restarts preserve the original evidence-based uncertainty deadline;
-  no elapsed-time inference establishes continued execution. Root resets have their own monotonic watermark, so an older reset
+  an accepted delayed tool can have a later retained deadline. While the restart
+  remains unresolved, exact session totals and capacity stay unknown through both
+  deadlines, including equality, and become eligible for an exact count only after
+  both expire. Reads and further restarts do not refresh either deadline.
+  No elapsed-time inference establishes continued execution. Root resets have their own monotonic watermark, so an older reset
   still removes older tool evidence after newer root activity, while replaying a
   reset cannot clear input requests delivered afterward at the same timestamp.
   Terminal tie precedence uses the root-turn watermark even when child activity
