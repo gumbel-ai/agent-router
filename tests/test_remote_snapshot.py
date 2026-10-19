@@ -504,8 +504,12 @@ while True:
 
         def exiting(pgid, signal_number):
             # The leader starts exiting just as cleanup signals it; the kernel refuses the signal.
-            original_killpg(pgid, signal.SIGKILL)
+            # A fast Git may already be exiting, so the real call can itself be refused.
             refused.append(pgid)
+            try:
+                original_killpg(pgid, signal.SIGKILL)
+            except (PermissionError, ProcessLookupError):
+                pass
             raise PermissionError(1, "Operation not permitted")
 
         with patch.object(remote_snapshot.subprocess, "Popen", side_effect=launch), \
