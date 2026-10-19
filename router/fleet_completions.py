@@ -5,7 +5,7 @@ import math
 import threading
 from concurrent.futures import ThreadPoolExecutor
 
-from router.client import CompletionBusy, request
+from router.client import CompletionBusy, CompletionRefused, request
 from router.fleet import (
     MAX_HOSTS,
     FleetConfig,
@@ -35,14 +35,14 @@ def _selected(config: FleetConfig, only: str | None) -> list[FleetHost]:
     return hosts
 
 
-def _result(raw: bytes, consumer: str, ack: tuple[str, str, str] | None = None) -> dict:
+def _result(raw: bytes, consumer: str, ack: dict | None = None) -> dict:
     if len(raw) > MAX_COMPLETION_BYTES:
         raise ValueError("Completion response exceeds 16 KiB")
     value = json.loads(raw)
     if not isinstance(value, dict) or value.get("consumer") != consumer:
         raise ValueError("Invalid completion consumer response")
     if ack is not None:
-        event_id, host_id, subscription_id = ack
+        event_id, host_id, subscription_id = (ack[key] for key in ("event_id", "host_id", "subscription_id"))
         if value.get("acknowledged") is not True or value.get("event_id") != event_id \
                 or value.get("host_id") != host_id or value.get("subscription_id") != subscription_id:
             raise ValueError("Invalid completion acknowledgment response")
@@ -115,8 +115,25 @@ def _query(host, consumer, timeout, arguments, local, *, cancelled=None, ack=Non
         for key in ("exit_code", "errno"):
             if getattr(error, key) is not None:
                 wrapper["error"][key] = getattr(error, key)
+        if ack is not None and error.code == "exit_failed" and error.exit_code == 1 and error.stdout is not None:
+            try:
+                if len(error.stdout) > MAX_COMPLETION_BYTES:
+                    raise ValueError("Completion refusal response exceeds 16 KiB")
+                refusal = json.loads(error.stdout)
+                if not isinstance(refusal, dict) or set(refusal) != {"schema_version", "error", *ack} \
+                        or type(refusal.get("schema_version")) is not int or refusal["schema_version"] != 1 \
+                        or any(refusal.get(key) != value for key, value in ack.items()) \
+                        or not isinstance(refusal.get("error"), dict) or set(refusal["error"]) != {"code"} \
+                        or refusal["error"]["code"] not in ("database_busy", "acknowledgment_refused"):
+                    raise ValueError("Invalid completion refusal response")
+            except (ValueError, TypeError, KeyError, RecursionError):
+                pass  # The original failed transport remains authoritative.
+            else:
+                wrapper["error"]["code"] = refusal["error"]["code"]
     except CompletionBusy:
         wrapper["error"] = {"code": "database_busy"}
+    except CompletionRefused:
+        wrapper["error"] = {"code": "acknowledgment_refused"}
     except TimeoutError:
         wrapper["error"] = {"code": "transport_deadline"}
     except OSError as error:
@@ -180,10 +197,10 @@ def acknowledge_completion(config: FleetConfig, only: str, consumer: str, event_
     payload = {"consumer": consumer, "event_id": event_id, "host_id": host_id,
                "event_host_id": event_host_id, "subscription_id": subscription_id}
     arguments = ["ack", f"--consumer={consumer}", f"--host-id={host_id}", f"--event-host-id={event_host_id}",
-                 f"--subscription-id={subscription_id}", event_id]
+                 f"--subscription-id={subscription_id}", "--json-errors", event_id]
     result = _query(host, consumer, config.ssh_timeout_seconds, arguments,
                     lambda: request("completion_ack", payload, timeout=config.ssh_timeout_seconds, deadline=True),
-                    ack=(event_id, host_id, subscription_id))
+                    ack=payload)
     # Any failed reply may follow a committed acknowledgment. Retrying this exact tuple is safe.
     if not result["ok"]:
         result["error"]["acknowledgment"] = "unknown"

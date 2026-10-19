@@ -17,6 +17,7 @@ from pathlib import Path
 
 from router.capacity import CapacitySampler
 from router.child import child_environment, executor_command, launch
+from router.client import CompletionRefused
 from router.codex import collect as collect_codex
 from router.codex import price_metadata
 from router.config import Settings
@@ -1188,6 +1189,8 @@ class Handler(socketserver.StreamRequestHandler):
             else:
                 LOGGER.exception("Control request database failure")
                 response = {"ok": False, "error": "Router database is unavailable; inspect the operator log"}
+        except CompletionRefused as error:
+            response = {"ok": False, "error": str(error), "code": "acknowledgment_refused"}
         except (ValueError, KeyError, OSError) as error:
             response = {"ok": False, "error": str(error)}
         except Exception:

@@ -16,7 +16,7 @@ import time
 import uuid
 from pathlib import Path
 
-from router.client import CompletionBusy, request
+from router.client import CompletionBusy, CompletionRefused, request
 from router.dispatch import canonical
 from router.paths import observed_project
 from router.processes import parent_and_identity
@@ -387,7 +387,7 @@ class ManagedProcesses:
             raise ValueError("completion_ack needs consumer and event_id, with optional host_id and event_host_id together")
         if "host_id" in payload:
             if _identifier(payload["host_id"], "host") != self.host_id:
-                raise ValueError("Completion serving host ID does not match")
+                raise CompletionRefused("Completion serving host ID does not match")
             _identifier(payload["event_host_id"], "event host")
         consumer = _identifier(payload["consumer"], "consumer")
         event_id = payload["event_id"]
@@ -396,19 +396,19 @@ class ManagedProcesses:
         with self.store.transaction(timeout=.1) as db:
             row = db.execute("SELECT cursor,subscription_id FROM completion_consumers WHERE name=?", (consumer,)).fetchone()
             if row is None:
-                raise ValueError("Unknown completion consumer; wait first")
+                raise CompletionRefused("Unknown completion consumer; wait first")
             if subscription is not None and row["subscription_id"] != subscription:
-                raise ValueError("Completion consumer subscription was removed, replaced, or belongs to another database")
+                raise CompletionRefused("Completion consumer subscription was removed, replaced, or belongs to another database")
             event = db.execute("SELECT host_id FROM completion_events WHERE sequence=?", (sequence,)).fetchone()
             if event is None:
-                raise ValueError("Unknown completion event ID")
+                raise CompletionRefused("Unknown completion event ID")
             if "event_host_id" in payload and event["host_id"] != payload["event_host_id"]:
-                raise ValueError("Completion producing host ID does not match")
+                raise CompletionRefused("Completion producing host ID does not match")
             if sequence > row["cursor"]:
                 pending = db.execute("SELECT MIN(sequence) FROM completion_events WHERE data IS NOT NULL AND sequence>?",
                                      (row["cursor"],)).fetchone()[0]
                 if sequence != pending:
-                    raise ValueError("Acknowledge the oldest pending event first")
+                    raise CompletionRefused("Acknowledge the oldest pending event first")
                 db.execute("UPDATE completion_consumers SET cursor=? WHERE name=?", (sequence, consumer))
         result = {"acknowledged": True, "event_id": event_id, "consumer": consumer, "host_id": self.host_id}
         if subscription is not None:

@@ -193,16 +193,27 @@ neither repairs machine-ID clones nor distinguishes copies of the same database 
 subscription state. Local `router ack` also accepts `--host-id` and `--event-host-id`
 together, with optional `--subscription-id`, for these checks; its existing syntax and
 output stay valid. A confirmed bound acknowledgment echoes `subscription_id`.
-Older Router installations that lack these flags refuse the request.
+Fleet acknowledgment also requests `router ack --json-errors`. This opt-in flag emits
+a versioned, bounded error object on stdout for known database contention or an
+identity/cursor refusal, while retaining exit code 1 and the diagnostic on stderr.
+Without the flag, failed local acknowledgments keep their existing empty stdout.
+Older Router installations that lack these flags refuse the request; Router does not
+fall back to an unbound acknowledgment. Upgrade the remote CLI and daemon together.
 
 A failed or interrupted acknowledgment has an unknown commit outcome. Failure wrappers
 include `error.acknowledgment: "unknown"`. Retry the same configured host, consumer,
 serving ID, producing ID, subscription ID, and event ID. Router makes no automatic
-acknowledgment retry. If the remote CLI refuses the request (`exit_failed` with code 1),
-the wrapper cannot distinguish database contention from a permanent refusal. After
-durably recording handling, run the same bound acknowledgment directly on that host
-to inspect its stderr; this is idempotent. Blindly repeating a permanent identity mismatch
-cannot repair it. Restore or verify changed host mappings. After explicit consumer removal,
+acknowledgment retry. Known database contention reports `database_busy`; an invalid
+serving host, producing host, subscription, consumer, event, or pending-event order
+reports `acknowledgment_refused`. Verify the binding or ordering before retrying a
+refusal: repetition cannot repair it. SSH errors retain numeric `exit_code` when known.
+A structured refusal is accepted only from exit 1, with the supported schema version
+and every expected binding echoed exactly; those echoes do not establish the actual
+serving host, so a failed wrapper retains `host_id: null`. Nonzero success-shaped,
+malformed, mismatched, or unsupported replies remain `exit_failed`, with no free-form
+remote error text forwarded. After durably recording handling, the same bound local
+acknowledgment can provide stderr diagnostics on the host; it remains idempotent.
+Restore or verify changed host mappings. After explicit consumer removal,
 a new wait receives a new subscription ID; verify that the event matches durable handling
 before acknowledging under that new binding. Waits do not
 acknowledge. Restart, dropped SSH replies, or killed wait clients replay unacknowledged
@@ -228,7 +239,8 @@ Router adds no trust bypass and never starts a remote daemon.
 | Error code | Meaning |
 | --- | --- |
 | `unavailable` | The daemon cannot supply a wait result or the local socket is unreachable. |
-| `database_busy` | A local acknowledgment encountered database contention; retry the same tuple. |
+| `database_busy` | A local or remote acknowledgment encountered known database contention; retry the same tuple after durable handling. |
+| `acknowledgment_refused` | The daemon rejected the acknowledgment's identity, subscription, event, or pending-event order. Verify the binding/order before retrying. |
 | `request_failed` | A local delivery request was refused or could not provide usable evidence. |
 | `invalid_response` | Missing, malformed, inconsistent, or oversized reply. |
 | `output_limit` | SSH stdout exceeded its one-MiB collection limit. Replies above the separate 16-KiB acceptance limit yield `invalid_response`. |
