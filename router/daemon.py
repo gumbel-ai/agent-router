@@ -881,7 +881,8 @@ class Runtime:
             relative = str(credential_file.relative_to(root))
             if git(root, "ls-files", "--", relative).strip():
                 raise ValueError("The provider env file must not be tracked")
-            ignored = subprocess.run(["git", "-C", str(root), "check-ignore", "--quiet", "--", relative], check=False)
+            ignored = subprocess.run(["git", "-C", str(root), "check-ignore", "--quiet", "--", relative],
+                                     env=strip_langfuse_environment(os.environ), check=False)
             if ignored.returncode != 0:
                 raise ValueError("The provider env file must be ignored when inside the repository")
         if executor == "claude":

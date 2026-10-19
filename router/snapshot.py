@@ -7,8 +7,11 @@ import sys
 import tempfile
 from pathlib import Path
 
+from router.child import strip_langfuse_environment
+
 
 def git(root: Path, *args: str, env: dict | None = None, binary: bool = False) -> str | bytes:
+    env = strip_langfuse_environment(os.environ if env is None else env)
     result = subprocess.run(["git", "-C", str(root), *args], env=env, check=False, capture_output=True)
     if result.returncode:
         raise ValueError(result.stderr.decode(errors="replace").strip() or "Git operation failed")
@@ -23,7 +26,8 @@ def validate_repository(root: Path) -> None:
         raise ValueError("Unresolved Git merges are unsupported")
     if any(line.startswith("160000 ") for line in git(root, "ls-files", "--stage").splitlines()):
         raise ValueError("Submodules are unsupported")
-    result = subprocess.run(["git", "-C", str(root), "config", "--bool", "core.sparseCheckout"], capture_output=True, check=False)
+    result = subprocess.run(["git", "-C", str(root), "config", "--bool", "core.sparseCheckout"],
+                            env=strip_langfuse_environment(os.environ), capture_output=True, check=False)
     if result.stdout.strip() == b"true":
         raise ValueError("Sparse checkouts are unsupported")
 

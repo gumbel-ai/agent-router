@@ -1,7 +1,9 @@
-"""Opt-in child tracing: recorded explicitly, never changing child launch or Router counters."""
+"""Opt-in tracing routes, credential isolation and unchanged native accounting."""
 
 import json
+import os
 import shlex
+import subprocess
 import sys
 import unittest
 from pathlib import Path
@@ -19,6 +21,7 @@ from router.child import (
     executor_command,
     strip_langfuse_environment,
 )
+from router.snapshot import apply_delta, capture_final, prepare
 
 CLAUDE_MODEL = "anthropic/claude-sonnet-4-6"
 CLAUDE_PROFILE = {"tools": ["Read", "Edit", "Write"], "allow": ["Read", "Edit", "Write"]}
@@ -112,6 +115,58 @@ class TracingTests(RuntimeHarness, unittest.TestCase):
         self.assertNotIn("LANGFUSE_SECRET_KEY", environments[0])
         self.assertEqual(environments[1]["LANGFUSE_PUBLIC_KEY"], "pk-secret")
         self.assertEqual(environments[1]["LANGFUSE_SECRET_KEY"], "sk-secret")
+
+    def test_direct_git_paths_never_receive_tracing_credentials(self):
+        self.runtime.stop()
+        credential_file = self.repo / ".env"
+        credential_file.write_text("# synthetic fixture\n")
+        self.control.environment["AGENT_ROUTER_ENV_FILE"] = str(credential_file)
+        hook_records = self.root / "git-hook.jsonl"
+        hook = self.repo / ".git/hooks/reference-transaction"
+        code = ("import json, os\nfrom pathlib import Path\n"
+                f"with Path({str(hook_records)!r}).open('a') as stream:\n"
+                "    stream.write(json.dumps({'keys': sorted(key for key in os.environ if key.startswith('LANGFUSE_')), "
+                "'option': os.environ.get('EXAMPLE_GIT_OPTION')}) + '\\n')\n")
+        hook.write_text(f"#!/bin/sh\nexec {shlex.quote(sys.executable)} -c {shlex.quote(code)}\n")
+        hook.chmod(0o700)
+        run = subprocess.run
+        environments = []
+
+        def record_run(command, *args, **kwargs):
+            if command[0] == "git":
+                environment = os.environ if kwargs.get("env") is None else kwargs["env"]
+                environments.append((command[3], dict(environment)))
+            return run(command, *args, **kwargs)
+
+        environment = {"LANGFUSE_PUBLIC_KEY": "synthetic-public", "LANGFUSE_SECRET_KEY": "synthetic-secret",
+                       "LANGFUSE_UNDOCUMENTED": "synthetic-extra", "EXAMPLE_GIT_OPTION": "preserved"}
+        with patch.dict(os.environ, environment), patch("router.snapshot.subprocess.run", side_effect=record_run):
+            task_id = "direct-git"
+            invocation = {"executor": "opencode", "model": "test", "parent_repo": str(self.repo),
+                          "parent_worktree": str(self.repo)}
+            self.runtime.validate({"task_id": task_id, "invocation": invocation})
+            info = prepare(self.repo, task_id, (self.root / task_id).resolve())
+            child = Path(info["worktree"])
+            tracked = child / "tracked.txt"
+            tracked.write_text(tracked.read_text() + "example update\n")
+            final = capture_final(self.repo, info, 1, self.root / task_id)
+            apply_delta(self.repo, Path(final["patch"]))
+            self.assertEqual((self.repo / "tracked.txt").read_text(), tracked.read_text())
+            with self.control.store.transaction() as db:
+                self.control.store.put(db, {**info, "session_id": "S", "invocation": invocation,
+                                           "status": "closed", "cleanup_pending": True})
+            before = len(hook_records.read_text().splitlines())
+            self.runtime.clean(task_id)
+            self.assertIsNone(self.control.store.get(task_id).get("cleanup_error"))
+            self.assertFalse(child.exists())
+            self.assertGreater(len(hook_records.read_text().splitlines()), before)
+            self.assertIn("check-ignore", [command for command, _ in environments])
+            for command, actual in environments:
+                self.assertFalse(any(key.startswith("LANGFUSE_") for key in actual), command)
+                self.assertEqual(actual["EXAMPLE_GIT_OPTION"], "preserved", command)
+        records = [json.loads(line) for line in hook_records.read_text().splitlines()]
+        self.assertTrue(records)
+        self.assertTrue(all(record == {"keys": [], "option": "preserved"} for record in records))
 
 
 class TracingLaunchTests(unittest.TestCase):
