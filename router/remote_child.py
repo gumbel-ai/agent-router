@@ -135,13 +135,15 @@ def _control_payload(operation: str, payload: dict) -> dict:
             raise ValueError("Remote review has invalid fields")
         _text(payload["task_id"], "task_id", 128)
         _text(payload["request_id"], "request_id")
-        if type(payload["expected_attempt"]) is not int or payload["expected_attempt"] < 1:
+        if type(payload["expected_attempt"]) is not int or payload["expected_attempt"] < 0:
             raise ValueError("Remote review attempt is invalid")
         if payload["outcome"] not in REVIEW_OUTCOMES:
             raise ValueError("Remote review outcome is invalid")
         # Mirrors the local review contract: feedback is optional for acceptance.
         if payload["outcome"] != "accepted":
-            _text(payload.get("feedback"), "feedback", 2000)
+            feedback = payload.get("feedback")
+            if not isinstance(feedback, str) or not feedback.strip() or len(feedback) > 2000:
+                raise ValueError("feedback must be bounded non-empty text")
         elif "feedback" in payload and not isinstance(payload["feedback"], str):
             raise ValueError("Remote review feedback must be a string")
     elif operation == "cancel":

@@ -81,6 +81,65 @@ class RemoteChildProtocolTests(unittest.TestCase):
             remote_child._control_payload("review", {"task_id": "t", "request_id": "r", "expected_attempt": 1,
                                                        "outcome": "rejected"})
 
+    def test_review_allows_attempt_zero_and_multiline_feedback(self):
+        review = {"task_id": "t", "request_id": "r", "expected_attempt": 0, "outcome": "rejected",
+                  "feedback": "Fix the parser\nAdd a regression test"}
+        self.assertEqual(remote_child._control_payload("review", review), review)
+
+    def test_partial_remote_destination_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "host"):
+            Controller.envelope({**self.invocation, "remote_repo": "/srv/project", "remote_worktree": "/srv/project"})
+
+    def test_remote_mutations_respect_maintenance_drain(self):
+        controller = Controller.__new__(Controller)
+        controller.settings = SimpleNamespace(delegation_enabled=True)
+        controller.lifecycle_lock = __import__("threading").Lock()
+        controller.draining = True
+        with patch.object(Controller, "remote_start") as remote_start, \
+                self.assertRaisesRegex(ValueError, "maintenance"):
+            controller.handle("remote_start", {})
+        remote_start.assert_not_called()
+
+    def test_pre_send_start_failure_stays_stopped(self):
+        directory = Path(tempfile.mkdtemp())
+        task = {"task_id": "task-a", "session_id": "session-a", "remote_host": "worker",
+                "remote_repo": "/srv/project", "remote_worktree": "/srv/project", "status": "preparing",
+                "execution_stopped": True, "artifact_dir": str(directory), "resolved_model": "provider/model-a",
+                "invocation": {**self.invocation, "parent_worktree": str(directory),
+                               "context": {"relevant_paths": ["code.txt"]}}}
+
+        class Store:
+            def get(self, _task_id):
+                return task
+
+            def update(self, _task_id, change):
+                change(task)
+                return task
+
+            update_with_attempt = update
+
+        class Transport:
+            def __init__(self, _host, _timeout):
+                pass
+
+            def start(self, **_kwargs):
+                raise ValueError("request_id must be a bounded non-empty string")
+
+        def export(_root, _task_id, artifact, _paths):
+            artifact.mkdir(parents=True)
+            (artifact / "snapshot.bundle").write_bytes(b"abc")
+            return self.receipt
+
+        runtime = Runtime.__new__(Runtime)
+        runtime.store = Store()
+        config = SimpleNamespace(hosts=(FleetHost("worker", "ssh", target="example"),), ssh_timeout_seconds=1)
+        with patch("router.fleet.load_fleet_config", return_value=config), \
+                patch("router.remote_child.RemoteChildTransport", Transport), \
+                patch("router.remote_snapshot.export_snapshot", export):
+            runtime.execute_remote("task-a")
+        self.assertEqual(task["status"], "failed")
+        self.assertTrue(task["execution_stopped"])
+
     def test_lost_start_reply_keeps_remote_ownership_uncertain(self):
         directory = Path(tempfile.mkdtemp())
         task = {"task_id": "task-a", "session_id": "session-a", "remote_host": "worker",
@@ -193,6 +252,23 @@ class RemoteChildProtocolTests(unittest.TestCase):
             runtime.start()
             runtime.scheduler.join(1)
         spawn.assert_called_once_with(task, recovered=True)
+
+    def test_restart_fails_known_unsent_remote_start_as_stopped(self):
+        task = {"task_id": "task-a", "remote_host": "worker", "status": "preparing",
+                "execution_stopped": True, "max_attempts": 1}
+        runtime = Runtime.__new__(Runtime)
+        runtime.control = SimpleNamespace(native=SimpleNamespace(reconcile_restart=lambda: None),
+                                          sessions=SimpleNamespace(reconcile_restart=lambda: None),
+                                          start_lifecycle_writer=lambda: None,
+                                          capacity=SimpleNamespace(start=lambda: None),
+                                          settings=SimpleNamespace(max_attempts=None))
+        runtime.store = SimpleNamespace(all=lambda: [task], update=lambda _task_id, change: change(task))
+        with patch.object(Runtime, "spawn") as spawn, patch.object(Runtime, "schedule"):
+            runtime.start()
+            runtime.scheduler.join(1)
+        spawn.assert_not_called()
+        self.assertEqual(task["status"], "failed")
+        self.assertTrue(task["execution_stopped"])
 
     def test_remote_cancelling_and_recovery_reconcile_remotely(self):
         for status, recovered in (("cancelling", False), ("running", True)):

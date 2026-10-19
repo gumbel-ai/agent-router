@@ -12,6 +12,7 @@ import socketserver
 import sqlite3
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import uuid
@@ -501,16 +502,19 @@ class Controller:
         if operation == "task_diff":
             from router.task_diff import export
             return export(self.store, self.directory, self.host.host_id, payload)
-        if operation == "remote_start":
-            return self.remote_start(payload)
         if operation == "remote_status":
             return self.remote_status(payload)
-        if operation == "remote_review":
-            return self.remote_mutation("review", payload)
-        if operation == "remote_cancel":
-            return self.remote_mutation("cancel", payload)
-        if operation == "remote_close":
-            return self.remote_mutation("close", payload)
+        if operation in {"remote_start", "remote_review", "remote_cancel", "remote_close"}:
+            # Same admission and maintenance gates as local mutations.
+            if not self.settings.delegation_enabled and (operation == "remote_start" or
+                    operation == "remote_review" and payload.get("outcome") in {"rejected", "continue"}):
+                raise ValueError("External delegation is not configured; run router init in the project")
+            with self.lifecycle_lock:
+                if self.draining:
+                    raise ValueError("Router is stopping for maintenance; retry after it restarts")
+                if operation == "remote_start":
+                    return self.remote_start(payload)
+                return self.remote_mutation(operation.removeprefix("remote_"), payload)
         if operation == "request_status":
             from router.request_status import export
             return export(self.store, self.host.host_id, payload)
@@ -599,15 +603,19 @@ class Controller:
                             raise ValueError("Remote request_id was already used with another payload")
                         return public(self.store.get(existing[2], db), self.store)
                 bundle = inbox / "snapshot.bundle"
+                descriptor, partial = tempfile.mkstemp(dir=inbox, prefix=".bundle-")
                 try:
-                    with bundle.open("xb") as stream:
-                        os.chmod(bundle, 0o600)
+                    with os.fdopen(descriptor, "wb") as stream:
                         stream.write(checked["snapshot_bytes"])
+                    # Publish only complete bytes; link never overwrites.
+                    os.link(partial, bundle)
                 except FileExistsError:
                     # The immutable receipt/digest check below decides whether
                     # this is the same transfer; never follow or overwrite an
                     # existing path.
                     pass
+                finally:
+                    os.unlink(partial)
                 imported = import_snapshot(remote_repo, receipt, bundle)
                 # The parent snapshot identity is the durable task identity on
                 # both hosts. This makes reconnect and cleanup address the same
@@ -621,6 +629,7 @@ class Controller:
                         "executor": invocation["executor"], "requested_model": invocation["model"],
                         "review_history": [], "created_at": now_ms(), "execution_stopped": True,
                         "max_attempts": self.settings.max_attempts, "artifact_dir": str(artifact_dir),
+                        "expected_resolved_model": checked["resolved_model"],
                         "remote_origin": {"session_id": session_id, "request_id": request_id},
                         "snapshot_commit": imported["snapshot_commit"], "snapshot_tree": imported["snapshot_tree"],
                         "worktree": materialized["worktree"], "branch": materialized["branch"]}
@@ -844,7 +853,7 @@ class Controller:
             raise ValueError("Only request_version 1 and write mode are supported")
         if any(not Path(payload[key]).is_absolute() for key in ("parent_repo", "parent_worktree")):
             raise ValueError("Repository and worktree paths must be absolute")
-        if "host" in payload:
+        if {"host", "remote_repo", "remote_worktree"} & set(payload):
             required_text(payload, "host")
             if any(key not in payload or not Path(payload[key]).is_absolute() for key in ("remote_repo", "remote_worktree")):
                 raise ValueError("Remote dispatch requires absolute remote_repo and remote_worktree")
@@ -1017,7 +1026,11 @@ class Runtime:
                 self.store.update(task["task_id"], lambda t: t.update(max_attempts=self.control.settings.max_attempts))
             if task["status"] in {"validating", "preparing", "running", "cancelling"}:
                 record = task.get("process")
-                if task.get("remote_host"):
+                if task.get("remote_host") and not task.get("remote_task_id") and task["execution_stopped"]:
+                    # The start was never claimed as sent; nothing can be running remotely.
+                    self.store.update(task["task_id"], lambda t: t.update(
+                        status="failed", execution_stopped=True, failure_reason="Remote start was not sent before restart"))
+                elif task.get("remote_host"):
                     # Remote liveness is read from the serving Router, not local process evidence.
                     self.spawn(task, recovered=True)
                 elif record and (owned_state(record) == "live" or
@@ -1080,6 +1093,8 @@ class Runtime:
         model = self.control.settings.models.get(invocation["model"])
         if model is None:
             raise ValueError("Unknown configured model alias; no fallback")
+        if "expected_resolved_model" in task and model != task["expected_resolved_model"]:
+            raise ValueError("Model alias no longer resolves to the parent's exact model; no fallback")
         root = Path(invocation["parent_worktree"]).resolve()
         repo = Path(invocation["parent_repo"]).resolve()
         validate_repository(root)
@@ -1377,7 +1392,7 @@ class Runtime:
                     for key in ("final_tree", "patch", "execution_outcome", "failure_reason", "exit_code", "last_event_at", "summary", "cost", "usage", "usage_complete", "cost_note", "cost_source", "executor_completed", "thread_observed", "executor_activity", "execution_error", "event_offset", "process", "phase", "phase_started_at"):
                         current.pop(key, None)
                 self.store.update(task_id, begin)
-                if task["executor"] == "claude":
+                if task["executor"] == "claude" and not self.store.get(task_id).get("remote_host"):
                     executable = resolve_executable(self.control.settings.claude_command, self.control.environment,
                                                     Path(task["invocation"]["parent_worktree"]))
                     self.store.update(task_id, lambda t: t.update(claude_executable=executable))
@@ -1496,10 +1511,19 @@ class Runtime:
             self.store.update(task_id, claim)
         try:
             if not recovered and not task.get("remote_task_id"):
-                remote = transport.start(session_id=task["session_id"], request_id=invocation["request_id"],
-                                         invocation=invocation, resolved_model=task["resolved_model"],
-                                         remote_repo=task["remote_repo"], remote_worktree=task["remote_worktree"],
-                                         snapshot_receipt=receipt, snapshot_bundle=bundle)
+                try:
+                    remote = transport.start(session_id=task["session_id"], request_id=invocation["request_id"],
+                                             invocation=invocation, resolved_model=task["resolved_model"],
+                                             remote_repo=task["remote_repo"], remote_worktree=task["remote_worktree"],
+                                             snapshot_receipt=receipt, snapshot_bundle=bundle)
+                except RemoteChildError:
+                    raise
+                except ValueError as error:
+                    # Plain ValueError is raised only before SSH is spawned: nothing was sent.
+                    reason = f"Remote start refused before sending: {error}"
+                    self.store.update_with_attempt(task_id, lambda current, reason=reason: current.update(
+                        status="failed", execution_stopped=True, failure_reason=reason))
+                    return
                 remote_id = remote.get("task_id")
                 if not isinstance(remote_id, str):
                     raise RemoteChildError("invalid_response", "Remote start did not return a task identity")
