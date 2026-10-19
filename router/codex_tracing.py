@@ -143,7 +143,8 @@ def environment(result: dict[str, str], task: dict, *, credentials: dict[str, st
     result["PATH"] = os.pathsep.join(
         entry for entry in result.get("PATH", os.defpath).split(os.pathsep)
         if Path(entry).is_absolute() and not any(Path(entry).resolve().is_relative_to(root) for root in roots))
-    if shutil.which("node", path=result["PATH"]) is None:
+    node = shutil.which("node", path=result["PATH"])
+    if node is None or any(Path(node).resolve().is_relative_to(root) for root in roots):
         raise ValueError("Codex tracing requires an operator-provisioned node outside delegated repositories")
     result["PLUGIN_ROOT"] = task["_codex_tracing"]["plugin_dir"]
     available = all(isinstance(credentials.get(key), str) and credentials[key].strip()

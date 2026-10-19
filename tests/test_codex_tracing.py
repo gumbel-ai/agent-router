@@ -119,6 +119,9 @@ class CodexTracingTests(unittest.TestCase):
         codex_tracing.shutil.which.return_value = None
         with self.assertRaisesRegex(ValueError, "node"):
             child_environment({"PATH": "/usr/bin"}, task)
+        codex_tracing.shutil.which.return_value = str(self.root / "worktree" / "node")
+        with self.assertRaisesRegex(ValueError, "node"):
+            child_environment({"PATH": "/usr/bin"}, task)
 
     def test_missing_credentials_disable_export_and_pin_endpoint(self):
         task = self.selected_task()
