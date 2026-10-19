@@ -171,6 +171,7 @@ def initialize(repo: Path, model: str, setup_command: str, permission: dict | No
         else:
             target.pop("tracing", None)
             target.pop("claude_tracing", None)
+            target.pop("codex_tracing", None)
         values.setdefault("AGENT_ROUTER_REPOSITORIES", {})[str(repo)] = target
         effective, _ = load_settings(values)
         for key, actual in (("AGENT_ROUTER_CONCURRENCY_CAP", effective.concurrency_cap),
@@ -225,7 +226,8 @@ def init(args) -> None:
     profile = sandbox if args.executor == "codex" else permission if permission is not None else "existing opencode.json permissions"
     tracing = ("requested (OpenCode plugin route; live export and correlation verified)"
                if args.tracing and args.executor == "opencode"
-               else "requested (route unavailable for this executor)" if args.tracing else "off")
+               else "requested (explicit audited plugin selection required)" if args.tracing and args.executor in {"codex", "claude"}
+               else "off")
     confirm(f"Enable {args.executor} delegation for {repo} with {model}, permissions {profile}, setup {setup_command!r}, "
             f"limits {cap}/{timeout}s/{attempts}, and child tracing {tracing}?", args.yes)
     initialize(repo, model, setup_command, permission, cap, timeout, attempts, executor=args.executor, sandbox=sandbox,

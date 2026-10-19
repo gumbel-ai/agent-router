@@ -15,7 +15,7 @@ import time
 import uuid
 from pathlib import Path
 
-from router import claude_tracing
+from router import claude_tracing, codex_tracing
 from router.capacity import CapacitySampler
 from router.child import (
     OPENCODE_LANGFUSE_PLUGIN,
@@ -102,14 +102,14 @@ def required_text(payload: dict, key: str) -> str:
 def public(task: dict, store: Store | None = None, history: list[dict] | None = None) -> dict:
     result = {key: value for key, value in task.items() if key not in {
         "session_id", "invocation", "feedback", "permission_profile", "setup_command", "cleanup_requested", "token_prices",
-        "codex_usage_baseline", "codex_usage_total", "codex_baseline_complete", "claude_baseline", "claude_total", "claude_executable", "_claude_tracing"}}
+        "codex_usage_baseline", "codex_usage_total", "codex_baseline_complete", "claude_baseline", "claude_total", "claude_executable", "_claude_tracing", "_codex_tracing"}}
     attempt_history = store.history(task["task_id"]) if history is None and store is not None else history or []
     result.update(visibility(task, attempt_history))
     if store is not None or history is not None:
         if task.get("executor") == "claude":
             attempt_history = [{**frame, **claude_public_usage(frame)} for frame in attempt_history]
         result["attempt_history"] = [{key: value for key, value in frame.items()
-                                      if key not in {"claude_baseline", "claude_total", "claude_executable", "_claude_tracing"}}
+                                      if key not in {"claude_baseline", "claude_total", "claude_executable", "_claude_tracing", "_codex_tracing"}}
                                      for frame in attempt_history]
     return result
 
@@ -916,9 +916,14 @@ class Runtime:
                                                           langfuse_credentials_available(self.control.environment)))
             return validated
         if executor == "codex":
-            return {"executor": executor, "requested_model": invocation["model"], "resolved_model": model,
-                    "setup_command": configured["setup_command"], "permission_profile": {"sandbox": sandbox},
-                    **price_metadata(model, self.control.settings.model_prices), **tracing}
+            validated = {"executor": executor, "requested_model": invocation["model"], "resolved_model": model,
+                         "setup_command": configured["setup_command"], "permission_profile": {"sandbox": sandbox},
+                         **price_metadata(model, self.control.settings.model_prices), **tracing}
+            if "codex_tracing" in configured:
+                validated.update(codex_tracing.configure(configured["codex_tracing"], {**task, **validated},
+                                                         self.control.host.host_id, root,
+                                                         langfuse_credentials_available(self.control.environment)))
+            return validated
         permission_file = root / "opencode.json"
         try:
             permission = json.loads(permission_file.read_text())["permission"]
@@ -951,10 +956,12 @@ class Runtime:
                 # A task can outlive a repository config reload. Fail closed for
                 # the next launch and remove the stale child opt-in.
                 self.store.update(task_id, lambda current: current.pop("tracing", None))
-            elif name == "child" and (task["executor"] == "opencode" or "_claude_tracing" in task):
+            elif name == "child" and (task["executor"] == "opencode" or "_claude_tracing" in task or "_codex_tracing" in task):
                 # Rejection/resume skips validate(); record what this child receives.
                 availability = (opencode_tracing_availability(phase_environment) if task["executor"] == "opencode"
-                                else claude_tracing.availability(langfuse_credentials_available(phase_environment)))
+                                else claude_tracing.availability(langfuse_credentials_available(phase_environment))
+                                if "_claude_tracing" in task else
+                                codex_tracing.availability(langfuse_credentials_available(phase_environment)))
                 self.store.update(task_id, lambda current: current["tracing"].update(availability))
             task = self.store.get(task_id)
         started = now_ms()
@@ -1003,6 +1010,8 @@ class Runtime:
             return False
         if "_claude_tracing" in task:
             return "claude_tracing" in configured
+        if "_codex_tracing" in task:
+            return "codex_tracing" in configured
         return configured.get("tracing") == "requested"
 
     def observe(self, task_id: str, record: dict, process=None, *, collecting: bool = False) -> dict:
