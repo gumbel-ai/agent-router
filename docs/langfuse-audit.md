@@ -94,6 +94,66 @@ explicitly accept and ignore stale `max_chars`. Live truncation remains
 uses Node with a 30-second timeout. [Codex hooks require manual trust](https://developers.openai.com/codex/hooks);
 this audit wrote or bypassed none.
 
+### OpenCode plugin 0.5.2
+
+The official [Langfuse OpenCode integration](https://langfuse.com/integrations/developer-tools/opencode)
+provides an existing tracing route. This audit read plugin 0.5.2 at
+[`24389efd13decfb72e103950526669addcb245e8`](https://github.com/langfuse/opencode-observability-plugin/tree/24389efd13decfb72e103950526669addcb245e8),
+released October 8, 2026. It did not install or run OpenCode or the plugin, read
+credentials, or upload a trace. Router-launched OpenCode tracing remains
+**UNVERIFIED**; [issue #53](https://github.com/gumbel-ai/agent-router/issues/53)
+stays open until an actual approved child trace reconciles with native records.
+
+The pinned [compatibility declaration](https://github.com/langfuse/opencode-observability-plugin/blob/24389efd13decfb72e103950526669addcb245e8/README.md#supported-versions)
+supports OpenCode 1.18.29 or newer through `plugin` configuration and OpenCode
+2.0.4 or newer through `plugins`. These are upstream plugin compatibility
+claims. They do not establish Router execution-adapter compatibility.
+
+| Capability | Pinned source evidence | Live result |
+| --- | --- | --- |
+| Session and parent IDs | Observations carry native `session.id`. Turn metadata contains `messageID` and optional explicit `parentSessionID`; `agent`/`mode` are names, not unique agent IDs. [Emitter](https://github.com/langfuse/opencode-observability-plugin/blob/24389efd13decfb72e103950526669addcb245e8/src/langfuse.ts#L520) | NOT CHECKED |
+| Caller metadata | The credential schema exposes destination, environment, user ID and service name; no general Router task metadata channel was found. OTel resource attributes are read, but their Langfuse projection remains unknown. [Runtime](https://github.com/langfuse/opencode-observability-plugin/blob/24389efd13decfb72e103950526669addcb245e8/src/runtime.ts), [resource setup](https://github.com/langfuse/opencode-observability-plugin/blob/24389efd13decfb72e103950526669addcb245e8/src/langfuse.ts#L1765) | NOT CHECKED |
+| Content and truncation | Prompts, outputs, reasoning, tool arguments/results and history can leave the host. V2 context also includes system instructions. No plugin-wide capture limit was found. [V1 hooks](https://github.com/langfuse/opencode-observability-plugin/blob/24389efd13decfb72e103950526669addcb245e8/src/v1.ts), [V2 hooks](https://github.com/langfuse/opencode-observability-plugin/blob/24389efd13decfb72e103950526669addcb245e8/src/v2.ts#L63) | NOT CHECKED |
+| Usage and cost | Generation observations copy native model/provider, message IDs, token buckets and cost. Missing native `total` falls back to input + output + reasoning. Do not combine Router and Langfuse totals. [Generation emitter](https://github.com/langfuse/opencode-observability-plugin/blob/24389efd13decfb72e103950526669addcb245e8/src/langfuse.ts#L680) | NOT CHECKED |
+| Flush and resume | V1 flushes on idle/disposal; V2 flushes on execution completion/interruption/failure and disposal. Deduplication state is in memory; there is no confirmed durable replay contract. [V1 hooks](https://github.com/langfuse/opencode-observability-plugin/blob/24389efd13decfb72e103950526669addcb245e8/src/v1.ts#L49), [V2 completion](https://github.com/langfuse/opencode-observability-plugin/blob/24389efd13decfb72e103950526669addcb245e8/src/v2.ts#L249) | NOT CHECKED |
+| Credentials | Environment keys precede the fixed home credential file. The loader does not validate file ownership, mode or symlinks. It does not copy file credentials into the environment. [Loader](https://github.com/langfuse/opencode-observability-plugin/blob/24389efd13decfb72e103950526669addcb245e8/src/runtime.ts#L34) | Tool access and inheritance NOT CHECKED |
+
+#### Router compatibility and verification handoff
+
+Router currently invokes `run --standalone --auto --session` with a preallocated
+session ID. The pinned public OpenCode 1.18.29
+[CLI parser](https://github.com/anomalyco/opencode/blob/16747470f976aca3d362ad730bcd3fe82ecc2c9a/packages/opencode/src/index.ts#L116)
+is strict; its [run command](https://github.com/anomalyco/opencode/blob/16747470f976aca3d362ad730bcd3fe82ecc2c9a/packages/opencode/src/cli/cmd/run.ts#L125)
+does not declare `--standalone`, and
+[`--session` retrieves an existing session](https://github.com/anomalyco/opencode/blob/16747470f976aca3d362ad730bcd3fe82ecc2c9a/packages/opencode/src/cli/cmd/run.ts#L456).
+This public-source mismatch must be resolved before claiming Router child
+coverage. The operator-selected executable may differ; its version and behavior
+were **NOT CHECKED**. Do not remove flags or retry an uncertain start as a fallback.
+
+OpenCode receives Router's permission-only `OPENCODE_CONFIG_CONTENT` override.
+Upstream [configuration loading](https://github.com/anomalyco/opencode/blob/16747470f976aca3d362ad730bcd3fe82ecc2c9a/packages/opencode/src/config/config.ts#L482)
+merges that override with other configuration, so it does not prove plugins are
+disabled. Router's Codex `--ignore-user-config` behavior does not describe OpenCode.
+
+Ask a teammate with an approved synthetic tracing destination to perform these
+checks after separate data-handling approval:
+
+1. Record the exact Router head, OpenCode executable/version and pinned plugin
+   version. Check command flags and session creation/resume semantics before any
+   model call. Stop if the invocation is unsupported.
+2. In a disposable `example-project`, enable only the pinned official plugin with
+   the correct version-specific key. Preserve authentication and permissions;
+   keep credentials out of the tool environment and public artifacts.
+3. Run one synthetic child and resume that same native session. Compare native
+   session/message IDs, every model call, token/cache/reasoning buckets and cost
+   with the resulting observations. Detect duplicated prior generations.
+4. Check normal flush, a harmless tool failure, effective worktree configuration,
+   captured synthetic content and credential access boundaries. Report every
+   omitted lifecycle, outage, SSH or independent reboot scenario as **NOT CHECKED**.
+
+Missing joins or unreconciled calls remain unknown. No trace was verified by this
+audit, and no custom Router tracing adapter is justified by this source evidence.
+
 ## Hook environment and correlation boundaries
 
 Codex 0.163.0's [command runner](https://github.com/openai/codex/blob/rust-v0.163.0/codex-rs/hooks/src/engine/command_runner.rs)
