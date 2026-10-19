@@ -44,7 +44,7 @@ def _inspect(directory: Path) -> str:
         digest = hashlib.sha256()
         for relative in PLUGIN_FILES:
             path = directory / relative
-            if path.is_symlink() or not path.is_file():
+            if path.is_symlink() or not path.is_file() or path.resolve() != directory.resolve() / relative:
                 raise ValueError("Codex tracing plugin files must be regular files without symlinks")
             with path.open("rb") as stream:
                 before = os.fstat(stream.fileno())

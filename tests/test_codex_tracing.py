@@ -138,6 +138,14 @@ class CodexTracingTests(unittest.TestCase):
                                            "host-a", self.root, True)
         self.assertNotIn("session_id", selected["tracing"]["correlation"])
 
+    def test_symlinked_plugin_subdirectory_is_rejected(self):
+        import shutil
+        target = self.root / "dist"
+        shutil.move(str(self.plugin / "dist"), target)
+        (self.plugin / "dist").symlink_to(target)
+        with self.assertRaisesRegex(ValueError, "Codex tracing"):
+            self.selected_task()
+
     def test_changed_plugin_refuses_launch(self):
         task = self.selected_task()
         (self.plugin / "dist/index.mjs").write_text("changed")
