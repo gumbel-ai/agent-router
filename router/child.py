@@ -8,6 +8,7 @@ import uuid
 from collections.abc import Callable
 from pathlib import Path
 
+from router import claude_tracing
 from router.claude_executor import validate_persistence
 from router.config import Settings
 from router.process import creation_identity
@@ -126,8 +127,10 @@ def executor_command(settings: Settings, task: dict) -> list[str]:
         if not isinstance(executable, str) or not Path(executable).is_absolute() or not task.get("executor_version"):
             raise ValueError("Claude attempt lacks an inspected executable/version binding; refusing unverified child")
         profile = task["permission_profile"]
+        tracing = claude_tracing.selected(task)
         return [executable, "--print", "--output-format", "stream-json", "--verbose",
-                "--safe-mode", "--setting-sources", "", "--permission-mode", "dontAsk", "--permission-prompts", "none",
+                *(["--restricted", "--plugin-dir", tracing["plugin_dir"]] if tracing is not None else ["--safe-mode"]),
+                "--setting-sources", "", "--permission-mode", "dontAsk", "--permission-prompts", "none",
                 "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}', "--disable-slash-commands",
                 "--tools", ",".join(profile["tools"]), "--settings", json.dumps({"permissions": {"allow": profile["allow"]}, "fallbackModel": [], "switchModelsOnFlag": False}),
                 "--model", task["resolved_model"].removeprefix("anthropic/"),
@@ -189,4 +192,17 @@ def child_environment(environment: dict[str, str], task: dict, *, include_tracin
                     "ANTHROPIC_DEFAULT_SONNET_MODEL", "ANTHROPIC_DEFAULT_HAIKU_MODEL",
                     "CLAUDE_CODE_SUBAGENT_MODEL", "OPENCODE_CONFIG_CONTENT"):
             result.pop(key, None)
+        if "_claude_tracing" in task and not include_tracing_credentials:
+            # Revalidate before setup; hook runtime restrictions apply only to the child.
+            claude_tracing.selected(task)
+        elif "_claude_tracing" in task:
+            result = claude_tracing.environment(result, task)
+            # Same forwarding as the OpenCode route: only the opted-in child
+            # phase receives the plugin's documented startup-environment inputs.
+            for key in LANGFUSE_ENVIRONMENT_KEYS:
+                if key in environment:
+                    result[key] = environment[key]
+            # The pinned Claude plugin reads only the canonical endpoint name.
+            if not result.get("LANGFUSE_BASE_URL") and result.get("LANGFUSE_BASEURL"):
+                result["LANGFUSE_BASE_URL"] = result["LANGFUSE_BASEURL"]
     return result

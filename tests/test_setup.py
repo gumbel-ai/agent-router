@@ -16,7 +16,7 @@ from unittest.mock import patch
 from router.client import request
 from router.config import load_settings
 from router.db import Store
-from router.paths import PROJECT_MARKER, PROJECT_MARKER_CONTENT
+from router.paths import PROJECT_MARKER, PROJECT_MARKER_CONTENT, registry, state_dir
 from router.service import definition, start
 from router.setup import init, initialize, setup, uninstall
 from router.snapshot import git
@@ -93,6 +93,14 @@ class SetupTests(unittest.TestCase):
                        executor="codex", sandbox="workspace-write")
             config, _ = load_settings()
             self.assertNotIn("tracing", config.repositories[str(repo.resolve())])
+            # An explicit Claude selection is also a tracing choice; init without --tracing removes it.
+            values = registry()
+            values["AGENT_ROUTER_REPOSITORIES"][str(repo.resolve())]["claude_tracing"] = '{"plugin_dir":"/synthetic"}'
+            (state_dir() / "config.json").write_text(json.dumps(values))
+            initialize(repo, "codex=openai/gpt-5.3-codex", "true", None, 3, 600, 3,
+                       executor="codex", sandbox="workspace-write")
+            config, _ = load_settings()
+            self.assertNotIn("claude_tracing", config.repositories[str(repo.resolve())])
 
     def test_codex_opt_in_needs_no_opencode_and_preserves_both_executors(self):
         repo = self.repository("codex")

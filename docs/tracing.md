@@ -72,11 +72,11 @@ Codex and Claude remain explicitly unavailable for this route:
 | Executor | Reason recorded when tracing is requested |
 | --- | --- |
 | Codex | Children run with `--ignore-user-config`; tracing plugin hooks need trust from that ignored user layer. |
-| Claude | Children run with `--safe-mode` and no setting sources; installed plugins and hooks do not load. |
+| Claude | Default children run with `--safe-mode`; the explicit candidate below uses `--restricted` and a selected plugin, but real tracer exports remain unverified. |
 
 Their tracing request is retained in task and attempt history with `available:
-false`; their child environments also strip Langfuse variables. No executor
-fallback is attempted.
+false`; their child environments also strip Langfuse variables. The explicit
+Claude candidate below is the only exception. No executor fallback is attempted.
 
 ## Verification boundary
 
@@ -88,3 +88,52 @@ as `available: true` only when the required Langfuse public and secret keys are
 present in the startup environment; otherwise the route remains visible with
 `available: false` and an explicit credential diagnostic. Remote
 children remain out of scope.
+
+## Explicit Claude candidate (live verification required)
+
+An operator repository entry may contain one `claude_tracing` JSON string:
+
+```json
+{"claude_tracing":"{\"plugin_dir\":\"/approved/langfuse-plugin\"}"}
+```
+
+The directory must be outside the delegated repository and contain the exact
+audited Langfuse Observability Plugin 1.2.1 source. Router verifies the pinned
+manifest, hooks and digest, freezes the private selection per task, and refuses
+launch if the source changes. The candidate uses `--restricted`, `--plugin-dir`
+and empty setting sources.
+
+Claude loads a `--plugin-dir` plugin under the `langfuse-observability@inline`
+identity, and native plugin options configured for an installed identity are not
+delivered to it. Credentials therefore follow the OpenCode route: set
+`LANGFUSE_PUBLIC_KEY`, `LANGFUSE_SECRET_KEY` and optionally `LANGFUSE_BASE_URL`
+and `LANGFUSE_USER_ID` in Router's startup environment (not a committed file).
+Router forwards the same documented `LANGFUSE_*` inputs as the OpenCode route
+only to the opted-in Claude child phase; the pinned plugin reads plain
+environment values before plugin options. Because it reads only
+`LANGFUSE_BASE_URL`, Router maps `LANGFUSE_BASEURL` to it when the canonical name
+is absent. Setup, default and Codex children and
+all Git subprocesses still remove `LANGFUSE_*`. As with OpenCode, the secret is
+present in the child process environment, so child tools can read it. Router
+does not read credential files or persist credential values. `tracing.available`
+is true only when the startup environment has the public and secret keys. Like
+OpenCode, each child launch, including a rejected or resumed attempt, refreshes
+the flag and reason for the environment that child receives.
+
+Selected children strip ambient plugins, hooks, plugin options, `CC_LANGFUSE_*`
+variables and attached trace context, while preserving native authentication.
+Router sets `CC_LANGFUSE_STATE_DIR` to private task storage,
+`CC_LANGFUSE_TRACE_SEED` to the child session ID, and `CC_LANGFUSE_TRACE_TAGS`
+to the Router task and host identifiers plus a bounded work-item tag when
+supported. Router usage and cost accounting remain unchanged, and
+`traced: "unknown"` remains until an exporter is independently verified.
+
+Running `router init` without `--tracing` also removes `claude_tracing`. A task
+selected before such a revocation refuses its next launch instead of continuing
+untraced, and selections recorded by earlier builds of this candidate (schema 1,
+native plugin options) refuse to resume; start a new task.
+
+The required live checks—a fresh Router Claude export, a rejected/resumed
+export, environment isolation for non-selected processes, and changed-plugin
+refusal—remain pending on an approved Claude environment. Synthetic hook tests
+do not count as tracer-export evidence.

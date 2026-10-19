@@ -15,6 +15,7 @@ import time
 import uuid
 from pathlib import Path
 
+from router import claude_tracing
 from router.capacity import CapacitySampler
 from router.child import (
     OPENCODE_LANGFUSE_PLUGIN,
@@ -101,14 +102,14 @@ def required_text(payload: dict, key: str) -> str:
 def public(task: dict, store: Store | None = None, history: list[dict] | None = None) -> dict:
     result = {key: value for key, value in task.items() if key not in {
         "session_id", "invocation", "feedback", "permission_profile", "setup_command", "cleanup_requested", "token_prices",
-        "codex_usage_baseline", "codex_usage_total", "codex_baseline_complete", "claude_baseline", "claude_total", "claude_executable"}}
+        "codex_usage_baseline", "codex_usage_total", "codex_baseline_complete", "claude_baseline", "claude_total", "claude_executable", "_claude_tracing"}}
     attempt_history = store.history(task["task_id"]) if history is None and store is not None else history or []
     result.update(visibility(task, attempt_history))
     if store is not None or history is not None:
         if task.get("executor") == "claude":
             attempt_history = [{**frame, **claude_public_usage(frame)} for frame in attempt_history]
         result["attempt_history"] = [{key: value for key, value in frame.items()
-                                      if key not in {"claude_baseline", "claude_total", "claude_executable"}}
+                                      if key not in {"claude_baseline", "claude_total", "claude_executable", "_claude_tracing"}}
                                      for frame in attempt_history]
     return result
 
@@ -906,9 +907,14 @@ class Runtime:
             except (ValueError, RecursionError) as error:
                 raise ValueError("Project Claude permissions are not valid JSON") from error
             profile = validate_claude(model, permission)
-            return {"executor": executor, "requested_model": invocation["model"], "resolved_model": model,
-                    "setup_command": configured["setup_command"], "permission_profile": profile,
-                    "child_session_id": str(uuid.uuid4()), **tracing}
+            validated = {"executor": executor, "requested_model": invocation["model"], "resolved_model": model,
+                         "setup_command": configured["setup_command"], "permission_profile": profile,
+                         "child_session_id": str(uuid.uuid4()), **tracing}
+            if "claude_tracing" in configured:
+                validated.update(claude_tracing.configure(configured["claude_tracing"], {**task, **validated},
+                                                          self.control.host.host_id, root,
+                                                          langfuse_credentials_available(self.control.environment)))
+            return validated
         if executor == "codex":
             return {"executor": executor, "requested_model": invocation["model"], "resolved_model": model,
                     "setup_command": configured["setup_command"], "permission_profile": {"sandbox": sandbox},
@@ -945,9 +951,10 @@ class Runtime:
                 # A task can outlive a repository config reload. Fail closed for
                 # the next launch and remove the stale child opt-in.
                 self.store.update(task_id, lambda current: current.pop("tracing", None))
-            elif name == "child" and task["executor"] == "opencode":
+            elif name == "child" and (task["executor"] == "opencode" or "_claude_tracing" in task):
                 # Rejection/resume skips validate(); record what this child receives.
-                availability = opencode_tracing_availability(phase_environment)
+                availability = (opencode_tracing_availability(phase_environment) if task["executor"] == "opencode"
+                                else claude_tracing.availability(langfuse_credentials_available(phase_environment)))
                 self.store.update(task_id, lambda current: current["tracing"].update(availability))
             task = self.store.get(task_id)
         started = now_ms()
@@ -992,7 +999,11 @@ class Runtime:
     def _tracing_requested(self, task: dict) -> bool:
         root = Path(task["invocation"]["parent_worktree"]).resolve()
         configured = self.control.settings.repositories.get(str(root))
-        return isinstance(configured, dict) and configured.get("tracing") == "requested"
+        if not isinstance(configured, dict):
+            return False
+        if "_claude_tracing" in task:
+            return "claude_tracing" in configured
+        return configured.get("tracing") == "requested"
 
     def observe(self, task_id: str, record: dict, process=None, *, collecting: bool = False) -> dict:
         offset = self.store.get(task_id).get("event_offset", 0)

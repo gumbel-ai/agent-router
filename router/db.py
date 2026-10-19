@@ -169,7 +169,7 @@ class Store:
         if "attempt_number" not in task:
             return
         evidence = {key: value for key, value in task.items() if key not in {
-            "invocation", "review_history", "attempt_history", "session_id", "feedback", "setup_command", "permission_profile"}}
+            "invocation", "review_history", "attempt_history", "session_id", "feedback", "setup_command", "permission_profile", "_claude_tracing"}}
         if db is None:
             with self.transaction() as connection:
                 self.save_attempt(task, connection)
