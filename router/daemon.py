@@ -934,11 +934,16 @@ class Runtime:
             task = self.store.get(task_id)
         started = now_ms()
         directory = Path(task["artifact_dir"]) / f"attempt-{task['attempt_number']}" / name
-        environment = strip_langfuse_environment(self.control.environment)
+        phase_environment = self.control.environment.copy()
+        environment = strip_langfuse_environment(phase_environment)
         for key in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR"):
             environment.pop(key, None)
         if "worktree" in task and name in {"setup", "child"}:
-            environment = child_environment(environment, task, include_tracing_credentials=name == "child")
+            environment = child_environment(
+                phase_environment if name == "child" else environment,
+                task,
+                include_tracing_credentials=name == "child",
+            )
         process = None
         def register(record):
             record["interrupt_first"] = name == "child" and task["executor"] in {"codex", "claude"}

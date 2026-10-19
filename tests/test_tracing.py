@@ -5,6 +5,8 @@ import shlex
 import sys
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
 from test_control import settings
 from test_runtime import RuntimeHarness
@@ -84,6 +86,32 @@ class TracingTests(RuntimeHarness, unittest.TestCase):
         self.assertTrue(self.runtime._tracing_requested(task))
         config.pop("tracing")
         self.assertFalse(self.runtime._tracing_requested(task))
+
+    def test_runtime_phase_only_restores_credentials_for_the_executor_child(self):
+        config = self.configure("opencode")
+        config["tracing"] = "requested"
+        self.control.environment.update({"LANGFUSE_PUBLIC_KEY": "pk-secret", "LANGFUSE_SECRET_KEY": "sk-secret"})
+        task_id = "phase-tracing"
+        task = {"task_id": task_id, "session_id": "S", "executor": "opencode", "status": "running",
+                "attempt_number": 1, "artifact_dir": str(self.root / "artifacts"), "deadline_at": 9_999_999_999_999,
+                "invocation": {"parent_worktree": str(self.repo)}, "worktree": str(self.root / "child"),
+                "permission_profile": {"*": "allow"}, "tracing": {"requested": True, "available": False}}
+        with self.control.store.transaction() as db:
+            self.control.store.put(db, task)
+        environments = []
+
+        def fake_launch(command, cwd, environment, directory, register, *, disposable=False):
+            environments.append(environment)
+            return SimpleNamespace(poll=lambda: 0), {}
+
+        with patch("router.daemon.launch", side_effect=fake_launch), \
+                patch.object(self.runtime, "observe", return_value={"exit_code": 0}):
+            self.runtime.phase(task_id, "setup", ["setup"], self.root)
+            self.runtime.phase(task_id, "child", ["child"], self.root)
+        self.assertNotIn("LANGFUSE_PUBLIC_KEY", environments[0])
+        self.assertNotIn("LANGFUSE_SECRET_KEY", environments[0])
+        self.assertEqual(environments[1]["LANGFUSE_PUBLIC_KEY"], "pk-secret")
+        self.assertEqual(environments[1]["LANGFUSE_SECRET_KEY"], "sk-secret")
 
 
 class TracingLaunchTests(unittest.TestCase):
