@@ -268,8 +268,9 @@ Router adds no trust bypass and never starts a remote daemon.
 Separate-process simulated hosts exercise distinct state directories, real daemon
 sockets and CLI readers, replay after restart and lost replies, and host-routing
 mismatches. Component tests cover subscription fences and malformed evidence;
-local SSH-reader fixtures cover failed-reader descendants. Interruption during an
-already-running fleet collection is **NOT CHECKED** by these tests.
+local SSH-reader fixtures cover failed-reader descendants. An active-collection
+interruption test synchronizes a local wait and an SSH-reader process before Ctrl-C,
+then checks reader and descendant cleanup while the managed command continues once.
 Physical SSH, host-key negotiation, independent machine reboot, and the
 two-host live smoke test are **NOT CHECKED** by these tests.
 

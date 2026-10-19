@@ -2,6 +2,7 @@ import errno
 import io
 import json
 import os
+import selectors
 import shlex
 import signal
 import sqlite3
@@ -561,3 +562,157 @@ main()
             ssh_stdout(config.hosts[0], 15, ['wait'], cancelled=cancelled)
         self.assertEqual(caught.exception.code, 'interrupted')
         self.assertIsNotNone(processes[-1].poll())
+
+    def test_interrupting_active_collection_cancels_readers_without_stopping_work(self):
+        from router.fleet import SSHQueryError, ssh_stdout
+        from router.fleet_completions import query_completions
+        from router.managed import wait
+        from router.paths import PROJECT_MARKER, PROJECT_MARKER_CONTENT
+
+        with tempfile.TemporaryDirectory(prefix='ar-active-wait-') as temporary:
+            root = Path(temporary)
+            project, home = root / 'project', root / 'home'
+            project.mkdir()
+            home.mkdir()
+            (project / PROJECT_MARKER).write_text(json.dumps(PROJECT_MARKER_CONTENT))
+            environment = {key: value for key, value in os.environ.items()
+                           if key in {'PATH', 'LANG', 'LC_ALL', 'TMPDIR', 'SHELL', 'USER', 'LOGNAME'}}
+            environment.update(HOME=str(home), AGENT_ROUTER_STATE_DIR=str(root / 'state'),
+                               AGENT_ROUTER_SOCKET=str(root / 'missing.sock'),
+                               AGENT_ROUTER_ENV_FILE=str(root / 'missing.env'),
+                               PYTHONPATH=str(Path(__file__).resolve().parents[1]))
+            release, ready, signals, launches = [root / name for name in ('release', 'ready', 'signals', 'launches')]
+            source = ("import os,signal,time;from pathlib import Path\n"
+                      f"release,ready,signals,launches=map(Path,{[str(path) for path in (release, ready, signals, launches)]!r})\n"
+                      "launches.write_text(launches.read_text()+'x' if launches.exists() else 'x')\n"
+                      "def signaled(number,frame): signals.write_text(str(number))\n"
+                      "signal.signal(signal.SIGTERM,signaled);signal.signal(signal.SIGINT,signaled)\n"
+                      "temporary=ready.with_suffix('.tmp');temporary.write_text(str(os.getpid()));temporary.replace(ready)\n"
+                      "while not release.exists(): time.sleep(.02)\n")
+            popen = subprocess.Popen
+            command = popen([sys.executable, '-m', 'router.cli', 'run', '--', sys.executable, '-c', source],
+                            env=environment, cwd=project, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            readers, local_results, remote_errors, forced_cleanup, failures = [], [], [], [], []
+            local_ready, local_done, reader_waiting, remote_done, abort = [threading.Event() for _ in range(5)]
+            observed = {}
+            remote_ready, child_ready = root / 'reader-ready', root / 'child-ready'
+            child_source = ("import os,time;from pathlib import Path;"
+                            f"ready=Path({str(child_ready)!r});temporary=ready.with_suffix('.tmp');"
+                            "temporary.write_text(str(os.getpid()));temporary.replace(ready);time.sleep(60)")
+            reader_source = ("import signal,subprocess,sys,time;from pathlib import Path\n"
+                             f"child=subprocess.Popen([sys.executable,'-c',{child_source!r}])\n"
+                             "def stopped(number,frame):\n child.wait(timeout=15)\n raise SystemExit(0)\n"
+                             "signal.signal(signal.SIGTERM,stopped)\n"
+                             f"ready=Path({str(child_ready)!r})\n"
+                             "while not ready.exists(): time.sleep(.02)\n"
+                             f"Path({str(remote_ready)!r}).touch()\n"
+                             "time.sleep(60)\n")
+
+            def start_reader(arguments, **options):
+                process = popen([sys.executable, '-c', reader_source], env=environment, **options)
+                readers.append(process)
+                return process
+
+            def request(operation, payload, **options):
+                self.assertIn(operation, {'completion_subscribe', 'completion_next'})
+                binding = {'consumer': 'batch-job', 'host_id': 'host-a', 'subscription_id': 'subscription-a'}
+                if operation == 'completion_subscribe':
+                    return binding
+                local_ready.set()
+                # Release a broken cancellation path without waiting for the production deadline.
+                return ({**self.event, **binding} if abort.is_set() else {**binding, 'status': 'pending'})
+
+            def local_wait(*arguments, **options):
+                observed['cancelled'] = options['cancelled']
+                try:
+                    result = wait(*arguments, **options)
+                    local_results.append(result)
+                    return result
+                finally:
+                    local_done.set()
+
+            def remote_wait(*arguments, **options):
+                try:
+                    return ssh_stdout(*arguments, **options)
+                except SSHQueryError as error:
+                    remote_errors.append(error.code)
+                    raise
+                finally:
+                    remote_done.set()
+
+            class ActiveSelector(selectors.DefaultSelector):
+                def select(self, timeout=None):
+                    events = super().select(timeout)
+                    reader_waiting.set()
+                    return events
+
+            def interrupt_when_active():
+                deadline = time.monotonic() + 15
+                while not (local_ready.is_set() and reader_waiting.is_set() and remote_ready.exists()):
+                    if time.monotonic() >= deadline:
+                        failures.append('Both readers did not become active')
+                        break
+                    time.sleep(.02)
+                else:
+                    observed['interrupted_at'] = time.monotonic()
+                    os.kill(os.getpid(), signal.SIGINT)
+                    deadline = time.monotonic() + 15
+                    if all(event.wait(max(0, deadline - time.monotonic()))
+                           for event in (observed['cancelled'], local_done, remote_done)):
+                        return
+                    failures.append('Active readers did not observe cancellation')
+                forced_cleanup.append(True)
+                abort.set()
+                for process in readers:
+                    if process.poll() is None:
+                        os.killpg(process.pid, signal.SIGTERM)
+
+            injector = None
+            previous = signal.signal(signal.SIGINT, signal.default_int_handler)
+            try:
+                deadline = time.monotonic() + 15
+                while not ready.exists() and command.poll() is None and time.monotonic() < deadline:
+                    time.sleep(.02)
+                self.assertTrue(ready.exists(), 'Managed command did not become active')
+                managed_pid = int(ready.read_text())
+                with patch('router.fleet.subprocess.Popen', side_effect=start_reader), \
+                        patch('router.fleet.selectors.DefaultSelector', ActiveSelector), \
+                        patch('router.managed.request', side_effect=request), \
+                        patch('router.fleet_completions.wait', side_effect=local_wait), \
+                        patch('router.fleet_completions.ssh_stdout', side_effect=remote_wait):
+                    injector = threading.Thread(target=interrupt_when_active)
+                    injector.start()
+                    with self.assertRaises(KeyboardInterrupt):
+                        query_completions(self.config, 'batch-job', 60)
+                    elapsed = time.monotonic() - observed['interrupted_at']
+                    injector.join(timeout=15)
+                self.assertFalse(injector.is_alive())
+                self.assertEqual(failures, [])
+                self.assertEqual(forced_cleanup, [])
+                self.assertLess(elapsed, 15, 'Interruption waited for a host deadline')
+                self.assertEqual(local_results, [{'status': 'unavailable', 'consumer': 'batch-job',
+                                                 'host_id': 'host-a', 'subscription_id': 'subscription-a'}])
+                self.assertEqual(remote_errors, ['interrupted'])
+                self.assertEqual(len(readers), 1)
+                self.assertIsNotNone(readers[0].poll())
+                child = int(child_ready.read_text())
+                with self.assertRaises(ProcessLookupError):
+                    os.kill(child, 0)
+                self.assertIsNone(command.poll())
+                os.kill(managed_pid, 0)
+                self.assertFalse(signals.exists(), 'The managed command received a signal')
+                self.assertEqual(launches.read_text(), 'x')
+            finally:
+                abort.set()
+                release.touch()
+                if injector is not None:
+                    injector.join(timeout=30)
+                for process in readers:
+                    if process.poll() is None:
+                        os.killpg(process.pid, signal.SIGTERM)
+                    process.wait(timeout=15)
+                command.communicate(timeout=15)
+                signal.signal(signal.SIGINT, previous)
+            self.assertEqual(command.returncode, 0)
+            self.assertEqual(launches.read_text(), 'x')
+            self.assertFalse(signals.exists())
