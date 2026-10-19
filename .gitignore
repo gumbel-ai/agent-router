@@ -9,3 +9,6 @@ build/
 dist/
 .env
 .pytest_cache/
+# Generated local pre-PR review outputs.
+docs/reviews/
+.DS_Store
