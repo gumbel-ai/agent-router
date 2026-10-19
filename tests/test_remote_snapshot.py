@@ -362,6 +362,23 @@ class RemoteSnapshotTests(unittest.TestCase):
         self.assertTrue(observed.exists(), "Real Git did not execute its alternate-refs helper")
         self.assertEqual(json.loads(observed.read_text()), [], "Git helper inherited tracing configuration")
 
+    def test_materialize_imported_snapshot_creates_isolated_worktree(self):
+        receipt = self.export()
+        remote_snapshot.import_snapshot(self.target, receipt, self.artifacts / "snapshot.bundle")
+        parent_head = git(self.target, "rev-parse", "HEAD").strip()
+        artifact = self.root / "remote-task"
+        info = remote_snapshot.materialize_snapshot(self.target, receipt, artifact)
+        self.assertEqual(info["snapshot_commit"], receipt["snapshot_commit"])
+        self.assertEqual((Path(info["worktree"]) / "code.txt").read_text(), "source initial\n")
+        self.assertEqual(git(self.target, "rev-parse", "HEAD").strip(), parent_head)
+        self.assertEqual(remote_snapshot.materialize_snapshot(self.target, receipt, artifact), info)
+        (Path(info["worktree"]) / "code.txt").write_text("remote result\n")
+        git(Path(info["worktree"]), "add", "code.txt")
+        final = remote_snapshot._git(Path(info["worktree"]), "write-tree").decode().strip()
+        self.assertNotEqual(final, receipt["snapshot_tree"])
+        with self.assertRaisesRegex(ValueError, "already exists"):
+            remote_snapshot.materialize_snapshot(self.target, receipt, artifact)
+
     def test_export_git_failures_stop_owned_group_and_close_pipes(self):
         helper = self.root / "owned-git-helper.py"
         helper.write_text("""import json, os, signal, sys

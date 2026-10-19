@@ -1,9 +1,12 @@
 # Selected snapshots for remote children
 
-The internal `router.remote_snapshot` helpers prepare and verify a bounded bundle
-of explicitly selected code files. They are prerequisites for remote-child
-submission in #54. They do not launch a command, create a child worktree, apply a
-result or provide a remote `router start` path yet.
+The `router.remote_snapshot` helpers prepare and verify a bounded bundle of
+explicitly selected code files. The remote-child control path carries the existing
+session/request identity with this receipt. A remote Router imports and materializes
+the immutable ref before the scheduler can launch a child; repeated `remote_start`
+with the same identity and receipt returns the same task, while a changed replay is
+refused. Remote status, review, cancel and close are explicit SSH requests. A
+transport failure leaves the parent outcome unknown and never starts locally.
 
 The caller must supply 1–128 exact, unique repository-relative file paths. No
 directory, glob, label or filename implies permission. Git-visible content is not
@@ -34,8 +37,8 @@ and timestamp are fixed so the same task and tree have stable commit identity.
 
 The receipt contains version 1, task/commit/tree IDs, object format, sorted selected
 paths, file/byte counts and a SHA-256 digest of the bundle. The digest detects
-changed bytes; it does not authenticate the sender. The future SSH submission path
-must also bind the serving host, original authorized request and snapshot identity.
+changed bytes; SSH authentication and the remote Router's durable request binding
+provide the transport boundary.
 
 | Bound | Limit |
 | --- | --- |
@@ -80,8 +83,8 @@ An uncertain Git timeout or cleanup remains an error even if its ref was persist
 only a confirmed Git status failure can recover from a matching concurrent ref.
 Neither outcome authorizes a command launch. Retry only the same immutable transfer
 identity when appropriate; never use a transfer error to rerun a command or fall
-back to local execution. A separate end-to-end origin request binding and durable
-apply-once record are still required for #54.
+back to local execution. The parent applies a returned diff only through its
+existing `git apply --check`/`git apply` path.
 
 ## Verification scope
 
@@ -92,7 +95,7 @@ refs, compressed expansion bounds, refused external transports and tracing-envir
 isolation for an allowed Git helper.
 
 **NOT CHECKED:** physical SSH, native child execution, independent reboot and the
-complete start/review/accept/discard/integration lifecycle. These internal helpers
-have no operator CLI yet; do not ask another machine to claim remote-child coverage
-from their unit tests. The remote-start PR must provide its exact-head live checklist
-when that path is implemented.
+complete start/review/accept/discard/integration lifecycle. Synthetic tests cover
+wire validation and isolated materialization only. A live run must use the exact
+commit on both hosts and record the remote host ID, request binding, reboot boundary,
+and final diff digest before claiming remote-child completion.

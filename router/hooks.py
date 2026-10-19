@@ -49,6 +49,9 @@ def authorize(event: dict, *, source: str = "claude") -> dict:
         operation = mutation_operation(command)
         if operation is None:
             return {}
+        if operation == "remote":
+            # The SSH serving entry point has no session authorization of its own.
+            raise ValueError("router remote is the SSH serving entry point; dispatch through router start")
         if source == "codex":
             event = codex_parent(event, "PreToolUse")
             values, _ = configuration()

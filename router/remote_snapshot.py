@@ -448,3 +448,50 @@ def import_snapshot(root: Path, receipt: dict, bundle_path: Path) -> dict:
              "--no-recurse-submodules", str(quarantine), commit)
         _bind(root, receipt["task_id"], commit)
     return {field: receipt[field] for field in ("task_id", "snapshot_commit", "snapshot_tree")}
+
+
+def materialize_snapshot(root: Path, receipt: dict, directory: Path) -> dict:
+    """Create an isolated child worktree from an already imported snapshot ref.
+
+    Import deliberately never checks out transport-supplied files.  This is the
+    separate, parent-controlled step used after import has verified the bundle.
+    The receiving repository's current checkout is not changed.
+    """
+    _receipt(receipt)
+    root = _repository(root)
+    reference = f"refs/router/snap/{receipt['task_id']}"
+    commit = _git(root, "rev-parse", "--verify", reference).decode().strip()
+    if commit != receipt["snapshot_commit"]:
+        raise ValueError("Imported snapshot ref does not match its receipt")
+    directory = Path(directory)
+    directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    info = directory.lstat()
+    if not stat.S_ISDIR(info.st_mode) or info.st_mode & 0o077 or info.st_uid != os.getuid():
+        raise ValueError("Remote child artifact directory must be private, owned and not a symlink")
+    worktree = directory / "worktree"
+    branch = f"agent/{receipt['task_id']}"
+    if worktree.exists() or worktree.is_symlink():
+        # A request may have reached this point before the serving daemon lost
+        # its response.  Reusing an already materialized worktree is safe only
+        # when Git proves that it is the exact task branch and snapshot; never
+        # treat an arbitrary existing path as an idempotent replay.
+        if worktree.is_symlink() or not worktree.is_dir():
+            raise ValueError("Remote child worktree already exists")
+        try:
+            actual_root = Path(os.fsdecode(_git(worktree, "rev-parse", "--show-toplevel")).strip()).resolve()
+            actual_commit = _git(worktree, "rev-parse", "HEAD").decode().strip()
+            actual_branch = _git(worktree, "symbolic-ref", "--quiet", "--short", "HEAD").decode().strip()
+            dirty = _git(worktree, "status", "--porcelain=v1", "--untracked-files=all", "--ignored=matching").strip()
+        except ValueError as error:
+            raise ValueError("Remote child worktree already exists") from error
+        if actual_root != worktree.resolve() or actual_commit != commit or actual_branch != branch or dirty:
+            raise ValueError("Remote child worktree already exists")
+        return {"task_id": receipt["task_id"], "snapshot_commit": commit,
+                "snapshot_tree": receipt["snapshot_tree"], "worktree": str(worktree),
+                "branch": branch}
+    if _git(root, "for-each-ref", "--format=%(refname)", f"refs/heads/{branch}").strip():
+        raise ValueError("Remote child branch already exists")
+    _git(root, "worktree", "add", "-b", branch, str(worktree), commit)
+    return {"task_id": receipt["task_id"], "snapshot_commit": commit,
+            "snapshot_tree": receipt["snapshot_tree"], "worktree": str(worktree),
+            "branch": branch}

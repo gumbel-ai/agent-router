@@ -20,7 +20,7 @@ def mutation_operation(command: str) -> str | None:
     words = "".join(character if character.isalnum() or character == "_" else " "
                     for character in command).split()
     for word, following in itertools.pairwise(words):
-        if word == "router" and following in MUTATIONS:
+        if word == "router" and (following in MUTATIONS or following == "remote"):
             return following
     return None
 

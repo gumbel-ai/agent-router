@@ -1,6 +1,8 @@
 """Local control plane: durable operations, bounded supervision, no auto-spawn."""
 
+import copy
 import fcntl
+import hashlib
 import json
 import logging
 import os
@@ -10,6 +12,7 @@ import socketserver
 import sqlite3
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import uuid
@@ -499,6 +502,20 @@ class Controller:
         if operation == "task_diff":
             from router.task_diff import export
             return export(self.store, self.directory, self.host.host_id, payload)
+        if operation == "remote_status":
+            return self.remote_status(payload)
+        if operation in {"remote_start", "remote_review", "remote_cancel", "remote_close"}:
+            # Same admission and maintenance gates as local mutations.
+            if not self.settings.delegation_enabled and (operation == "remote_start" or
+                    operation == "remote_review" and payload.get("outcome") in {"rejected", "continue"}):
+                raise ValueError("External delegation is not configured; run router init in the project")
+            # Held through import so maintenance cannot exit mid-admission.
+            with self.lifecycle_lock:
+                if self.draining:
+                    raise ValueError("Router is stopping for maintenance; retry after it restarts")
+                if operation == "remote_start":
+                    return self.remote_start(payload)
+                return self.remote_mutation(operation.removeprefix("remote_"), payload)
         if operation == "request_status":
             from router.request_status import export
             return export(self.store, self.host.host_id, payload)
@@ -523,6 +540,165 @@ class Controller:
             result = self.mutate(operation, payload)
         self.changed.set()
         return public(result, self.store)
+
+    def remote_start(self, payload: dict) -> dict:
+        """Admit one parent-owned remote snapshot without a local dispatch auth row.
+
+        The SSH caller has already authenticated to this Router account.  The
+        request/session pair is still bound durably in ``operations`` before the
+        scheduler can run the child, so reconnecting can return the same task.
+        """
+        from router.remote_child import _start_payload
+        from router.remote_snapshot import import_snapshot, materialize_snapshot
+
+        checked = _start_payload(payload)
+        session_id, request_id = checked["session_id"], checked["request_id"]
+        invocation = dict(checked["invocation"])
+        remote_repo = Path(checked["remote_repo"]).resolve()
+        remote_worktree = Path(checked["remote_worktree"]).resolve()
+        if remote_worktree != remote_repo:
+            raise ValueError("Remote repository and worktree must name the configured remote checkout")
+        invocation["parent_repo"] = str(remote_repo)
+        invocation["parent_worktree"] = str(remote_worktree)
+        self.envelope(invocation)
+        invocation.pop("host", None)
+        invocation.pop("remote_repo", None)
+        invocation.pop("remote_worktree", None)
+        receipt = checked["snapshot_receipt"]
+        operation_payload = canonical({"invocation": invocation, "resolved_model": checked["resolved_model"],
+                                       "remote_repo": str(remote_repo), "remote_worktree": str(remote_worktree),
+                                       "snapshot_receipt": receipt})
+        with self.store.snapshot() as db:
+            existing = db.execute("SELECT operation,payload,task_id FROM operations WHERE session_id=? AND request_id=?",
+                                  (session_id, request_id)).fetchone()
+            if existing:
+                if tuple(existing[:2]) != ("start", operation_payload):
+                    raise ValueError("Remote request_id was already used with another payload")
+                return public(self.store.get(existing[2], db), self.store)
+        configured = self.settings.repositories.get(str(remote_repo))
+        if configured is None:
+            raise ValueError("Remote repository is not configured on the serving host")
+        if self.settings.models.get(invocation["model"]) != checked["resolved_model"]:
+            raise ValueError("Remote model alias does not resolve to the parent's exact model; no fallback")
+        # Operations are keyed by (session_id, request_id); the inbox must be too.
+        inbox = self.directory / "remote-inbox" / hashlib.sha256(canonical([session_id, request_id]).encode()).hexdigest()
+        inbox.mkdir(parents=True, exist_ok=True, mode=0o700)
+        # Serialize the durable request binding with import/materialization. A
+        # lost SSH response causes the parent to replay the exact request while
+        # the first server call may still be finishing; without this lock both
+        # calls can race through the initial operation lookup and one can reject
+        # the already-created worktree instead of returning the same task.
+        lock_path = inbox / "request.lock"
+        try:
+            lock_fd = os.open(lock_path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+        except OSError as error:
+            raise ValueError("Remote request lock is unavailable") from error
+        with os.fdopen(lock_fd, "a+") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            try:
+                with self.store.snapshot() as db:
+                    existing = db.execute("SELECT operation,payload,task_id FROM operations WHERE session_id=? AND request_id=?",
+                                          (session_id, request_id)).fetchone()
+                    if existing:
+                        if tuple(existing[:2]) != ("start", operation_payload):
+                            raise ValueError("Remote request_id was already used with another payload")
+                        return public(self.store.get(existing[2], db), self.store)
+                bundle = inbox / "snapshot.bundle"
+                descriptor, partial = tempfile.mkstemp(dir=inbox, prefix=".bundle-")
+                try:
+                    with os.fdopen(descriptor, "wb") as stream:
+                        stream.write(checked["snapshot_bytes"])
+                    # Publish only complete bytes; link never overwrites.
+                    os.link(partial, bundle)
+                except FileExistsError:
+                    # The immutable receipt/digest check below decides whether
+                    # this is the same transfer; never follow or overwrite an
+                    # existing path.
+                    pass
+                finally:
+                    os.unlink(partial)
+                imported = import_snapshot(remote_repo, receipt, bundle)
+                # The parent snapshot identity is the durable task identity on
+                # both hosts. This makes reconnect and cleanup address the same
+                # ref/worktree without a second mutable mapping.
+                task_id = receipt["task_id"]
+                artifact_dir = self.directory / "tasks" / task_id
+                materialized = materialize_snapshot(remote_repo, receipt, artifact_dir)
+                task = {"task_id": task_id, "session_id": session_id, "parent_agent_id": None,
+                        "instruction_id": invocation["instruction_id"], "invocation": invocation,
+                        "status": "created", "attempts": 0, "review_retries": 0, "continuations": 0,
+                        "executor": invocation["executor"], "requested_model": invocation["model"],
+                        "review_history": [], "created_at": now_ms(), "execution_stopped": True,
+                        "max_attempts": self.settings.max_attempts, "artifact_dir": str(artifact_dir),
+                        "expected_resolved_model": checked["resolved_model"],
+                        "remote_origin": {"session_id": session_id, "request_id": request_id},
+                        "snapshot_commit": imported["snapshot_commit"], "snapshot_tree": imported["snapshot_tree"],
+                        "worktree": materialized["worktree"], "branch": materialized["branch"]}
+                if "work_item_id" in invocation:
+                    task["work_item_id"] = invocation["work_item_id"]
+                with self.store.transaction() as db:
+                    existing = db.execute("SELECT operation,payload,task_id FROM operations WHERE session_id=? AND request_id=?",
+                                          (session_id, request_id)).fetchone()
+                    if existing:
+                        if tuple(existing[:2]) != ("start", operation_payload):
+                            raise ValueError("Remote request_id was already used with another payload")
+                        return public(self.store.get(existing[2], db), self.store)
+                    collision = db.execute("SELECT session_id FROM tasks WHERE task_id=?", (task_id,)).fetchone()
+                    if collision is not None:
+                        raise ValueError("Remote snapshot task identity is already in use")
+                    self.store.put(db, task)
+                    db.execute("INSERT INTO operations VALUES(?,?,?,?,?)",
+                               (session_id, request_id, "start", operation_payload, task_id))
+            finally:
+                fcntl.flock(lock, fcntl.LOCK_UN)
+        self.changed.set()
+        return public(task, self.store)
+
+    def remote_status(self, payload: dict) -> dict:
+        from router.remote_child import _control_payload
+        checked = _control_payload("status", payload)
+        with self.store.snapshot() as db:
+            row = db.execute("SELECT operation,task_id FROM operations WHERE session_id=? AND request_id=?",
+                             (checked["session_id"], checked["request_id"])).fetchone()
+            if row is None or row["operation"] != "start":
+                return {"status": "not_found", "session_id": checked["session_id"],
+                        "request_id": checked["request_id"], "host_id": self.host.host_id}
+            task = self.store.get(row["task_id"], db)
+        return public(task, self.store)
+
+    def remote_mutation(self, operation: str, payload: dict) -> dict:
+        from router.remote_child import _control_payload
+        checked = _control_payload(operation, payload)
+        task_id, request_id = checked["task_id"], checked["request_id"]
+        with self.store.transaction() as db:
+            task = self.store.get(task_id, db)
+            origin = task.get("remote_origin")
+            if not isinstance(origin, dict):
+                raise TypeError("Task is not a remote child")
+            replay = db.execute("SELECT operation,payload FROM operations WHERE session_id=? AND request_id=?",
+                                (task["session_id"], request_id)).fetchone()
+            encoded = canonical(checked)
+            if replay:
+                if tuple(replay) != (operation, encoded):
+                    raise ValueError("Remote request_id was already used with another payload")
+                return public(task, history=self.store.history(task_id, db))
+            if operation == "review":
+                self.review(task, checked)
+            elif operation == "cancel":
+                if task["status"] in {"accepted", "integrated", "closed"}:
+                    raise ValueError("Finalize accepted work through close")
+                task.update(cancel_requested=True, cancel_requested_at=now_ms())
+                if task["status"] in {"created", "retrying", "awaiting_review", "blocked", "failed", "cancelled"} and task["execution_stopped"]:
+                    task["status"] = "cancelled"
+                else:
+                    task["status"] = "cancelling"
+            else:
+                self.close(task, checked)
+            self.store.put(db, task)
+            db.execute("INSERT INTO operations VALUES(?,?,?,?,?)",
+                       (task["session_id"], request_id, operation, encoded, task_id))
+        self.changed.set()
+        return public(task, self.store)
 
     def submit(self, payload: dict) -> dict:
         from router.paths import delegation_target
@@ -612,30 +788,65 @@ class Controller:
                 if "work_item_id" in payload:
                     task["work_item_id"] = payload["work_item_id"]
             elif operation == "review":
+                if task.get("remote_host"):
+                    self.forward_remote(task, operation, payload)
                 self.review(task, payload)
             elif operation == "cancel":
                 if set(payload) - {"task_id", "request_id"}:
                     raise ValueError("Unknown cancel field")
                 if task["status"] in {"accepted", "integrated", "closed"}:
                     raise ValueError("Finalize accepted work through close")
+                if task.get("remote_host"):
+                    self.forward_remote(task, operation, payload)
                 task.update(cancel_requested=True, cancel_requested_at=now_ms())
-                if task["status"] in {"created", "retrying", "awaiting_review", "blocked", "failed", "cancelled"} and task["execution_stopped"]:
+                if task["status"] in {"created", "retrying", "awaiting_review", "blocked", "failed", "cancelled"} and task["execution_stopped"] \
+                        and not task.get("remote_task_id"):  # a sent remote task waits for remote confirmation
                     task["status"] = "cancelled"
                 else:
                     task["status"] = "cancelling"
             else:
+                if task.get("remote_host"):
+                    self.forward_remote(task, operation, payload)
                 self.close(task, payload)
             self.store.put(db, task)
             db.execute("UPDATE authorizations SET consumed=1 WHERE session_id=? AND request_id=?", (session, request_id))
             db.execute("INSERT INTO operations VALUES(?,?,?,?,?)", (session, request_id, operation, encoded, task["task_id"]))
             return task
 
+    def forward_remote(self, task: dict, operation: str, payload: dict) -> dict | None:
+        """Commit review/close remotely before changing the parent's state."""
+        # Refuse a locally invalid transition before any remote mutation.
+        if operation == "review":
+            self.review(copy.deepcopy(task), payload)
+        elif operation == "close":
+            self.close(copy.deepcopy(task), payload)
+        if not task.get("remote_task_id") and task["execution_stopped"]:
+            return None  # The start was never sent; no remote task or config needed.
+        from router.fleet import DEFAULT_CONFIG, load_fleet_config
+        from router.remote_child import RemoteChildTransport
+        host_name = task["remote_host"]
+        config = load_fleet_config(DEFAULT_CONFIG)
+        hosts = [host for host in config.hosts if host.name == host_name]
+        if len(hosts) != 1:
+            raise ValueError("Remote task host is no longer configured; parent state unchanged")
+        forwarded = dict(payload)
+        # The snapshot task identity is the parent task_id on both hosts, so a
+        # possibly admitted start whose reply was lost is still addressable.
+        forwarded["task_id"] = task.get("remote_task_id", task["task_id"])
+        transport = RemoteChildTransport(hosts[0], config.ssh_timeout_seconds)
+        if operation == "review":
+            return transport.review(forwarded)
+        if operation == "cancel":
+            return transport.cancel(forwarded)
+        return transport.close(forwarded)
+
     @staticmethod
     def envelope(payload: dict) -> None:
-        allowed = {"request_version", "request_id", "instruction_id", "executor", "model", "task", "parent_repo", "parent_worktree", "mode", "context", "work_item_id"}
+        allowed = {"request_version", "request_id", "instruction_id", "executor", "model", "task", "parent_repo", "parent_worktree", "mode", "context", "work_item_id", "host", "remote_repo", "remote_worktree"}
         if set(payload) - allowed:
             raise ValueError("Unknown invocation field; operator limits are not task inputs")
-        for key in allowed - {"context", "work_item_id"}:
+        for key in ("request_version", "request_id", "instruction_id", "executor", "model", "task",
+                    "parent_repo", "parent_worktree", "mode"):
             required_text(payload, key)
         if "work_item_id" in payload:
             correlation_identifier(payload["work_item_id"], "work_item_id")
@@ -643,6 +854,10 @@ class Controller:
             raise ValueError("Only request_version 1 and write mode are supported")
         if any(not Path(payload[key]).is_absolute() for key in ("parent_repo", "parent_worktree")):
             raise ValueError("Repository and worktree paths must be absolute")
+        if {"host", "remote_repo", "remote_worktree"} & set(payload):
+            required_text(payload, "host")
+            if any(key not in payload or not Path(payload[key]).is_absolute() for key in ("remote_repo", "remote_worktree")):
+                raise ValueError("Remote dispatch requires absolute remote_repo and remote_worktree")
         context = payload.get("context", {})
         if not isinstance(context, dict) or set(context) - {"relevant_paths", "constraints"}:
             raise ValueError("Invalid context")
@@ -801,13 +1016,26 @@ class Runtime:
         self.control.start_lifecycle_writer()
         self.control.capacity.start()
         for task in self.store.all():
+            if task.get("remote_host") and task["status"] == "interrupted" and not task["execution_stopped"]:
+                # A lost reply leaves remote ownership unknown; reconcile it from
+                # the original request binding without resubmitting work.
+                self.spawn(task, recovered=True)
+                continue
             if task["status"] == "closed" and task.get("cleanup_pending") and task.get("cleanup_error") is None:
                 self.store.update(task["task_id"], lambda t: t.update(cleanup_requested=True))
             if self.control.settings.max_attempts is not None and task["status"] != "closed" and task["max_attempts"] != self.control.settings.max_attempts:
                 self.store.update(task["task_id"], lambda t: t.update(max_attempts=self.control.settings.max_attempts))
             if task["status"] in {"validating", "preparing", "running", "cancelling"}:
                 record = task.get("process")
-                if record and (owned_state(record) == "live" or
+                if task.get("remote_host") and not task.get("remote_task_id") and task["execution_stopped"]:
+                    # The start was never claimed as sent; nothing can be running remotely.
+                    self.store.update(task["task_id"], lambda t: t.update(
+                        status="cancelled" if t.get("cancel_requested") else "failed", execution_stopped=True,
+                        failure_reason="Remote start was not sent before restart"))
+                elif task.get("remote_host"):
+                    # Remote liveness is read from the serving Router, not local process evidence.
+                    self.spawn(task, recovered=True)
+                elif record and (owned_state(record) == "live" or
                                (owned_state(record) == "stopped" and Path(record["completion"]).exists())):
                     self.spawn(task, recovered=True)
                 elif task.get("cancel_requested") and (not record or owned_state(record) == "stopped"):
@@ -867,6 +1095,8 @@ class Runtime:
         model = self.control.settings.models.get(invocation["model"])
         if model is None:
             raise ValueError("Unknown configured model alias; no fallback")
+        if "expected_resolved_model" in task and model != task["expected_resolved_model"]:
+            raise ValueError("Model alias no longer resolves to the parent's exact model; no fallback")
         root = Path(invocation["parent_worktree"]).resolve()
         repo = Path(invocation["parent_repo"]).resolve()
         validate_repository(root)
@@ -884,12 +1114,6 @@ class Runtime:
                 # user/plugin configuration disabled, so credentials are stripped.
                 tracing = {"tracing": {"requested": True, "available": False,
                                         "reason": TRACING_UNAVAILABLE[executor]}}
-        if executor == "codex":
-            sandbox = configured.get("codex_sandbox")
-            if sandbox not in {"read-only", "workspace-write"}:
-                raise ValueError("Project requires an explicit Codex sandbox; run router init --executor codex")
-            if not model.startswith("openai/") or not model.removeprefix("openai/").strip():
-                raise ValueError("Codex requires an exact openai/model ID; no provider fallback")
         credential_file = Path(self.control.environment.get("AGENT_ROUTER_ENV_FILE", "~/.agent-router/.env")).expanduser().resolve()
         if credential_file.is_relative_to(root):
             relative = str(credential_file.relative_to(root))
@@ -899,6 +1123,24 @@ class Runtime:
                                      env=strip_langfuse_environment(os.environ), check=False)
             if ignored.returncode != 0:
                 raise ValueError("The provider env file must be ignored when inside the repository")
+        if invocation.get("host"):
+            from router.fleet import DEFAULT_CONFIG, load_fleet_config
+            hosts = [host for host in load_fleet_config(DEFAULT_CONFIG).hosts if host.name == invocation["host"]]
+            if len(hosts) != 1 or hosts[0].transport != "ssh":
+                raise ValueError("Remote dispatch requires one configured SSH fleet host")
+            if tracing_requested or "claude_tracing" in configured:
+                # Remote children run outside the local tracing route; record it, never drop it.
+                tracing = {"tracing": {"requested": True, "available": False,
+                                        "reason": "Remote children are not traced"}}
+            return {"executor": executor, "requested_model": invocation["model"],
+                    "resolved_model": model, "remote_host": invocation["host"],
+                    "remote_repo": invocation["remote_repo"], "remote_worktree": invocation["remote_worktree"], **tracing}
+        if executor == "codex":
+            sandbox = configured.get("codex_sandbox")
+            if sandbox not in {"read-only", "workspace-write"}:
+                raise ValueError("Project requires an explicit Codex sandbox; run router init --executor codex")
+            if not model.startswith("openai/") or not model.removeprefix("openai/").strip():
+                raise ValueError("Codex requires an exact openai/model ID; no provider fallback")
         if executor == "claude":
             validate_command(self.control.settings.claude_command)
             validate_persistence(self.control.environment)
@@ -1122,6 +1364,10 @@ class Runtime:
             task = self.store.get(task_id)
             if not recovered and task["status"] not in {"created", "retrying", "cancelling"}:
                 return
+            if task.get("remote_host") and (recovered or task["status"] == "cancelling"):
+                # Never infer remote shutdown locally; reconcile from remote status.
+                self.execute_remote(task_id, recovered=True)
+                return
             if task["status"] == "cancelling" and not recovered:
                 record = task.get("process")
                 if record:
@@ -1157,7 +1403,7 @@ class Runtime:
                     for key in ("final_tree", "patch", "execution_outcome", "failure_reason", "exit_code", "last_event_at", "summary", "cost", "usage", "usage_complete", "cost_note", "cost_source", "executor_completed", "thread_observed", "executor_activity", "execution_error", "event_offset", "process", "phase", "phase_started_at"):
                         current.pop(key, None)
                 self.store.update(task_id, begin)
-                if task["executor"] == "claude":
+                if task["executor"] == "claude" and not self.store.get(task_id).get("remote_host"):
                     executable = resolve_executable(self.control.settings.claude_command, self.control.environment,
                                                     Path(task["invocation"]["parent_worktree"]))
                     self.store.update(task_id, lambda t: t.update(claude_executable=executable))
@@ -1185,6 +1431,9 @@ class Runtime:
                     self.finish(task_id, outcome, reason, already_captured=phase == "capture")
                     return
             task = self.store.get(task_id)
+            if task.get("remote_host"):
+                self.execute_remote(task_id, recovered)
+                return
             if task["executor"] == "claude":
                 executable = task.get("claude_executable")
                 if not isinstance(executable, str) or not Path(executable).is_absolute() or recovered and not task.get("executor_version"):
@@ -1239,6 +1488,120 @@ class Runtime:
                     return
             outcome, reason = "failed", str(error)
         self.finish(task_id, outcome, reason)
+
+    def execute_remote(self, task_id: str, recovered: bool = False) -> None:
+        """Start or recover one remote task; never substitute local execution."""
+        from router.fleet import DEFAULT_CONFIG, load_fleet_config
+        from router.remote_child import RemoteChildError, RemoteChildTransport
+        from router.remote_snapshot import export_snapshot
+
+        task = self.store.get(task_id)
+        invocation = task["invocation"]
+        try:
+            config = load_fleet_config(DEFAULT_CONFIG)
+            hosts = [host for host in config.hosts if host.name == task["remote_host"] and host.transport == "ssh"]
+        except ValueError:
+            hosts = []
+        if len(hosts) != 1:
+            if not task.get("remote_task_id") and task["execution_stopped"]:
+                # Known-unsent start: nothing can be running remotely.
+                self.store.update_with_attempt(task_id, lambda current: current.update(
+                    status="cancelled" if current.get("cancel_requested") else "failed", execution_stopped=True,
+                    failure_reason="Remote host configuration is unavailable; start was not sent"))
+                return
+            self.store.update_with_attempt(task_id, lambda current: current.update(
+                status="interrupted", execution_stopped=False,
+                failure_reason="Remote host configuration is unavailable; execution outcome is unknown"))
+            return
+        transport = RemoteChildTransport(hosts[0], config.ssh_timeout_seconds)
+        if not recovered and not task.get("remote_task_id"):
+            paths = invocation.get("context", {}).get("relevant_paths", [])
+            if not paths:
+                raise ValueError("Remote dispatch requires explicit context.relevant_paths for the code snapshot")
+            artifact = Path(task["artifact_dir"]) / "remote-snapshot"
+            receipt = export_snapshot(Path(invocation["parent_worktree"]), task_id, artifact, paths)
+            bundle = (artifact / "snapshot.bundle").read_bytes()
+            # From here the receiver may commit the start even if its reply is
+            # lost, so ownership is uncertain until a status read settles it.
+            # Recheck cancellation in the same write: an unsent start is suppressed.
+            def claim(current):
+                if current.get("cancel_requested"):
+                    raise PhaseStopped("cancelled")
+                current.update(status="running", execution_stopped=False)
+            self.store.update(task_id, claim)
+        try:
+            if not recovered and not task.get("remote_task_id"):
+                try:
+                    remote = transport.start(session_id=task["session_id"], request_id=invocation["request_id"],
+                                             invocation=invocation, resolved_model=task["resolved_model"],
+                                             remote_repo=task["remote_repo"], remote_worktree=task["remote_worktree"],
+                                             snapshot_receipt=receipt, snapshot_bundle=bundle)
+                except RemoteChildError as error:
+                    if error.code != "spawn_failed":
+                        raise
+                    # SSH never started, so nothing was sent.
+                    self.store.update_with_attempt(task_id, lambda current: current.update(
+                        status="failed", execution_stopped=True, failure_reason="Remote transport could not start"))
+                    return
+                except ValueError as error:
+                    # Plain ValueError is raised only before SSH is spawned: nothing was sent.
+                    reason = f"Remote start refused before sending: {error}"
+                    self.store.update_with_attempt(task_id, lambda current, reason=reason: current.update(
+                        status="failed", execution_stopped=True, failure_reason=reason))
+                    return
+                remote_id = remote.get("task_id")
+                if not isinstance(remote_id, str):
+                    raise RemoteChildError("invalid_response", "Remote start did not return a task identity")
+                if remote_id != task_id:
+                    raise RemoteChildError("invalid_response", "Remote start returned a different task identity")
+                self.store.update(task_id, lambda current: current.update(
+                    remote_task_id=remote_id, snapshot_commit=receipt["snapshot_commit"],
+                    snapshot_tree=receipt["snapshot_tree"]))
+            while True:
+                task = self.store.get(task_id)
+                status = transport.status(task["session_id"], task["invocation"]["request_id"])
+                if status.get("status") == "not_found":
+                    raise RemoteChildError("invalid_response", "Remote request binding disappeared")
+                if "resolved_model" in status and status["resolved_model"] != task.get("resolved_model"):
+                    raise RemoteChildError("invalid_response", "Remote task resolved a different exact model")
+                if status.get("status") != "not_found" and status.get("task_id") != task_id:
+                    raise RemoteChildError("invalid_response", "Remote status returned a different task identity")
+                remote_status = status.get("status")
+                if remote_status in {"awaiting_review", "failed", "interrupted", "blocked", "cancelled"}:
+                    updates = {"status": remote_status, "execution_stopped": status.get("execution_stopped") is True,
+                               "remote_task_id": status.get("task_id", task.get("remote_task_id"))}
+                    for field in ("attempts", "attempt_number", "final_tree", "execution_outcome", "failure_reason",
+                                  "duration_ms", "exit_code", "snapshot_commit", "snapshot_tree"):
+                        if field in status:
+                            updates[field] = status[field]
+                    self.store.update_with_attempt(task_id, lambda current, updates=updates: current.update(updates))
+                    return
+                if remote_status in {"accepted", "integrated", "closed"}:
+                    updates = {"status": remote_status, "execution_stopped": True,
+                               "remote_task_id": status.get("task_id", task.get("remote_task_id"))}
+                    for field in ("attempts", "attempt_number", "final_tree", "execution_outcome", "failure_reason",
+                                  "duration_ms", "exit_code", "snapshot_commit", "snapshot_tree"):
+                        if field in status:
+                            updates[field] = status[field]
+                    self.store.update_with_attempt(task_id, lambda current, updates=updates: current.update(updates))
+                    return
+                if remote_status not in {"created", "validating", "preparing", "running", "retrying", "cancelling"}:
+                    raise RemoteChildError("invalid_response", "Remote task returned an unknown state")
+                # Recovery starts with a locally uncertain task. A successful
+                # status read is the evidence that re-establishes the remote
+                # task identity and its current liveness; do not leave the
+                # parent visibly interrupted while the remote child is active.
+                updates = {"status": remote_status, "execution_stopped": False,
+                           "remote_task_id": status.get("task_id", task.get("remote_task_id"))}
+                for field in ("attempts", "attempt_number", "duration_ms", "snapshot_commit", "snapshot_tree"):
+                    if field in status:
+                        updates[field] = status[field]
+                self.store.update_with_attempt(task_id, lambda current, updates=updates: current.update(updates))
+                time.sleep(.2)
+        except RemoteChildError as error:
+            reason = f"Remote transport {error.code}; execution outcome is unknown"
+            self.store.update_with_attempt(task_id, lambda current, reason=reason: current.update(
+                status="interrupted", execution_stopped=False, failure_reason=reason))
 
     @staticmethod
     def child_failed(task: dict) -> bool:
@@ -1312,13 +1675,17 @@ class Handler(socketserver.StreamRequestHandler):
     def handle(self) -> None:
         self.connection.settimeout(15)
         try:
-            line = self.rfile.readline(1024 * 1024 + 1)
+            from router.remote_child import MAX_REQUEST_BYTES
+            line = self.rfile.readline(MAX_REQUEST_BYTES + 1)
             if not line:
                 return
-            if len(line) > 1024 * 1024:
-                raise ValueError("Request exceeds one MiB")
+            if len(line) > MAX_REQUEST_BYTES:
+                raise ValueError("Request exceeds its wire bound")
             message = json.loads(line)
             operation, payload = message["operation"], message["payload"]
+            # Only a remote snapshot start may exceed the ordinary one MiB frame.
+            if len(line) > 1024 * 1024 and operation != "remote_start":
+                raise ValueError("Request exceeds one MiB")
             if operation == "daemon_stop":
                 if not isinstance(payload, dict) or set(payload) - {"only_if_idle"}:
                     raise ValueError("Invalid daemon stop options")
