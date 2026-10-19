@@ -1,4 +1,4 @@
-"""Explicit Claude hook selection; native Claude owns all secret option delivery."""
+"""Explicit Claude hook selection; Langfuse credentials come from Router's startup environment."""
 
 import hashlib
 import json
@@ -6,13 +6,12 @@ import os
 import shutil
 import sys
 from pathlib import Path
-from urllib.parse import urlsplit
 
 PLUGIN_ID = "langfuse-observability@inline"
 PLUGIN_FILES = (".claude-plugin/plugin.json", "hooks/hooks.json", "hooks/langfuse_hook.py")
 # b5b7cc364996467e856dc17575b5674f4799ad87, including relative names and NUL separators.
 AUDITED_DIGEST = "776d495fbc91ffc486e04fad0ccf2975084c299ff1034e44f7b183149bf369e5"
-CONFIG_KEYS = {"plugin_dir", "public_key", "base_url"}
+CONFIG_KEYS = {"plugin_dir"}
 AUTH_KEYS = {"CLAUDE_CONFIG_DIR", "CLAUDE_CODE_OAUTH_TOKEN"}
 
 
@@ -20,17 +19,9 @@ def _configuration(value: object) -> dict:
     if (not isinstance(value, dict) or set(value) != CONFIG_KEYS
             or any(not isinstance(item, str) or not item or len(item) > 4096
                    or item != item.strip() or any(not c.isprintable() for c in item) for item in value.values())):
-        raise ValueError("Claude tracing requires exactly plugin_dir, public_key and base_url strings; no secret setting")
-    if not Path(value["plugin_dir"]).is_absolute() or not value["public_key"].startswith("pk-lf-"):
-        raise ValueError("Claude tracing requires an absolute plugin directory and a Langfuse public key")
-    try:
-        url = urlsplit(value["base_url"])
-        valid = url.scheme in {"https", "http"} and url.hostname and not (url.username or url.password or url.query or url.fragment)
-        _ = url.port
-    except ValueError:
-        valid = False
-    if not valid:
-        raise ValueError("Claude tracing base_url must be an HTTP(S) endpoint without credentials, query or fragment")
+        raise ValueError("Claude tracing requires exactly one plugin_dir string; credentials come from the environment")
+    if not Path(value["plugin_dir"]).is_absolute():
+        raise ValueError("Claude tracing requires an absolute plugin directory")
     return value
 
 
@@ -69,24 +60,30 @@ def _inspect(directory: Path) -> str:
         raise ValueError("Claude tracing plugin is unavailable, invalid or changed; inspect the selected source") from error
 
 
-def configure(raw: str, task: dict, host_id: str, repository: Path) -> dict:
+def configure(raw: str, task: dict, host_id: str, repository: Path, credentials_available: bool) -> dict:
     try:
         if not isinstance(raw, str) or len(raw) > 16384:
             raise ValueError()
         config = _configuration(json.loads(raw))
         directory = Path(config["plugin_dir"]).resolve(strict=True)
     except (OSError, ValueError, TypeError, RecursionError) as error:
-        raise ValueError("Claude tracing configuration is invalid; expected explicit plugin_dir, public_key and base_url") from error
+        raise ValueError("Claude tracing configuration is invalid; expected exactly one explicit plugin_dir") from error
     repositories = {repository.resolve(), Path(task["invocation"]["parent_repo"]).resolve()}
     if any(directory.is_relative_to(root) for root in repositories):
         raise ValueError("Claude tracing plugin must be outside the delegated repository")
     correlation = {"session_id": task["child_session_id"], "router_task_id": task["task_id"], "host_id": host_id}
     if "work_item_id" in task:
         correlation["work_item_id"] = task["work_item_id"]
-    tracing = {"requested": True, "plugin": PLUGIN_ID, "correlation": correlation}
+    # Same availability rule as the OpenCode route: true only when Router's
+    # startup environment has the required keys. Real exports remain unverified.
+    tracing = {"requested": True, "available": credentials_available,
+               "reason": ("Claude plugin selected; Langfuse credentials are forwarded from Router's startup environment"
+                          if credentials_available else
+                          "Claude plugin selected, but required Langfuse credentials are unavailable"),
+               "plugin": PLUGIN_ID, "correlation": correlation}
     if "work_item_id" in correlation and len("work_item_id:" + correlation["work_item_id"]) > 200:
         tracing["omitted_tags"] = {"work_item_id": "exceeds_plugin_200_character_limit"}
-    return {"_claude_tracing": {**config, "plugin_dir": str(directory), "schema_version": 1,
+    return {"_claude_tracing": {**config, "plugin_dir": str(directory), "schema_version": 2,
                                 "digest": _inspect(directory)},
             "tracing": tracing}
 
@@ -94,30 +91,27 @@ def configure(raw: str, task: dict, host_id: str, repository: Path) -> dict:
 def selected(task: dict) -> dict | None:
     if "_claude_tracing" not in task:
         tracing = task.get("tracing")
-        # Older repository-wide tracing requests are explicitly recorded as
-        # unavailable by the Router and must retain their normal untraced
-        # Claude command. The opt-in candidate has no availability marker and
-        # must fail closed if its private selection is missing.
-        if (isinstance(tracing, dict) and tracing.get("requested")
-                and "available" not in tracing):
+        # Repository-wide tracing requests are recorded as unavailable and keep
+        # the normal untraced Claude command. The opt-in candidate names its
+        # plugin and must fail closed if its private selection is missing.
+        if isinstance(tracing, dict) and tracing.get("requested") and tracing.get("plugin") == PLUGIN_ID:
             raise ValueError("Claude tracing selection is missing; refusing an untraced replacement")
         return None
     config = task["_claude_tracing"]
+    if isinstance(config, dict) and config.get("schema_version") == 1:
+        # Version 1 selected native plugin options that never reach the inline
+        # identity. Its destination cannot be silently replaced by environment input.
+        raise ValueError("Claude tracing selection uses the superseded native-option format; start a new task")
     if (not isinstance(config, dict) or set(config) != CONFIG_KEYS | {"schema_version", "digest"}
-            or type(config["schema_version"]) is not int or config["schema_version"] != 1):
+            or type(config["schema_version"]) is not int or config["schema_version"] != 2):
         raise ValueError("Claude tracing selection is invalid; refusing an untraced replacement")
+    tracing = task.get("tracing")
+    if not (isinstance(tracing, dict) and tracing.get("requested") is True and tracing.get("plugin") == PLUGIN_ID):
+        raise ValueError("Claude tracing was revoked after selection; refusing an untraced replacement")
     _configuration({key: config[key] for key in CONFIG_KEYS})
     if _inspect(Path(config["plugin_dir"])) != config["digest"]:
         raise ValueError("Claude tracing plugin changed after selection; refusing an untraced replacement")
     return config
-
-
-def options(task: dict, config: dict) -> dict:
-    return {"pluginConfigs": {PLUGIN_ID: {"options": {
-        "LANGFUSE_PUBLIC_KEY": config["public_key"], "LANGFUSE_BASE_URL": config["base_url"],
-        "CC_LANGFUSE_STATE_DIR": str(Path(task["artifact_dir"]) / "claude-tracing" / "state"),
-        "CC_LANGFUSE_TRACE_SEED": task["child_session_id"],
-    }}}}
 
 
 def _private_directories(base: Path) -> None:
@@ -200,4 +194,8 @@ def environment(result: dict[str, str], task: dict) -> dict[str, str]:
     if "work_item_id" in correlation and len("work_item_id:" + correlation["work_item_id"]) <= 200:
         tags.append("work_item_id:" + correlation["work_item_id"])
     result["CC_LANGFUSE_TRACE_TAGS"] = json.dumps(tags)
+    # The inline-loaded plugin identity receives no native plugin options, so
+    # its non-secret inputs use the plain environment names it reads first.
+    result["CC_LANGFUSE_STATE_DIR"] = str(base / "state")
+    result["CC_LANGFUSE_TRACE_SEED"] = task["child_session_id"]
     return result

@@ -15,7 +15,7 @@ from unittest.mock import patch
 from test_runtime import RuntimeHarness
 
 from router import claude_tracing
-from router.child import child_environment, executor_command
+from router.child import LANGFUSE_ENVIRONMENT_KEYS, child_environment, executor_command
 
 MODEL = "anthropic/claude-sonnet-4-6"
 PROFILE = {"tools": ["Read", "Edit", "Write"], "allow": ["Read", "Edit", "Write"]}
@@ -40,8 +40,14 @@ class ClaudeTracingTests(RuntimeHarness, unittest.TestCase):
         pinned = patch("router.claude_tracing.AUDITED_DIGEST", digest.hexdigest())
         pinned.start()
         self.addCleanup(pinned.stop)
-        self.selection = {"plugin_dir": str(self.plugin), "public_key": "pk-lf-synthetic",
-                          "base_url": "https://collector.example.invalid"}
+        self.selection = {"plugin_dir": str(self.plugin)}
+        # Synthetic startup credentials; never the developer's ambient values.
+        for key in tuple(self.control.environment):
+            if key.startswith("LANGFUSE_"):
+                self.control.environment.pop(key)
+        self.credentials = {"LANGFUSE_PUBLIC_KEY": "synthetic-public", "LANGFUSE_SECRET_KEY": "synthetic-secret",
+                            "LANGFUSE_BASE_URL": "https://collector.example.invalid", "LANGFUSE_USER_ID": "synthetic-user"}
+        self.control.environment.update(self.credentials)
         wrapper = self.root / "claude-fixture"
         fixture = Path(__file__).with_name("fixture_executor.py")
         wrapper.write_text(f'#!/bin/sh\nexec {shlex.quote(sys.executable)} {shlex.quote(str(fixture))} "$@"\n')
@@ -69,7 +75,7 @@ class ClaudeTracingTests(RuntimeHarness, unittest.TestCase):
         self.assertTrue(first.get("tracing", {}).get("requested"), first)
         self.assertNotIn("_claude_tracing", first)
         self.assertNotIn(str(self.plugin), json.dumps(first))
-        self.assertNotIn("available", first["tracing"])
+        self.assertIs(first["tracing"]["available"], True)
         self.assertEqual(first["tracing"]["correlation"]["session_id"], first["child_session_id"])
         self.assertEqual(first["tracing"]["correlation"]["work_item_id"], work_item)
         self.assertIn("work_item_id", first["tracing"]["omitted_tags"])
@@ -96,10 +102,7 @@ class ClaudeTracingTests(RuntimeHarness, unittest.TestCase):
             self.assertEqual(settings["permissions"]["allow"], PROFILE["allow"])
             self.assertEqual(settings["fallbackModel"], [])
             self.assertIs(settings["switchModelsOnFlag"], False)
-            options = settings["pluginConfigs"]["langfuse-observability@inline"]["options"]
-            self.assertEqual(options["LANGFUSE_PUBLIC_KEY"], self.selection["public_key"])
-            self.assertEqual(options["LANGFUSE_BASE_URL"], self.selection["base_url"])
-            self.assertNotIn("LANGFUSE_SECRET_KEY", options)
+            self.assertNotIn("pluginConfigs", settings)
         self.assertIn("--session-id", commands[0])
         self.assertIn("--resume", commands[1])
         exported = self.control.handle("correlation", {})
@@ -136,10 +139,11 @@ class ClaudeTracingTests(RuntimeHarness, unittest.TestCase):
             "XDG_CACHE_HOME", "XDG_DATA_HOME", "XDG_CONFIG_HOME", "XDG_CONFIG_DIRS", "XDG_BIN_HOME", "TMPDIR", "TMP", "TEMP")}
         environment.update(storage_overrides)
         actual = child_environment(environment, task)
-        for key in ("HOME", "CLAUDE_CONFIG_DIR", "ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN", "HTTPS_PROXY"):
+        for key in ("HOME", "CLAUDE_CONFIG_DIR", "ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN", "HTTPS_PROXY",
+                    "LANGFUSE_SECRET_KEY"):
             self.assertEqual(actual[key], environment[key])
         for key in ("CLAUDE_CODE_PLUGIN_DIRS", "CLAUDE_CODE_PLUGIN_SEED_DIR", "CLAUDE_CODE_SAFE_MODE", "CLAUDE_CODE_SIMPLE",
-                    "CLAUDE_PLUGIN_OPTION_LANGFUSE_SECRET_KEY", "LANGFUSE_SECRET_KEY", "CC_LANGFUSE_SECRET_KEY",
+                    "CLAUDE_PLUGIN_OPTION_LANGFUSE_SECRET_KEY", "CC_LANGFUSE_SECRET_KEY",
                     "CC_LANGFUSE_TRACEPARENT", "CC_LANGFUSE_PARENT_TRACE_ID", "TRACE_TO_LANGFUSE", "BASH_ENV", "NODE_OPTIONS"):
             self.assertNotIn(key, actual)
         self.assertEqual(actual["PATH"], str(self.operator_bin) + os.pathsep + "/usr/bin")
@@ -168,6 +172,8 @@ class ClaudeTracingTests(RuntimeHarness, unittest.TestCase):
             probe = subprocess.run([real_uv, "--no-config", "cache", "dir"], env=probe_env, cwd=self.repo,
                                    capture_output=True, text=True, timeout=5, check=True)
             self.assertEqual(Path(probe.stdout.strip()).resolve(), private / "runtime-cache")
+        self.assertEqual(actual["CC_LANGFUSE_STATE_DIR"], str(private / "state"))
+        self.assertEqual(actual["CC_LANGFUSE_TRACE_SEED"], task["child_session_id"])
         tags = json.loads(actual["CC_LANGFUSE_TRACE_TAGS"])
         self.assertEqual(tags, ["router_task_id:task-synthetic", "router_host_id:" + self.control.host.host_id,
                                 "work_item_id:work-synthetic"])
@@ -189,6 +195,92 @@ class ClaudeTracingTests(RuntimeHarness, unittest.TestCase):
                 self.assertEqual(len(selected_tags), 3 if supported else 2)
                 self.assertEqual(changed["tracing"]["correlation"].get("work_item_id"), work_item)
                 self.assertEqual("omitted_tags" in changed["tracing"], work_item is not None and not supported)
+
+    def _opted_task(self, task_id="task-synthetic"):
+        task = {"task_id": task_id, "invocation": {
+            "executor": "claude", "model": "test", "parent_worktree": str(self.repo), "parent_repo": str(self.repo)}}
+        task.update(self.runtime.validate(task), worktree=str(self.root / "worker"), artifact_dir=str(self.root / "artifacts"))
+        return task
+
+    def test_availability_follows_startup_credentials(self):
+        self.runtime.stop()
+        self.assertIs(self._opted_task()["tracing"]["available"], True)
+        for missing in ("LANGFUSE_PUBLIC_KEY", "LANGFUSE_SECRET_KEY"):
+            with self.subTest(missing=missing):
+                value = self.control.environment.pop(missing)
+                tracing = self._opted_task()["tracing"]
+                self.assertIs(tracing["available"], False)
+                self.assertIn("credentials are unavailable", tracing["reason"])
+                self.control.environment[missing] = value
+
+    def test_only_opted_claude_child_phase_receives_startup_credentials(self):
+        self.runtime.stop()
+        environment = {**self.credentials, "PATH": str(self.operator_bin) + os.pathsep + "/usr/bin",
+                       "LANGFUSE_UNDOCUMENTED": "synthetic-extra"}
+        task = self._opted_task()
+        child = child_environment(environment, task)
+        for key in self.credentials:
+            self.assertEqual(child[key], self.credentials[key])
+        self.assertNotIn("LANGFUSE_UNDOCUMENTED", child)
+        setup = child_environment(environment, task, include_tracing_credentials=False)
+        unopted = child_environment(environment, {key: value for key, value in task.items()
+                                                  if key not in {"_claude_tracing", "tracing"}})
+        # Setup keeps its normal dependency environment; hook restrictions are child-only.
+        self.assertEqual(setup["PATH"].split(os.pathsep)[0], str(Path(task["worktree"]) / ".venv" / "bin"))
+        self.assertNotIn("CC_LANGFUSE_TRACE_TAGS", setup)
+        for name, actual in (("setup", setup), ("unopted", unopted)):
+            with self.subTest(phase=name):
+                self.assertTrue(all(key not in actual for key in LANGFUSE_ENVIRONMENT_KEYS))
+        codex = child_environment(environment, {"executor": "codex", "worktree": task["worktree"]})
+        self.assertFalse(any(key.startswith("LANGFUSE_") for key in codex))
+
+    def test_claude_alias_endpoint_maps_to_canonical_name(self):
+        self.runtime.stop()
+        task = self._opted_task()
+        base = {**self.credentials, "PATH": str(self.operator_bin)}
+        alias = {key: value for key, value in base.items() if key != "LANGFUSE_BASE_URL"}
+        alias["LANGFUSE_BASEURL"] = "https://alias.example.invalid"
+        self.assertEqual(child_environment(alias, task)["LANGFUSE_BASE_URL"], "https://alias.example.invalid")
+        blank = {**alias, "LANGFUSE_BASE_URL": ""}
+        self.assertEqual(child_environment(blank, task)["LANGFUSE_BASE_URL"], "https://alias.example.invalid")
+        both = {**base, "LANGFUSE_BASEURL": "https://alias.example.invalid"}
+        self.assertEqual(child_environment(both, task)["LANGFUSE_BASE_URL"], self.credentials["LANGFUSE_BASE_URL"])
+
+    def test_revoked_or_superseded_selection_refuses_without_untraced_replacement(self):
+        self.runtime.stop()
+        task = self._opted_task()
+        environment = {"PATH": str(self.operator_bin)}
+        revoked = {key: value for key, value in task.items() if key != "tracing"}
+        with self.assertRaisesRegex(ValueError, "revoked after selection"):
+            child_environment(environment, revoked)
+        legacy = {**task, "_claude_tracing": {**task["_claude_tracing"], "schema_version": 1,
+                                              "public_key": "synthetic-public",
+                                              "base_url": "https://collector.example.invalid"}}
+        with self.assertRaisesRegex(ValueError, "superseded native-option format"):
+            child_environment(environment, legacy)
+        self.assertTrue(self.runtime._tracing_requested(task))
+        self.repository.pop("claude_tracing")
+        self.assertFalse(self.runtime._tracing_requested(task))
+        # A Claude selection never authorizes another executor's tracing route.
+        self.repository["claude_tracing"] = json.dumps(self.selection)
+        self.assertFalse(self.runtime._tracing_requested({"invocation": task["invocation"]}))
+
+    def test_opted_claude_validation_git_subprocesses_strip_credentials(self):
+        self.runtime.stop()
+        run = subprocess.run
+        environments = []
+
+        def record_run(command, *args, **kwargs):
+            if command[0] == "git":
+                environments.append(dict(os.environ if kwargs.get("env") is None else kwargs["env"]))
+            return run(command, *args, **kwargs)
+
+        with (patch.dict(os.environ, self.credentials),
+              patch("router.snapshot.subprocess.run", side_effect=record_run)):
+            self.assertIs(self._opted_task()["tracing"]["available"], True)
+        self.assertTrue(environments)
+        for actual in environments:
+            self.assertFalse(any(key.startswith("LANGFUSE_") for key in actual))
 
     def test_private_roots_and_hook_interpreter_refuse_delegated_links(self):
         self.runtime.stop()
@@ -233,8 +325,8 @@ class ClaudeTracingTests(RuntimeHarness, unittest.TestCase):
 
     def test_invalid_selection_refuses_before_any_executor_or_worktree(self):
         cases = ["{", "null", json.dumps({**self.selection, "secret_key": "synthetic"}),
-                 json.dumps({**self.selection, "public_key": "sk-lf-synthetic"}),
-                 json.dumps({**self.selection, "base_url": "https://user:secret@example.invalid"}),
+                 json.dumps({**self.selection, "public_key": "synthetic-public"}),
+                 json.dumps({"plugin_dir": "relative/plugin"}),
                  json.dumps({**self.selection, "plugin_dir": str(self.root / "absent")})]
         for number, selected in enumerate(cases):
             with self.subTest(selected=number):

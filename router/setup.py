@@ -170,6 +170,7 @@ def initialize(repo: Path, model: str, setup_command: str, permission: dict | No
             target["tracing"] = "requested"
         else:
             target.pop("tracing", None)
+            target.pop("claude_tracing", None)
         values.setdefault("AGENT_ROUTER_REPOSITORIES", {})[str(repo)] = target
         effective, _ = load_settings(values)
         for key, actual in (("AGENT_ROUTER_CONCURRENCY_CAP", effective.concurrency_cap),

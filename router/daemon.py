@@ -903,7 +903,8 @@ class Runtime:
                          "child_session_id": str(uuid.uuid4()), **tracing}
             if "claude_tracing" in configured:
                 validated.update(claude_tracing.configure(configured["claude_tracing"], {**task, **validated},
-                                                          self.control.host.host_id, root))
+                                                          self.control.host.host_id, root,
+                                                          langfuse_credentials_available(self.control.environment)))
             return validated
         if executor == "codex":
             return {"executor": executor, "requested_model": invocation["model"], "resolved_model": model,
@@ -985,8 +986,11 @@ class Runtime:
     def _tracing_requested(self, task: dict) -> bool:
         root = Path(task["invocation"]["parent_worktree"]).resolve()
         configured = self.control.settings.repositories.get(str(root))
-        return (isinstance(configured, dict)
-                and (configured.get("tracing") == "requested" or "claude_tracing" in configured))
+        if not isinstance(configured, dict):
+            return False
+        if "_claude_tracing" in task:
+            return "claude_tracing" in configured
+        return configured.get("tracing") == "requested"
 
     def observe(self, task_id: str, record: dict, process=None, *, collecting: bool = False) -> dict:
         offset = self.store.get(task_id).get("event_offset", 0)
