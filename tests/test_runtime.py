@@ -7,6 +7,7 @@ import tempfile
 import threading
 import time
 import unittest
+from contextlib import closing
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -431,7 +432,7 @@ class RuntimeTests(RuntimeHarness, unittest.TestCase):
     def test_lifecycle_shutdown_is_bounded_during_database_contention(self):
         import sqlite3
 
-        with sqlite3.connect(self.control.store.path, timeout=0) as locked:
+        with closing(sqlite3.connect(self.control.store.path, timeout=0)) as locked, locked:
             locked.execute("BEGIN IMMEDIATE")
             result = self.control.handle("lifecycle_observe", {"session": {
                 "source": "claude", "session_id": "contended", "kind": "session_start",
@@ -627,7 +628,7 @@ class RuntimeTests(RuntimeHarness, unittest.TestCase):
         directory.mkdir()
         database = directory / "router.sqlite3"
         import sqlite3
-        with sqlite3.connect(database) as connection:
+        with closing(sqlite3.connect(database)) as connection, connection:
             connection.execute("CREATE TABLE observations(task_id TEXT PRIMARY KEY, session_id TEXT, data TEXT)")
             connection.execute("INSERT INTO observations VALUES('bad','S','not-json')")
         with (directory / "daemon.lock").open("a") as lock:

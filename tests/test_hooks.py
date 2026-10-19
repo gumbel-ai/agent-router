@@ -5,6 +5,7 @@ import subprocess
 import sys
 import time
 import unittest
+from contextlib import closing
 from unittest.mock import patch
 
 from test_transport import TransportHarness
@@ -126,7 +127,7 @@ class HookTests(TransportHarness, unittest.TestCase):
 
     def test_locked_observation_database_is_best_effort_and_fast(self):
         database = self.root / "state" / "router.sqlite3"
-        with sqlite3.connect(database, timeout=.1) as locked:
+        with closing(sqlite3.connect(database, timeout=.1)) as locked, locked:
             locked.execute("BEGIN IMMEDIATE")
             started = time.monotonic()
             self.assertEqual(self.hook({"hook_event_name": "SessionStart", "session_id": "locked",
