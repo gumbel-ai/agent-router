@@ -16,7 +16,15 @@ import uuid
 from pathlib import Path
 
 from router.capacity import CapacitySampler
-from router.child import child_environment, executor_command, launch
+from router.child import (
+    OPENCODE_LANGFUSE_PLUGIN,
+    TRACING_UNAVAILABLE,
+    child_environment,
+    executor_command,
+    langfuse_credentials_available,
+    launch,
+    strip_langfuse_environment,
+)
 from router.claude_executor import collect as collect_claude
 from router.claude_executor import public_usage as claude_public_usage
 from router.claude_executor import (
@@ -856,6 +864,16 @@ class Runtime:
         configured = self.control.settings.repositories.get(str(root))
         if configured is None or repo not in {root, common.parent}:
             raise ValueError("Repository/worktree is not an operator-configured target")
+        tracing = {}
+        tracing_requested = "tracing" in configured
+        if tracing_requested:
+            if configured["tracing"] != "requested":
+                raise ValueError("Repository tracing must be exactly \"requested\" when present")
+            if executor in TRACING_UNAVAILABLE:
+                # Recorded, never silently dropped: these children run with their
+                # user/plugin configuration disabled, so credentials are stripped.
+                tracing = {"tracing": {"requested": True, "available": False,
+                                        "reason": TRACING_UNAVAILABLE[executor]}}
         if executor == "codex":
             sandbox = configured.get("codex_sandbox")
             if sandbox not in {"read-only", "workspace-write"}:
@@ -867,7 +885,8 @@ class Runtime:
             relative = str(credential_file.relative_to(root))
             if git(root, "ls-files", "--", relative).strip():
                 raise ValueError("The provider env file must not be tracked")
-            ignored = subprocess.run(["git", "-C", str(root), "check-ignore", "--quiet", "--", relative], check=False)
+            ignored = subprocess.run(["git", "-C", str(root), "check-ignore", "--quiet", "--", relative],
+                                     env=strip_langfuse_environment(os.environ), check=False)
             if ignored.returncode != 0:
                 raise ValueError("The provider env file must be ignored when inside the repository")
         if executor == "claude":
@@ -880,11 +899,11 @@ class Runtime:
             profile = validate_claude(model, permission)
             return {"executor": executor, "requested_model": invocation["model"], "resolved_model": model,
                     "setup_command": configured["setup_command"], "permission_profile": profile,
-                    "child_session_id": str(uuid.uuid4())}
+                    "child_session_id": str(uuid.uuid4()), **tracing}
         if executor == "codex":
             return {"executor": executor, "requested_model": invocation["model"], "resolved_model": model,
                     "setup_command": configured["setup_command"], "permission_profile": {"sandbox": sandbox},
-                    **price_metadata(model, self.control.settings.model_prices)}
+                    **price_metadata(model, self.control.settings.model_prices), **tracing}
         permission_file = root / "opencode.json"
         try:
             permission = json.loads(permission_file.read_text())["permission"]
@@ -894,19 +913,42 @@ class Runtime:
             return all(noninteractive(v) for v in value.values()) if isinstance(value, dict) else value in {"allow", "deny"}
         if not isinstance(permission, dict) or not permission or not noninteractive(permission):
             raise ValueError("Permission profile must explicitly use allow/deny, never ask")
+        child_session_id = "ses" + uuid.uuid4().hex
+        if tracing_requested:
+            credentials_available = langfuse_credentials_available(self.control.environment)
+            tracing = {"tracing": {"requested": True, "available": credentials_available,
+                                    "reason": ("OpenCode plugin export and Router correlation verified via OpenTelemetry resource attributes"
+                                                if credentials_available else
+                                                "OpenCode route is verified, but required Langfuse credentials are unavailable"),
+                                    "plugin": OPENCODE_LANGFUSE_PLUGIN,
+                                    "correlation": {"session_id": child_session_id,
+                                                     "router_task_id": task["task_id"],
+                                                     "host_id": self.control.host.host_id}}}
         return {"executor": "opencode", "requested_model": invocation["model"], "resolved_model": model,
                 "setup_command": configured["setup_command"], "permission_profile": permission,
-                "child_session_id": "ses" + uuid.uuid4().hex}
+                "child_session_id": child_session_id, **tracing}
 
     def phase(self, task_id: str, name: str, command: list[str], cwd: Path, *, collecting: bool = False) -> dict:
         task = self.store.get(task_id)
+        tracing = task.get("tracing")
+        requested = isinstance(tracing, dict) and tracing.get("requested") is True
+        if requested and not self._tracing_requested(task):
+            # A task can outlive a repository config reload. Fail closed for
+            # every resumed phase and remove the stale child opt-in.
+            self.store.update(task_id, lambda current: current.pop("tracing", None))
+            task = self.store.get(task_id)
         started = now_ms()
         directory = Path(task["artifact_dir"]) / f"attempt-{task['attempt_number']}" / name
-        environment = self.control.environment.copy()
+        phase_environment = self.control.environment.copy()
+        environment = strip_langfuse_environment(phase_environment)
         for key in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR"):
             environment.pop(key, None)
         if "worktree" in task and name in {"setup", "child"}:
-            environment = child_environment(environment, task)
+            environment = child_environment(
+                phase_environment if name == "child" else environment,
+                task,
+                include_tracing_credentials=name == "child",
+            )
         process = None
         def register(record):
             record["interrupt_first"] = name == "child" and task["executor"] in {"codex", "claude"}
@@ -934,6 +976,11 @@ class Runtime:
             if process.poll() is not None:
                 with self.lock:
                     self.processes.pop(task_id, None)
+
+    def _tracing_requested(self, task: dict) -> bool:
+        root = Path(task["invocation"]["parent_worktree"]).resolve()
+        configured = self.control.settings.repositories.get(str(root))
+        return isinstance(configured, dict) and configured.get("tracing") == "requested"
 
     def observe(self, task_id: str, record: dict, process=None, *, collecting: bool = False) -> dict:
         offset = self.store.get(task_id).get("event_offset", 0)

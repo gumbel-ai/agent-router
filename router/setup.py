@@ -104,7 +104,8 @@ def permissions(value: object) -> bool:
 
 
 def initialize(repo: Path, model: str, setup_command: str, permission: dict | None,
-               concurrency: int, timeout: float, attempts: int, *, executor: str = "opencode", sandbox: str | None = None) -> None:
+               concurrency: int, timeout: float, attempts: int, *, executor: str = "opencode", sandbox: str | None = None,
+               tracing: bool = False) -> None:
     repo = Path(git(repo, "rev-parse", "--show-toplevel").strip()).resolve()
     validate_repository(repo)
     if not setup_command.strip() or "=" not in model:
@@ -164,6 +165,11 @@ def initialize(repo: Path, model: str, setup_command: str, permission: dict | No
             target["codex_sandbox"] = sandbox
         if executor == "claude":
             target["claude_permissions"] = json.dumps(permission)
+        # Each init states the repository's tracing choice; without --tracing it is off.
+        if tracing:
+            target["tracing"] = "requested"
+        else:
+            target.pop("tracing", None)
         values.setdefault("AGENT_ROUTER_REPOSITORIES", {})[str(repo)] = target
         effective, _ = load_settings(values)
         for key, actual in (("AGENT_ROUTER_CONCURRENCY_CAP", effective.concurrency_cap),
@@ -216,8 +222,13 @@ def init(args) -> None:
     timeout = choice(args.timeout, config.attempt_timeout_seconds, 600, "Per-attempt timeout seconds", float)
     attempts = choice(args.attempts, config.max_attempts, 3, "Maximum launches per task", int)
     profile = sandbox if args.executor == "codex" else permission if permission is not None else "existing opencode.json permissions"
-    confirm(f"Enable {args.executor} delegation for {repo} with {model}, permissions {profile}, setup {setup_command!r}, and limits {cap}/{timeout}s/{attempts}?", args.yes)
-    initialize(repo, model, setup_command, permission, cap, timeout, attempts, executor=args.executor, sandbox=sandbox)
+    tracing = ("requested (OpenCode plugin route; live export and correlation verified)"
+               if args.tracing and args.executor == "opencode"
+               else "requested (route unavailable for this executor)" if args.tracing else "off")
+    confirm(f"Enable {args.executor} delegation for {repo} with {model}, permissions {profile}, setup {setup_command!r}, "
+            f"limits {cap}/{timeout}s/{attempts}, and child tracing {tracing}?", args.yes)
+    initialize(repo, model, setup_command, permission, cap, timeout, attempts, executor=args.executor, sandbox=sandbox,
+               tracing=args.tracing)
 
 
 def register_codex_marketplace(marketplace: str) -> None:

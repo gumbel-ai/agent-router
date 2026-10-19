@@ -1,43 +1,85 @@
 # Child tracing
 
-Router-launched Codex and Claude children are currently untraced, and OpenCode child
-tracing is unverified. Router never uploads traces or calls Langfuse; only a runtime's
-own tracing plugin could export a child trace, and no route that runs such a plugin
-inside a Router child has been verified.
+Child tracing is off unless the target repository was initialized with
+`router init --tracing`. Router never uploads traces itself. When tracing is
+requested, the OpenCode 2 route adds the pinned official
+`@langfuse/opencode-observability-plugin@0.5.0` to the child configuration;
+the plugin performs any export using its own documented OpenTelemetry route.
+The route has been live-verified against native OpenCode records and a
+Router-launched child trace.
 
-Router's token and cost counters remain the record for child usage, and
-`router correlation --json` reports `traced: "unknown"`.
+```sh
+router init --executor opencode --model worker=provider/exact \
+  --setup-command 'true' --permissions '{"*":"allow"}' --tracing --yes
+```
 
-| Executor | Why no plugin runs | Evidence |
-| --- | --- | --- |
-| Codex | Children run with `--ignore-user-config`. Codex then uses an empty user layer, and plugin hooks need trust from the user or session-flag layer. | Codex `rust-v0.163.0` [configuration loader](https://github.com/openai/codex/blob/rust-v0.163.0/codex-rs/config/src/loader/mod.rs#L512), [hook trust rules](https://github.com/openai/codex/blob/rust-v0.163.0/codex-rs/hooks/src/config_rules.rs#L8), [hook discovery](https://github.com/openai/codex/blob/rust-v0.163.0/codex-rs/hooks/src/engine/discovery.rs#L666) |
-| Claude | Children run with `--safe-mode` and no setting sources, so installed plugins and hooks do not load. | `claude --help` on 2.1.303; [Claude children](claude-executor.md) |
-| OpenCode | Not known either way. Router's permission-only `OPENCODE_CONFIG_CONTENT` merges with other configuration, so an operator-installed plugin may still load; no Router-launched trace is verified. | [OpenCode audit](langfuse-audit.md#opencode-plugin-052) |
+Running `router init` without `--tracing` removes the repository's tracing choice.
+The permission object is always copied unchanged into the child
+`OPENCODE_CONFIG_CONTENT`; tracing does not broaden or replace it.
 
-Router does not work around these boundaries by copying hook trust, removing
-isolation flags, loading the operator's user configuration or creating another
-runtime home. A route needs verification on a live child first.
+## OpenCode 2 route
 
-## Credentials
+For a requested OpenCode child, Router sets:
 
-Router's environment file is passed to children as documented in
-[the example configuration](../examples/router.env.example). Keep tracing
-credentials out of that file.
+```json
+{
+  "permission": {"...": "the configured allow/deny profile"},
+  "plugins": ["@langfuse/opencode-observability-plugin@0.5.0"]
+}
+```
 
-## Candidate routes (NOT CHECKED)
+The plugin's documented credential inputs are passed only to a requested
+OpenCode child: `LANGFUSE_PUBLIC_KEY`, `LANGFUSE_SECRET_KEY`, `LANGFUSE_BASE_URL`
+(or its documented `LANGFUSE_BASEURL` alias), `LANGFUSE_ENVIRONMENT`, and
+`LANGFUSE_USER_ID`. Router forwards these existing environment inputs only for
+that child; it does not read credential files or persist credential values.
+All Git validation, snapshot, integration and cleanup subprocesses remove
+`LANGFUSE_*` variables, including Git hooks. Without tracing, these variables are
+also removed from the child, and Router does not add the plugin. An
+operator-installed plugin or credential file
+in the user's own OpenCode configuration remains outside Router's control.
 
-- Codex: supplying the plugin hook and its trust through session flags (`-c`).
-- Claude: whether plugins given with `--plugin-dir`, or hooks given through
-  `--settings`, run under `--safe-mode`.
+The plugin emits the native OpenCode `session.id` on observations. Router records
+the requested session value as `child_session_id` and stores the join tuple
+`(host_id, router_task_id, child_session_id)` locally. For a requested OpenCode
+child, Router also sets the standard `OTEL_RESOURCE_ATTRIBUTES` environment
+variable to the three non-secret `router.*` identifiers. The official plugin
+preserves those resource attributes in Langfuse observation metadata as
+`resourceAttributes.router.host_id`, `resourceAttributes.router.task_id`, and
+`resourceAttributes.router.child_session_id`. This provides a direct trace join
+without putting credentials or metadata into the prompt. A resumed attempt reuses
+the same requested session ID and resource attributes.
 
-If a route is verified, it would set the plugins' metadata channels, verified from
-pinned source only:
+Router's usage and cost counters remain the accounting source for Router tasks;
+Langfuse observations must not be added to them. Missing credentials cause the
+upstream plugin to disable its exporter; Router does not treat the absence of
+credentials as permission to expose or persist them.
 
-- Codex plugin 0.4.2: `LANGFUSE_CODEX_METADATA`, a JSON object whose values become
-  strings ([config loader](https://github.com/langfuse/codex-observability-plugin/blob/586910c81eeaf21d8f54c1c86c89a29a5466c1ef/plugins/tracing/src/config.ts)),
-  carrying `router_task_id`, `router_host_id` and any declared `work_item_id`.
-- Claude plugin 1.2.1: `CC_LANGFUSE_TRACE_TAGS`, at most 20 tags of at most 200
-  characters each ([hook source](https://github.com/langfuse/Claude-Observability-Plugin/blob/b5b7cc364996467e856dc17575b5674f4799ad87/hooks/langfuse_hook.py)).
+The task's `tracing.available` flag is conservative and is true only when the
+startup environment contains the plugin's required public and secret keys. Router
+does not read the optional user credential file, so file-only configuration remains
+an operator-controlled export path and is not claimed as Router-verified readiness.
 
-Router's counters would stay as they are; analysis must pick one source for each
-total and never add Router and Langfuse totals together.
+## Other executors
+
+Codex and Claude remain explicitly unavailable for this route:
+
+| Executor | Reason recorded when tracing is requested |
+| --- | --- |
+| Codex | Children run with `--ignore-user-config`; tracing plugin hooks need trust from that ignored user layer. |
+| Claude | Children run with `--safe-mode` and no setting sources; installed plugins and hooks do not load. |
+
+Their tracing request is retained in task and attempt history with `available:
+false`; their child environments also strip Langfuse variables. No executor
+fallback is attempted.
+
+## Verification boundary
+
+The route and environment/configuration boundary are covered by unit and runtime
+tests. A live Router-launched child reconciled the native OpenCode
+session/message/model/token records with its Langfuse generation and confirmed the
+three `resourceAttributes.router.*` values. Requested OpenCode tracing is recorded
+as `available: true` only when the required Langfuse public and secret keys are
+present in the startup environment; otherwise the route remains visible with
+`available: false` and an explicit credential diagnostic. Remote
+children remain out of scope.

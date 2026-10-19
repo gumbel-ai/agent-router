@@ -94,15 +94,15 @@ explicitly accept and ignore stale `max_chars`. Live truncation remains
 uses Node with a 30-second timeout. [Codex hooks require manual trust](https://developers.openai.com/codex/hooks);
 this audit wrote or bypassed none.
 
-### OpenCode plugin 0.5.2
+### OpenCode plugin 0.5.2 source audit
 
 The official [Langfuse OpenCode integration](https://langfuse.com/integrations/developer-tools/opencode)
 provides an existing tracing route. This audit read plugin 0.5.2 at
 [`24389efd13decfb72e103950526669addcb245e8`](https://github.com/langfuse/opencode-observability-plugin/tree/24389efd13decfb72e103950526669addcb245e8),
-released October 8, 2026. It did not install or run OpenCode or the plugin, read
-credentials, or upload a trace. Router-launched OpenCode tracing remains
-**UNVERIFIED**; [issue #53](https://github.com/gumbel-ai/agent-router/issues/53)
-stays open until an actual approved child trace reconciles with native records.
+released October 8, 2026. That source-only pass did not install or run OpenCode
+or the plugin. A later follow-up used the pinned 0.5.0 route actually launched by
+Router and is recorded below; the source-only statements in this section are not
+the current live verification status.
 
 The pinned [compatibility declaration](https://github.com/langfuse/opencode-observability-plugin/blob/24389efd13decfb72e103950526669addcb245e8/README.md#supported-versions)
 supports OpenCode 1.18.29 or newer through `plugin` configuration and OpenCode
@@ -112,11 +112,28 @@ claims. They do not establish Router execution-adapter compatibility.
 | Capability | Pinned source evidence | Live result |
 | --- | --- | --- |
 | Session and parent IDs | Observations carry native `session.id`. Turn metadata contains `messageID` and optional explicit `parentSessionID`; `agent`/`mode` are names, not unique agent IDs. [Emitter](https://github.com/langfuse/opencode-observability-plugin/blob/24389efd13decfb72e103950526669addcb245e8/src/langfuse.ts#L520) | NOT CHECKED |
-| Caller metadata | The credential schema exposes destination, environment, user ID and service name; no general Router task metadata channel was found. OTel resource attributes are read, but their Langfuse projection remains unknown. [Runtime](https://github.com/langfuse/opencode-observability-plugin/blob/24389efd13decfb72e103950526669addcb245e8/src/runtime.ts), [resource setup](https://github.com/langfuse/opencode-observability-plugin/blob/24389efd13decfb72e103950526669addcb245e8/src/langfuse.ts#L1765) | NOT CHECKED |
+| Caller metadata | The credential schema exposes destination, environment, user ID and service name; no general Router task metadata input exists. The official plugin reads standard OTel resource attributes and preserves them in Langfuse observation metadata. Router uses `OTEL_RESOURCE_ATTRIBUTES` for non-secret `router.task_id`, `router.host_id`, and `router.child_session_id`. [Runtime](https://github.com/langfuse/opencode-observability-plugin/blob/24389efd13decfb72e103950526669addcb245e8/src/runtime.ts), [resource setup](https://github.com/langfuse/opencode-observability-plugin/blob/24389efd13decfb72e103950526669addcb245e8/src/langfuse.ts#L1765) | VERIFIED in direct and Router-child traces |
 | Content and truncation | Prompts, outputs, reasoning, tool arguments/results and history can leave the host. V2 context also includes system instructions. No plugin-wide capture limit was found. [V1 hooks](https://github.com/langfuse/opencode-observability-plugin/blob/24389efd13decfb72e103950526669addcb245e8/src/v1.ts), [V2 hooks](https://github.com/langfuse/opencode-observability-plugin/blob/24389efd13decfb72e103950526669addcb245e8/src/v2.ts#L63) | NOT CHECKED |
 | Usage and cost | Generation observations copy native model/provider, message IDs, token buckets and cost. Missing native `total` falls back to input + output + reasoning. Do not combine Router and Langfuse totals. [Generation emitter](https://github.com/langfuse/opencode-observability-plugin/blob/24389efd13decfb72e103950526669addcb245e8/src/langfuse.ts#L680) | NOT CHECKED |
 | Flush and resume | V1 flushes on idle/disposal; V2 flushes on execution completion/interruption/failure and disposal. Deduplication state is in memory; there is no confirmed durable replay contract. [V1 hooks](https://github.com/langfuse/opencode-observability-plugin/blob/24389efd13decfb72e103950526669addcb245e8/src/v1.ts#L49), [V2 completion](https://github.com/langfuse/opencode-observability-plugin/blob/24389efd13decfb72e103950526669addcb245e8/src/v2.ts#L249) | NOT CHECKED |
 | Credentials | Environment keys precede the fixed home credential file. The loader does not validate file ownership, mode or symlinks. It does not copy file credentials into the environment. [Loader](https://github.com/langfuse/opencode-observability-plugin/blob/24389efd13decfb72e103950526669addcb245e8/src/runtime.ts#L34) | Tool access and inheritance NOT CHECKED |
+
+### Router-launched OpenCode follow-up (2026-10-19)
+
+An approved disposable repository ran one real Router child through the pinned
+OpenCode 2 plugin and existing OpenRouter/Langfuse project credentials. The child
+returned `ROUTER_OTEL_CORRELATION_OK` with exit code 0. Native OpenCode and
+Langfuse generation records reconciled on model `z-ai/glm-5.3-flash`, input 8,408,
+output 10, reasoning 184, total 8,602 and cost `0.000434624`.
+
+The Langfuse observations for native session
+`sesb982e5d3a8744e4594002bdbbcc18486` exposed all three exact join values in
+metadata: `resourceAttributes.router.task_id`,
+`resourceAttributes.router.host_id`, and
+`resourceAttributes.router.child_session_id`. The direct child-session query and
+Router's local `correlation --json` record therefore agree without using prompt
+metadata or credentials. This closes the Router task/host/session correlation gap
+for the local OpenCode route; remote children remain out of scope.
 
 #### Router compatibility and verification handoff
 
