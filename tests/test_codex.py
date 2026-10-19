@@ -35,6 +35,13 @@ class CodexTelemetryTests(unittest.TestCase):
         self.assertNotIn("OPENAI_API_KEY", actual)
         self.assertEqual(actual["CODEX_HOME"], environment["CODEX_HOME"])
 
+    def test_opencode_child_uses_task_worktree_in_pwd(self):
+        environment = {"PWD": "/mnt/lab/stock-trading", "PATH": "/usr/bin"}
+        task = {"executor": "opencode", "worktree": "/tmp/router-child",
+                "permission_profile": {"*": "deny", "read": "allow"}}
+        actual = child_environment(environment, task)
+        self.assertEqual(actual["PWD"], str(Path(task["worktree"]).resolve()))
+
     def test_operator_rates_and_partial_turns_preserve_unknown_total_cost(self):
         tier = PriceTier(input=1, cache_read=.1, output=2, cache_write_5m=0, cache_write_1h=0, cache_write=1)
         task = price_metadata("openai/custom", {"openai/custom": [tier]})
