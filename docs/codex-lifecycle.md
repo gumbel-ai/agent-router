@@ -96,6 +96,39 @@ This namespace is shared with the Langfuse correlation bridge (TODO item 9): run
   `PreToolUse` with no `PostToolUse` in the captured session. Router's existing tool
   deadline handles this; the tool must not stay active forever. [V]
 - **Parent and subagent events interleave** in one Codex process. [V]
+  Router orders the root turn independently of child events. A delayed root stop,
+  prompt, or session start reconciles session status without replacing the newest
+  event timestamp, discarding newer child tools, or clearing newer input requests.
+  With an observed closed root turn and no recently running child or live tool,
+  session status becomes idle. Missing root hooks do not establish that the root
+  stopped; child completion alone does not establish idle. Newer input requests
+  retain their waiting state. Same-time root starts and prompts cannot
+  reopen a stopped turn. Pre-restart delayed evidence keeps restart uncertainty
+  until fresh evidence arrives, including sessions already unknown before restart.
+  Repeated restarts preserve the original evidence-based uncertainty deadline;
+  no elapsed-time inference establishes continued execution. Root resets have their own monotonic watermark, so an older reset
+  still removes older tool evidence after newer root activity, while replaying a
+  reset cannot clear input requests delivered afterward at the same timestamp.
+  Terminal tie precedence uses the root-turn watermark even when child activity
+  or notifications intervene. Codex lifecycle evidence reconciles retained root,
+  tool, waiter, and child state even on delayed, tied, and duplicate deliveries.
+  A delayed child's activity uses that child's own native ordering fences. Stored
+  future child work remains evidence when deriving durable session status; clock
+  rollback makes its rendered state and total unknown until the clock catches up. A fresh unknown
+  session with missing root hooks makes the session total and capacity unknown;
+  that uncertainty expires after the normal lifecycle freshness window. Accepted root
+  evidence clears its missing-root warning. Fresh accepted lifecycle evidence retires
+  the prior restart fence; later missing-root uncertainty remains independent, and a
+  later restart derives its deadline from the newer retained evidence.
+  Child-derived running state expires when its supporting children and tools expire,
+  even without another hook. An unrelated completion cannot extend that support. A
+  closed root then becomes idle; a missing root remains unknown within normal
+  freshness bounds. Rendering and all-record active totals apply the same expiry,
+  independently of display limits, without writing during reads. The existing session
+  record stores this support as private versioned bookkeeping. Older records without
+  it, or records with an unsupported version, conservatively report unknown when
+  child-derived running state cannot be verified; fresh accepted evidence restores
+  the bookkeeping. It is excluded from public session and correlation projections.
 
 ## Gaps (shown as unavailable, never inferred)
 

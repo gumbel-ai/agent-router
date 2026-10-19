@@ -11,13 +11,19 @@ import time
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from test_control import observe_every_session, settings
 
 from router import observer_hook
+from router.capacity import CapacitySampler
 from router.cli import fleet_table, sessions_table
 from router.daemon import Controller
+from router.db import Store
+from router.fleet_snapshot import compose
+from router.native import STALE_AFTER_MS, NativeObserver
+from router.sessions import MAX_INFLIGHT_AGE_MS, SessionObserver
 
 SESSION = "019a0000-0000-7000-8000-000000000001"
 CHILD = "019a0000-0000-7000-8000-000000000002"
@@ -122,12 +128,253 @@ class CodexObservationTests(unittest.TestCase):
         self.assertFalse(session["needs_input"])
 
     def test_restart_marks_running_codex_work_uncertain(self):
-        self.hook("SessionStart", source="startup")
-        self.hook("SubagentStart", turn_id="t2", agent_id=CHILD, agent_type="default")
-        self.control.sessions.reconcile_restart()
-        self.control.native.reconcile_restart()
-        self.assertEqual(self.agent()["status"], "unknown")
-        self.assertIn("restart", self.session()["visibility_reason"].lower())
+        cases = (("known root", True, False, False, None), ("missing root", False, False, False, None),
+                 ("historical unknown", False, False, True, None),
+                 ("tool uncertainty", False, True, False, None),
+                 *((f"fresh child then {kind}", False, False, False, kind)
+                   for kind in ("Stop", "UserPromptSubmit", "SessionStart", "restart")))
+        for name, root_observed, live_tool, historical, resolution in cases:
+            with self.subTest(name=name):
+                self.control = Controller(settings(self.root / "repo"), {}, self.root / f"restart-{name}")
+                self.control.start_lifecycle_writer()
+                self.addCleanup(self.control.stop_lifecycle_writer)
+                self.clock = int(time.time() * 1000) - 10_000 - (STALE_AFTER_MS if historical else 0)
+                if root_observed:
+                    self.hook("SessionStart", source="startup")
+                self.hook("SubagentStart", turn_id="t2", agent_id=CHILD, agent_type="default")
+                if live_tool:
+                    self.hook("PreToolUse", turn_id="t2", agent_id=CHILD, tool_name="Bash",
+                              tool_use_id="restart-tool", tool_input={})
+                    tool_at = self.session()["last_event_at"]
+                self.hook("SubagentStop", turn_id="t2", agent_id=CHILD, agent_type="default")
+                latest = self.session()["last_event_at"]
+                deadline = tool_at + MAX_INFLIGHT_AGE_MS if live_tool else latest + STALE_AFTER_MS
+                self.control.sessions.reconcile_restart()
+                self.control.native.reconcile_restart()
+                for offset in (-15, -10):
+                    # Older and tied pre-restart evidence cannot resolve the restart.
+                    self.clock = latest + offset
+                    self.hook("SubagentStop" if resolution else "Stop", turn_id="t1",
+                              agent_id=CHILD if resolution else None, stop_hook_active=False)
+                    self.assertEqual(self.agent()["status"], "idle" if resolution and self.clock == latest else "unknown")
+                    self.assertEqual(self.session()["status"], "unknown")
+                    self.assertIn("restart", self.session()["visibility_reason"].lower())
+                if live_tool:
+                    # A tied notice may add a waiter without resolving the unknown state.
+                    self.clock = latest - 10
+                    self.hook("PermissionRequest", agent_id=CHILD, turn_id="t2")
+                    self.assertEqual(self.session()["status"], "unknown")
+                    self.assertTrue(self.session()["needs_input"])
+                for _ in range(2):
+                    self.control.sessions.reconcile_restart()
+                    self.control.native.reconcile_restart()
+                    with self.control.store.connect() as db:
+                        stored = json.loads(db.execute(
+                            "SELECT data FROM sessions WHERE source='codex' AND session_id=?", (SESSION,)
+                        ).fetchone()[0])
+                    self.assertEqual(stored["restart_uncertain_until"], deadline)
+                    self.assertEqual(stored["last_event_at"], latest)
+                actual_now = int(time.time() * 1000)
+                checks = ((actual_now, None if actual_now <= deadline else 0),
+                          (deadline - 1, None), (deadline, None), (deadline + 1, 0))
+                for checked_at, active in checks:
+                    healthy = {"logical_cpus": 8, "load_1m": 0, "cpu_busy_pct": 0,
+                               "memory_available_bytes": 32 * 1024**3,
+                               "disk_available_bytes": 64 * 1024**3,
+                               "observed_at": checked_at - 1000, "partial": False}
+                    with self.subTest(checked_at=checked_at), \
+                            patch("router.capacity.time.time", return_value=checked_at / 1000), \
+                            patch("router.sessions.now_ms", return_value=checked_at), \
+                            patch("router.native.now_ms", return_value=checked_at), \
+                            patch.object(self.control.capacity, "_latest", healthy):
+                        snapshot = self.control.handle("snapshot", {})
+                        self.assertEqual(snapshot["capacity"]["active_claude_sessions"], active)
+                        self.assertEqual(snapshot["capacity"]["capacity_state"],
+                                         "unknown" if active is None else "available")
+                if resolution is not None:
+                    self.clock = latest + 290
+                    self.hook("SubagentStart", turn_id="t2", agent_id=CHILD, agent_type="default")
+                    self.assertEqual(self.session()["status"], "running")
+                    self.clock = latest + 390
+                    self.hook("SubagentStop", turn_id="t2", agent_id=CHILD, agent_type="default")
+                    self.assertEqual(self.session()["status"], "unknown")
+                    self.assertEqual(self.session()["visibility_reason"], "Root turn state was not observed")
+                    with self.control.store.connect() as db:
+                        stored = json.loads(db.execute(
+                            "SELECT data FROM sessions WHERE source='codex' AND session_id=?", (SESSION,),
+                        ).fetchone()[0])
+                    self.assertNotIn("restart_uncertain_until", stored)
+                    if resolution == "restart":
+                        for _ in range(2):
+                            self.control.sessions.reconcile_restart()
+                            self.control.native.reconcile_restart()
+                            with self.control.store.connect() as db:
+                                stored = json.loads(db.execute(
+                                    "SELECT data FROM sessions WHERE source='codex' AND session_id=?", (SESSION,),
+                                ).fetchone()[0])
+                            self.assertEqual(stored["restart_uncertain_until"], latest + 400 + STALE_AFTER_MS)
+                        self.clock = latest + 340
+                        self.hook("Stop", turn_id="t1")
+                        self.assertIn("restart", self.session()["visibility_reason"].lower())
+                    else:
+                        self.clock = latest + 340
+                        self.hook(resolution, source="compact", turn_id="t1")
+                        self.assertEqual(self.session()["status"], "idle" if resolution == "Stop" else "running")
+                        self.assertIsNone(self.session()["visibility_reason"])
+                        self.assertEqual(self.control.sessions.fleet_records(0)[1], int(resolution != "Stop"))
+                self.clock = int(time.time() * 1000) - 1000
+                self.hook("Stop", turn_id="t1", stop_hook_active=False)
+                self.hook("SubagentStop", turn_id="t2", agent_id=CHILD, agent_type="default")
+                self.assertEqual(self.session()["status"], "idle")
+                self.assertEqual(self.control.sessions.fleet_records(0)[1], 0)
+                self.assertEqual(self.agent()["status"], "idle")
+
+    def test_delayed_root_stop_keeps_clock_rollback_uncertain(self):
+        for child_running in (False, True):
+            with self.subTest(child_running=child_running):
+                self.control = Controller(settings(self.root / "repo"), {}, self.root / f"clock-{child_running}")
+                self.control.start_lifecycle_writer()
+                self.addCleanup(self.control.stop_lifecycle_writer)
+                self.hook("SessionStart", source="startup")
+                self.hook("SubagentStart", turn_id="t2", agent_id=CHILD, agent_type="default")
+                if not child_running:
+                    self.hook("SubagentStop", turn_id="t2", agent_id=CHILD, agent_type="default")
+                latest = self.clock
+                self.clock = latest - 15
+                with patch("router.sessions.now_ms", return_value=latest - 1):
+                    self.hook("Stop", turn_id="t1", stop_hook_active=False)
+                    session = self.session()
+                    self.assertEqual(session["status"], "unknown")
+                    self.assertIn("clock", session["visibility_reason"])
+                    self.assertIsNone(self.control.sessions.fleet_records(10)[1])
+                # No new hook: the stored live child must survive the clock catching up.
+                with patch("router.sessions.now_ms", return_value=latest + 1), \
+                        patch("router.native.now_ms", return_value=latest + 1):
+                    snapshot = self.control.handle("snapshot", {})
+                    self.assertEqual(snapshot["sessions"][0]["status"], "running" if child_running else "idle")
+                    self.assertEqual(snapshot["capacity"]["active_claude_sessions"], int(child_running))
+                    self.assertEqual(snapshot["capacity"]["active_agents"], int(child_running))
+                self.clock = latest + 100
+
+    def test_child_support_expires_without_another_hook(self):
+        expiry = STALE_AFTER_MS + 10
+        cases = {
+            "closed": {"checks": ((expiry - 2, "unknown", None, None), (expiry - 1, "running", 1, 1),
+                                   (expiry, "running", 1, 1), (expiry + 1, "idle", 0, 0)), "replay": True},
+            "multiple children": {"extra": (("SubagentStart", 15, {"agent_id": "worker-c"}),),
+                                  "checks": ((expiry + 1, "running", 1, 1), (expiry + 5, "running", 1, 1),
+                                             (expiry + 6, "idle", 0, 0)), "replay": True},
+            "missing child start": {"child_start": False, "checks": ((expiry + 1, "idle", 0, 0),), "replay": True},
+            "missing root": {"root": None, "checks": ((expiry + 1, "unknown", None, 0),)},
+            "open root": {"root": "open", "checks": ((expiry + 1, "running", 1, 0),)},
+            "waiting": {"extra": (("PermissionRequest", 30, {"agent_id": "worker-c"}),),
+                        "checks": ((expiry + 1, "idle", 1, 1),)},
+            "live tool": {"extra": (("PreToolUse", 30, {"agent_id": "worker-c", "tool_use_id": "long-tool"}),),
+                          "checks": ((expiry + 1, "running", 1, 1), (expiry + 21, "running", 1, 0))},
+            "restart": {"restart": True, "checks": ((expiry + 1, "unknown", None, None),)},
+            "session end": {"end": True, "checks": ((expiry + 1, "stopped", 0, 0),)},
+            "legacy": {"format": None, "checks": ((expiry + 1, "unknown", None, 0),)},
+            "unsupported format": {"format": {"version": 2, "until": 0},
+                                   "checks": ((expiry + 1, "unknown", None, 0),)},
+        }
+        with tempfile.TemporaryDirectory(prefix="ar-codex-support-") as temporary:
+            for name, case in cases.items():
+                store = Store(Path(temporary) / name / "router.sqlite3", "host-a")
+                sessions, native = SessionObserver(store, "host-a"), NativeObserver(store, "host-a")
+                capacity = CapacitySampler(store.path.parent)
+                host = SimpleNamespace(view=lambda at: {"host_id": "host-a", "hostname": "example-host"})
+                controller = SimpleNamespace(sessions=sessions, native=native, capacity=capacity, host=host)
+                start = int(time.time() * 1000) - 2 * STALE_AFTER_MS
+                clock = [start + expiry - 1]
+
+                def send(session, agent, sessions=sessions, native=native):
+                    if session:
+                        sessions.observe(session)
+                    if agent:
+                        native.observe(agent)
+                    return {}
+
+                def hook(kind, offset, *, start=start, **fields):
+                    with patch("router.observer_hook.time.time", return_value=(start + offset) / 1000):
+                        observer_hook.observe_codex(payload(kind, **fields))
+
+                def snapshot(limit=100, capacity=capacity, controller=controller, clock=clock):
+                    capacity._latest = {"logical_cpus": 8, "load_1m": 0, "cpu_busy_pct": 0,
+                                        "memory_available_bytes": 32 * 1024**3,
+                                        "disk_available_bytes": 64 * 1024**3,
+                                        "observed_at": clock[0] - 100, "partial": False}
+                    with patch("router.capacity.time.time", return_value=clock[0] / 1000):
+                        return compose(controller, history_limit=limit)
+
+                with self.subTest(name=name), patch("router.sessions.now_ms", side_effect=lambda clock=clock: clock[0]), \
+                        patch("router.native.now_ms", side_effect=lambda clock=clock: clock[0]), \
+                        patch("router.observer_hook.send", side_effect=send):
+                    if case.get("root", "closed") is not None:
+                        hook("SessionStart", 0)
+                    hook("SubagentStart", 10, agent_id="worker-a")
+                    if case.get("root", "closed") == "closed":
+                        hook("Stop", 20)
+                    for kind, offset, fields in case.get("extra", ()):
+                        hook(kind, offset, **fields)
+                    if case.get("child_start", True):
+                        hook("SubagentStart", STALE_AFTER_MS - 100, agent_id="worker-b")
+                    hook("SubagentStop", expiry - 1, agent_id="worker-b")
+                    if case.get("restart"):
+                        sessions.reconcile_restart()
+                        native.reconcile_restart()
+                    if case.get("end"):
+                        hook("SessionEnd", expiry - 1)
+                    if "format" in case:
+                        with store.transaction() as db:
+                            row = json.loads(db.execute("SELECT data FROM sessions").fetchone()[0])
+                            row.pop("codex_liveness", None)
+                            if case["format"] is not None:
+                                row["codex_liveness"] = case["format"]
+                            sessions._put_session(db, row)
+                    for offset, status, total, agents in case["checks"]:
+                        clock[0] = start + offset
+                        result = snapshot()
+                        row, sample = result["sessions"][0], result["capacity"]
+                        self.assertEqual((row["status"], sample["active_claude_sessions"], sample["active_agents"]),
+                                         (status, total, agents))
+                        expected = "unknown" if None in (total, agents) else "busy" if total or agents else "available"
+                        self.assertEqual(sample["capacity_state"], expected)
+                        self.assertNotIn("codex_liveness", row)
+                        self.assertEqual(sessions.fleet_records(0), ([], total))
+                    if case.get("replay"):
+                        before = snapshot()
+                        hook("Stop", 20)
+                        self.assertEqual(snapshot(), before)
+                        sessions.observe({"source": "codex", "session_id": "newer-row", "kind": "session_end",
+                                          "observed_at": clock[0]})
+                        truncated = snapshot(1)
+                        self.assertEqual(truncated["sessions"][0]["session_id"], "newer-row")
+                        self.assertEqual(truncated["capacity"]["active_claude_sessions"], 0)
+
+    def test_missing_root_uncertainty_reaches_capacity_until_freshness_expires(self):
+        for waited in (False, True):
+            self.control = Controller(settings(self.root / "repo"), {}, self.root / f"missing-root-{waited}")
+            self.control.start_lifecycle_writer()
+            self.addCleanup(self.control.stop_lifecycle_writer)
+            if waited:
+                self.hook("PermissionRequest", agent_id=CHILD, turn_id="t2")
+            self.hook("SubagentStop", agent_id=CHILD, turn_id="t2")
+            event_at = self.clock
+            healthy = {"logical_cpus": 8, "load_1m": 0, "cpu_busy_pct": 0,
+                       "memory_available_bytes": 32 * 1024**3, "disk_available_bytes": 64 * 1024**3,
+                       "observed_at": int(time.time() * 1000) - 1000, "partial": False}
+            for age in (1, STALE_AFTER_MS - 1, STALE_AFTER_MS, STALE_AFTER_MS + 1):
+                fresh = age <= STALE_AFTER_MS
+                with self.subTest(waited=waited, age=age), \
+                        patch("router.sessions.now_ms", return_value=event_at + age), \
+                        patch("router.native.now_ms", return_value=event_at + age), \
+                        patch.object(self.control.capacity, "_latest", healthy):
+                    snapshot = self.control.handle("snapshot", {})
+                    self.assertEqual(snapshot["sessions"][0]["status"], "unknown")
+                    self.assertEqual(snapshot["capacity"]["active_claude_sessions"], None if fresh else 0)
+                    self.assertEqual(snapshot["capacity"]["active_agents"], 0)
+                    self.assertEqual(snapshot["capacity"]["capacity_state"], "unknown" if fresh else "available")
+                    self.assertEqual("session_active_count" in snapshot.get("errors", {}), fresh)
 
     def test_session_end_closes_subagents_left_unknown_by_a_restart(self):
         self.hook("SessionStart", source="startup")
@@ -182,10 +429,12 @@ class CodexObservationTests(unittest.TestCase):
                 self.hook("SessionStart", source="resume")
                 # A late event stamped between the end and the resume is not resumed work.
                 resumed = self.clock
+                self.hook("Stop", stop_hook_active=False)
                 self.clock = resumed - 15  # hook() advances 10 ms: stamped 5 ms before resume.
                 self.hook("PreToolUse", turn_id="t2", agent_id=CHILD, agent_type="default", tool_name="Bash",
                           tool_input={}, tool_use_id="exec-9b")
                 self.assertEqual(self.agent()["status"], "stopped")
+                self.assertEqual(self.session()["status"], "idle")
                 self.clock = resumed + 20
                 self.hook("SessionStart", source="compact")  # Must not move the resume boundary.
                 self.clock = resumed
@@ -212,30 +461,209 @@ class CodexObservationTests(unittest.TestCase):
 
     def test_root_turn_state_is_ordered_by_root_events(self):
         child = {"agent_id": CHILD, "turn_id": "t2"}
+        sibling = {"agent_id": "worker-b", "turn_id": "t3"}
         cases = {
-            # Root tool activity after Stop reopens the root turn.
             "root tool after stop": ([("Stop", 30, {}), ("PreToolUse", 40, {"tool_use_id": "r1"}),
                                       ("PostToolUse", 50, {"tool_use_id": "r1"}), ("SubagentStop", 60, child)],
-                                     "running"),
-            # A delayed root Stop still closes the turn despite newer child events.
+                                     "running", False, 0, 1),
             "delayed root stop": ([("PreToolUse", 45, {**child, "tool_use_id": "c1"}),
                                    ("PostToolUse", 50, {**child, "tool_use_id": "c1"}),
-                                   ("Stop", 40, {}), ("SubagentStop", 60, child)], "idle"),
+                                   ("SubagentStop", 60, child), ("Stop", 40, {})], "idle", False, 0, 0),
+            "delayed root prompt": ([("Stop", 30, {}), ("SubagentStop", 60, child),
+                                     ("UserPromptSubmit", 40, {})], "running", False, 0, 1),
+            "delayed session start": ([("Stop", 30, {}), ("SubagentStop", 60, child),
+                                       ("SessionStart", 40, {"source": "compact"})], "running", False, 0, 1),
+            "older child tool": ([("PreToolUse", 35, {**child, "tool_use_id": "c1"}),
+                                  ("SubagentStop", 60, child), ("Stop", 40, {})], "idle", False, 0, 0),
+            "newer child tool": ([("PreToolUse", 50, {**child, "tool_use_id": "c1"}),
+                                  ("SubagentStop", 60, child), ("Stop", 40, {})], "running", False, 1, 1),
+            "waiting with live child tool": ([("PreToolUse", 50, {**child, "tool_use_id": "c1"}),
+                                              ("PermissionRequest", 60, child), ("Stop", 40, {})],
+                                             "idle", True, 1, 1),
+            "older child waiter": ([("PermissionRequest", 35, child), ("SubagentStop", 60, sibling),
+                                    ("Stop", 40, {})], "idle", False, 0, 0),
+            "newer child waiter": ([("SubagentStop", 60, child), ("PermissionRequest", 50, sibling),
+                                    ("Stop", 40, {})], "idle", True, 0, 1),
+            "running sibling": ([("SubagentStart", 50, sibling), ("SubagentStop", 60, child),
+                                 ("Stop", 40, {})], "running", False, 0, 1),
+            "delayed sibling stop": ([("SubagentStart", 35, sibling), ("Stop", 40, {}),
+                                      ("SubagentStop", 60, child), ("SubagentStop", 50, sibling)],
+                                     "idle", False, 0, 0),
+            "terminal prompt tie": ([("SubagentStop", 35, child), ("Stop", 40, {}),
+                                     ("UserPromptSubmit", 40, {})], "idle", False, 0, 0),
+            "terminal start tie": ([("SubagentStop", 35, child), ("Stop", 40, {}),
+                                    ("SessionStart", 40, {"source": "compact"})], "idle", False, 0, 0),
+            "terminal tie": ([("Stop", 40, {}), ("SubagentStop", 60, child),
+                              ("UserPromptSubmit", 40, {})], "idle", False, 0, 0),
         }
-        for name, (events, status) in cases.items():
-            with self.subTest(name):
-                self.control = Controller(settings(self.root / "repo"), {}, self.root / f"state-{name}")
+        cases.update({
+            "reset behind newer root activity": ([
+                ("PreToolUse", 35, {**child, "tool_use_id": "c1"}),
+                ("PreToolUse", 50, {"tool_use_id": "r1"}),
+                ("PostToolUse", 55, {"tool_use_id": "r1"}),
+                ("SubagentStop", 60, child), ("Stop", 40, {})], "running", False, 0, 1),
+            "tied child completion last": ([("Stop", 40, {}), ("SubagentStop", 40, child)],
+                                           "idle", False, 0, 0),
+            "tied root completion last": ([("SubagentStop", 40, child), ("Stop", 40, {})],
+                                           "idle", False, 0, 0),
+            "replayed stop with live child": ([("Stop", 40, {}), ("Stop", 40, {})],
+                                              "running", False, 0, 1),
+            "replayed stop preserves tied waiter": ([
+                ("SubagentStop", 35, child), ("Stop", 40, {}),
+                ("PermissionRequest", 40, child), ("Stop", 40, {})], "idle", True, 0, 1),
+            "replayed stop preserves newer waiter": ([
+                ("SubagentStop", 35, child), ("Stop", 40, {}), ("UserPromptSubmit", 50, {}),
+                ("PermissionRequest", 60, child), ("Stop", 40, {})], "idle", True, 0, 1),
+        })
+        reset_cases = {"reset behind newer root activity"}
+        for reset, fields in (("UserPromptSubmit", {}), ("SessionStart", {"source": "compact"})):
+            name = f"reset behind newer root activity {reset}"
+            reset_cases.add(name)
+            cases[name] = ([
+                ("PreToolUse", 35, {**child, "tool_use_id": "c1"}),
+                ("PreToolUse", 50, {"tool_use_id": "r1"}),
+                ("PostToolUse", 55, {"tool_use_id": "r1"}),
+                ("SubagentStop", 60, child), (reset, 40, fields)], "running", False, 0, 1)
+        cases.update({
+            "delayed sibling start": ([("Stop", 40, {}), ("SubagentStop", 60, child),
+                                       ("SubagentStart", 50, sibling)], "running", False, 0, 1),
+            "delayed sibling activity": ([
+                ("SubagentStart", 35, sibling), ("Stop", 40, {}), ("PermissionRequest", 45, sibling),
+                ("SubagentStop", 60, child), ("UserPromptSubmit", 50, sibling)], "running", False, 0, 1),
+            "superseded sibling start": ([
+                ("SubagentStart", 35, sibling), ("Stop", 40, {}), ("SubagentStop", 55, sibling),
+                ("SubagentStop", 60, child), ("SubagentStart", 50, sibling)], "idle", False, 0, 0),
+        })
+        for opening, fields in (("UserPromptSubmit", {}), ("SessionStart", {"source": "compact"})):
+            cases[f"replayed {opening} preserves tied waiter"] = ([
+                ("SubagentStop", 35, child), ("Stop", 40, {}), (opening, 50, fields),
+                ("PermissionRequest", 50, child), (opening, 50, fields)], "idle", True, 0, 1)
+        for first, second in (("Stop", "SubagentStart"), ("SubagentStart", "Stop")):
+            cases[f"tied live child {first} then {second}"] = ([
+                ("SubagentStop", 35, child),
+                (first, 40, sibling if first == "SubagentStart" else {}),
+                (second, 40, sibling if second == "SubagentStart" else {})], "running", False, 0, 1)
+        for terminal in ("Stop", "Interrupt"):
+            for first, second in ((terminal, "SubagentStop"), ("SubagentStop", terminal)):
+                cases[f"live sibling {first} then {second}"] = ([
+                    ("SubagentStart", 35, sibling),
+                    (first, 40, child if first == "SubagentStop" else {}),
+                    (second, 40, child if second == "SubagentStop" else {})], "running", False, 0, 1)
+            for opening, fields in (("UserPromptSubmit", {}), ("SessionStart", {"source": "compact"})):
+                cases[f"{terminal} {opening} tie after notice"] = ([
+                    ("SubagentStop", 35, child), (terminal, 40, {}),
+                    ("PermissionRequest", 40, child), (opening, 40, fields)], "idle", True, 0, 1)
+                cases[f"{terminal} {opening} tie after child activity"] = ([
+                    (terminal, 40, {}), ("SubagentStop", 40, child),
+                    (opening, 40, fields)], "idle", False, 0, 0)
+                cases[f"{terminal} {opening} tie after sibling start"] = ([
+                    ("SubagentStop", 35, child), (terminal, 40, {}), ("SubagentStart", 40, sibling),
+                    (opening, 40, fields), ("SubagentStop", 60, sibling)], "idle", False, 0, 0)
+        for age in (STALE_AFTER_MS - 1, STALE_AFTER_MS, STALE_AFTER_MS + 1):
+            fresh = age <= STALE_AFTER_MS
+            cases[f"child freshness {age}"] = (
+                [("SubagentStart", 90 - age, sibling), ("SubagentStop", 60, child), ("Stop", 40, {})],
+                "running" if fresh else "idle", False, 0, 1 if fresh else 0,
+            )
+        cases = {name: (True, *case) for name, case in cases.items()}
+        cases.update({
+            "missing root child completion": (False, [("SubagentStart", 35, child),
+                                                       ("SubagentStop", 60, child)], "unknown", False, 0, None),
+            "missing root lone completion": (False, [("SubagentStop", 60, child)], "unknown", False, 0, None),
+            "missing root stale child": (False, [("SubagentStart", -STALE_AFTER_MS, child),
+                                                  ("SubagentStop", 60, child)], "unknown", False, 0, None),
+            "missing root live sibling": (False, [("SubagentStart", 50, sibling),
+                                                   ("SubagentStop", 60, child)], "running", False, 0, 1),
+            "missing root live tool": (False, [("PreToolUse", 50, {**child, "tool_use_id": "c1"}),
+                                                ("SubagentStop", 60, child)], "running", False, 1, 1),
+            "missing root newer waiter": (False, [("PermissionRequest", 60, sibling),
+                                                   ("SubagentStop", 50, child)], "idle", True, 0, 1),
+            "missing root waiting with live tool": (False, [
+                ("PreToolUse", 50, {**child, "tool_use_id": "c1"}), ("PermissionRequest", 60, sibling),
+                ("SubagentStop", 70, child)], "idle", True, 1, 1),
+        })
+        for opening in ("Stop", "UserPromptSubmit", "SessionStart"):
+            cases[f"missing root resolved by delayed {opening}"] = (
+                False, [("SubagentStop", 60, child), (opening, 40, {"source": "compact"})],
+                "idle" if opening == "Stop" else "running", False, 0, int(opening != "Stop"),
+            )
+        for name, (root_observed, events, status, waiting, tools, active) in cases.items():
+            for reordered in (False, True):
+                self.clock = int(time.time() * 1000) - 10_000
+                with self.subTest(name=name, reordered=reordered), \
+                        patch("router.sessions.now_ms", return_value=self.clock + 100), \
+                        patch("router.native.now_ms", return_value=self.clock + 100):
+                    self.control = Controller(settings(self.root / "repo"), {},
+                                              self.root / f"state-{name}-{reordered}")
+                    self.control.start_lifecycle_writer()
+                    self.addCleanup(self.control.stop_lifecycle_writer)
+                    start = self.clock
+                    if root_observed:
+                        self.hook("SessionStart", source="startup")
+                        self.hook("UserPromptSubmit", turn_id="t1", prompt=CONTENT)
+                        self.hook("SubagentStart", agent_type="default", **child)
+                    ordered = events if reordered else sorted(events, key=lambda item: item[1])
+                    for hook_name, offset, fields in ordered:
+                        self.clock = start + offset
+                        self.hook(hook_name, tool_name="Bash", tool_input={}, tool_response="", **fields)
+                    snapshot = self.control.handle("snapshot", {})
+                    session = next(row for row in snapshot["sessions"] if row["session_id"] == SESSION)
+                    self.assertEqual(snapshot["capacity"]["active_claude_sessions"], active)
+                    self.assertEqual(session["last_event_at"], start + max(item[1] for item in events) + 10)
+                    self.assertEqual((session["status"], session["needs_input"], session["inflight_tool_count"]),
+                                     (status, waiting, tools))
+                    if root_observed or any(kind in {"Stop", "UserPromptSubmit", "SessionStart"}
+                                            and fields.get("agent_id") is None for kind, _, fields in events):
+                        self.assertNotEqual(session["visibility_reason"], "Root turn state was not observed")
+                    elif status == "unknown":
+                        self.assertEqual(session["visibility_reason"], "Root turn state was not observed")
+                    with patch("router.sessions.now_ms", return_value=start + 100):
+                        self.assertEqual(self.control.sessions.fleet_records(10)[1], active)
+                    if name in reset_cases:
+                        expired = session["last_event_at"] + STALE_AFTER_MS + 1
+                        with patch("router.sessions.now_ms", return_value=expired), \
+                                patch("router.native.now_ms", return_value=expired):
+                            stale = self.control.handle("snapshot", {})
+                            self.assertEqual(stale["sessions"][0]["status"], "unknown")
+                            self.assertEqual(stale["capacity"]["active_claude_sessions"], 0)
+                    if name == "older child tool":
+                        self.clock = start + 35
+                        self.hook("PreToolUse", **child, tool_use_id="c1", tool_name="Bash", tool_input={})
+                        self.assertEqual(self.session()["inflight_tool_count"], 0)
+                    self.control.stop_lifecycle_writer()
+
+    def test_delayed_root_reset_preserves_unresolved_tool_uncertainty(self):
+        child = {"agent_id": CHILD, "turn_id": "t2"}
+        cases = {"older": ("idle", False, 0), "newer": ("unknown", True, 1), "unorderable": ("unknown", True, 0)}
+        for timing, expected in cases.items():
+            with self.subTest(timing=timing), patch("router.sessions.MAX_EXACT_INFLIGHT_TOOLS", 1):
+                self.control = Controller(settings(self.root / "repo"), {}, self.root / f"overflow-{timing}")
                 self.control.start_lifecycle_writer()
                 self.addCleanup(self.control.stop_lifecycle_writer)
                 start = self.clock
                 self.hook("SessionStart", source="startup")
-                self.hook("UserPromptSubmit", turn_id="t1", prompt=CONTENT)
                 self.hook("SubagentStart", agent_type="default", **child)
-                for hook_name, offset, fields in events:
-                    self.clock = start + offset
-                    self.hook(hook_name, tool_name="Bash", tool_input={}, tool_response="", **fields)
-                self.assertEqual(self.session()["status"], status)
-                self.clock = start + 100
+                for number in range(2):
+                    self.clock = start + (50 if timing == "newer" else 30) + number
+                    self.hook("PreToolUse", **child, tool_use_id=f"tool-{number}", tool_name="Bash", tool_input={})
+                self.clock = start + 60
+                self.hook("SubagentStop", **child)
+                if timing == "unorderable":
+                    # An unresolved overflow without a deadline cannot be ordered against a root reset.
+                    with self.control.store.transaction() as db:
+                        db.execute("""UPDATE sessions SET data=json_set(data,'$.tool_correlation_partial_until',NULL)
+                            WHERE source='codex' AND session_id=?""", (SESSION,))
+                self.clock = start + 40
+                self.hook("Stop", stop_hook_active=False)
+                session = self.session()
+                self.assertEqual((session["status"], session["tool_visibility_partial"], session["inflight_tool_count"]),
+                                 expected)
+                if timing != "older":
+                    self.assertEqual(session["visibility_reason"],
+                                     "Inflight tool correlation exceeded the exact tracking bound")
+                with patch("router.sessions.now_ms", return_value=start + 100):
+                    self.assertEqual(self.control.sessions.fleet_records(10)[1], 0 if timing == "older" else None)
+                self.clock = start + 200
 
     def test_status_and_fleet_tables_label_the_source(self):
         self.hook("SessionStart", source="startup")
