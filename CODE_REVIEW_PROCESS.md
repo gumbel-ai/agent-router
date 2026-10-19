@@ -303,6 +303,9 @@ item before requesting review.
   consume the rest of a field.
 - Validate identifiers structurally (no controls, no surrounding whitespace, bounded
   length). Do not reject them for looking like secrets.
+- Validate execution identity independently of usage and cost. A nonempty reported
+  model map that omits the selected model must fail even when malformed counters,
+  invalid entries, or accounting bounds make usage unavailable.
 - A value that fails a safety check should degrade only that value. For example, an
   unusable transcript path must not reject the whole lifecycle event.
 

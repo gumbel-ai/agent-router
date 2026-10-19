@@ -141,10 +141,11 @@ def collect(task: dict, event: dict) -> None:
             task["execution_error"] = True
         if isinstance(event.get("result"), str):
             task["summary"] = event["result"][-8000:]
-        models = model_counters(event.get("modelUsage"), TOKEN_FIELDS)
-        complete = models is not None and bool(models) and event.get("subtype") != "error_during_execution"
-        if complete and model not in models and event.get("subtype") == "success":
+        reported_models = event.get("modelUsage")
+        if isinstance(reported_models, dict) and reported_models and model not in reported_models and event.get("subtype") == "success":
             task["execution_error"] = True
+        models = model_counters(reported_models, TOKEN_FIELDS)
+        complete = models is not None and bool(models) and event.get("subtype") != "error_during_execution"
         baseline = task.get("claude_baseline", {"schema_version": 1, "models": {}, "complete": True})
         if not isinstance(baseline, dict):
             baseline = {"complete": False, "cost_complete": False}

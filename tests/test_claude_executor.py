@@ -674,17 +674,58 @@ class ClaudeAccountingTests(unittest.TestCase):
 
     def test_malformed_identity_and_model_evidence_fails_closed(self):
         session = "12345678-1234-4321-8765-123456789abc"
-        for event in ({"type": []}, {"type": {}}, {"type": None},
-                      {"type": "assistant", "session_id": session, "message": []},
-                      {"type": "assistant", "session_id": session, "message": {"model": "other"}},
-                      {"type": "system", "subtype": "init", "session_id": session, "model": "other"},
-                      {"type": "result", "session_id": []}, {"type": "result", "session_id": "invalid"}):
-            with self.subTest(event=event):
-                task = {"executor": "claude", "child_session_id": session, "resolved_model": MODEL,
-                        "thread_observed": True, "executor_completed": True}
-                collect(task, event)
-                self.assertTrue(Runtime.child_failed(task))
-
+        selected = MODEL.removeprefix("anthropic/")
+        counts = {"inputTokens": 100, "outputTokens": 20, "cacheReadInputTokens": 40, "cacheCreationInputTokens": 10}
+        init = {"type": "system", "subtype": "init", "session_id": session, "model": selected}
+        result = {"type": "result", "session_id": session, "subtype": "success", "is_error": False,
+                  "total_cost_usd": .25, "modelUsage": {selected: counts}}
+        events = [{"type": []}, {"type": {}}, {"type": None},
+                  {"type": "assistant", "session_id": session, "message": []},
+                  {"type": "assistant", "session_id": session, "message": {"model": "other"}},
+                  {**init, "model": "other"}, {**result, "session_id": []}, {**result, "session_id": "invalid"},
+                  {**result, "session_id": "87654321-1234-4321-8765-123456789abc"},
+                  {**result, "subtype": "error_during_execution", "modelUsage": None},
+                  {**result, "is_error": True, "modelUsage": None}]
+        foreign = "claude-opus-4-6"
+        usages = [{foreign: counts}, {foreign: None}, {foreign: []}, {"": counts}, {"x" * 241: counts},
+                  {foreign: counts, "invalid model": counts},
+                  {f"claude-opus-fixture-{index}": counts for index in range(33)}]
+        for bucket in counts:
+            missing = counts.copy()
+            missing.pop(bucket)
+            usages.append({foreign: missing})
+            usages.extend({foreign: {**counts, bucket: value}} for value in (None, True, -1, MAX_WIRE_INTEGER + 1))
+        events.extend({**result, "modelUsage": usage} for usage in usages)
+        with tempfile.TemporaryDirectory(prefix="router-claude-model-evidence-") as directory:
+            database = Path(directory) / "router.sqlite3"
+            store = Store(database)
+            runtime = Runtime.__new__(Runtime)
+            runtime.store = store
+            runtime.observe = lambda *args, **kwargs: {"exit_code": 0}
+            for index, event in enumerate(events):
+                with self.subTest(event=event):
+                    task = {"task_id": f"task-{index}", "session_id": "parent", "executor": "claude",
+                            "status": "running", "phase": "child", "process": {}, "execution_stopped": True,
+                            "child_session_id": session, "resolved_model": MODEL, "created_at": 1,
+                            "attempt_number": 1, "attempts": 1, "review_retries": 0, "continuations": 0,
+                            "invocation": {"task": "batch-job", "parent_worktree": "/tmp/example-project"}}
+                    with store.transaction() as db:
+                        store.put(db, task)
+                    output = Path(directory) / "events.jsonl"
+                    output.write_text("".join(json.dumps(value) + "\n" for value in (init, event)))
+                    offset = runtime.events(task, {"stdout": str(output)}, 0, final=True)
+                    self.assertTrue(store.get(task["task_id"]).get("execution_error"))
+                    # Later matching evidence and repeated results cannot erase an execution error.
+                    with output.open("a") as stream:
+                        stream.write("".join(json.dumps(value) + "\n" for value in (init, result, result)))
+                    runtime.events(task, {"stdout": str(output)}, offset, final=True)
+                    self.assertTrue(Runtime.child_failed(store.get(task["task_id"])))
+                    runtime.execute(task["task_id"], recovered=True)
+                    reopened = Store(database)
+                    view = public(reopened.get(task["task_id"]), store=reopened)
+                    self.assertEqual(view["status"], "failed")
+                    self.assertEqual(view["attempt_history"][0]["status"], "failed")
+                    self.assertEqual(view["cost"], .25)
 
     def test_result_replacement_baselines_and_invalid_numeric_fields(self):
         session = "12345678-1234-4321-8765-123456789abc"
@@ -693,9 +734,11 @@ class ClaudeAccountingTests(unittest.TestCase):
                      "inputTokens": 200, "outputTokens": 40, "cacheReadInputTokens": 80,
                      "cacheCreationInputTokens": 20, "costUSD": 999}}}
         counts = {"input_tokens": 100, "output_tokens": 20, "cache_read_input_tokens": 40, "cache_creation_input_tokens": 10}
-        base = {"child_session_id": session, "resolved_model": MODEL,
+        base = {"executor": "claude", "child_session_id": session, "resolved_model": MODEL,
                 "claude_baseline": {"schema_version": 1, "models": {"claude-sonnet-4-6": counts},
                                     "cost": .25, "complete": True, "cost_complete": True}}
+        collect(base, {"type": "system", "subtype": "init", "session_id": session,
+                       "model": MODEL.removeprefix("anthropic/")})
         task = copy.deepcopy(base)
         for _ in range(2):
             collect(task, event)
@@ -712,14 +755,26 @@ class ClaudeAccountingTests(unittest.TestCase):
                         malformed["modelUsage"]["claude-sonnet-4-6"][field] = value
                     task = copy.deepcopy(base)
                     collect(task, malformed)
+                    self.assertFalse(Runtime.child_failed(task))
                     if field == "total_cost_usd":
                         self.assertNotIn("cost", task)
                     else:
                         self.assertFalse(task["usage_complete"])
                         self.assertEqual(task["usage"], {})
+                        self.assertEqual(task["cost"], .25)
         selected = "claude-sonnet-4-6"
         auxiliary = "claude-haiku-4-5"
         counters = {"inputTokens": 100, "outputTokens": 20, "cacheReadInputTokens": 40, "cacheCreationInputTokens": 10}
+        for usage in ({}, {"modelUsage": None}, {"modelUsage": {}}, {"modelUsage": []},
+                      {"modelUsage": {selected: None}}, {"modelUsage": {selected: counters, "": counters}},
+                      {"modelUsage": {selected: counters, **{f"model-{index}": counters for index in range(32)}}}):
+            with self.subTest(unavailable_usage=usage):
+                task = copy.deepcopy(base)
+                collect(task, {**{key: value for key, value in event.items() if key != "modelUsage"}, **usage})
+                self.assertFalse(Runtime.child_failed(task))
+                self.assertFalse(task["usage_complete"])
+                self.assertEqual(task["usage"], {})
+                self.assertEqual(task["cost"], .25)
         prior = {**copy.deepcopy(base), "claude_baseline": {"schema_version": 1, "models": {}, "complete": True, "cost_complete": True}}
         collect(prior, {**event, "modelUsage": {selected: counters, auxiliary: counters}})
         for variant in ("missing-model", "decreased-model", "missing-bucket", "decreased-bucket"):
