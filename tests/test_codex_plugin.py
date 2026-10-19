@@ -292,7 +292,8 @@ class CodexPluginTests(unittest.TestCase):
         with patch("router.codex_plugin.shutil.which", return_value=None):
             self.assertEqual(status("--codex", "--json")["codex_observation"]["state"], "codex_not_installed")
         for flags in (["--codex"], ["task-1", "--codex", "--json"], ["--codex", "--json", "--filter", "needs_decision"],
-                      ["--codex", "--json", "--watch"], ["--codex", "--json", "--native-offset", "100"]):
+                      ["--codex", "--json", "--watch"], ["--codex", "--json", "--native-offset", "100"],
+                      ["--codex", "--json", "--native-offset", "0"], ["", "--codex", "--json"]):
             with self.subTest(flags=flags), self.assertRaises(SystemExit) as raised:
                 status(*flags)
             self.assertEqual(raised.exception.code, 2)
