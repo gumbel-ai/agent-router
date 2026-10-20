@@ -203,7 +203,7 @@ identity contract before an external tool can interpret them.
 
 ### Native session and child identities
 
-The [pinned plugin audit](langfuse-audit.md) supplies the synthetic contract shapes:
+The pinned Langfuse Claude and Codex plugin sources supply these contract shapes:
 
 | Runtime and evidence | Native identity for analysis |
 | --- | --- |
