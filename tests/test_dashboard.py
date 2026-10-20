@@ -1,9 +1,11 @@
 import json
+import socket
 import threading
 import unittest
 import urllib.error
 import urllib.request
 from contextlib import contextmanager
+from unittest.mock import patch
 
 from router.dashboard import make_server
 
@@ -29,10 +31,49 @@ def get(url: str, host: str | None = None) -> tuple[int, str, bytes]:
         with urllib.request.urlopen(request, timeout=5) as response:
             return response.status, response.headers["Content-Type"], response.read()
     except urllib.error.HTTPError as error:
-        return error.code, error.headers["Content-Type"], error.read()
+        with error:
+            return error.code, error.headers["Content-Type"], error.read()
 
 
 class DashboardTests(unittest.TestCase):
+    def test_client_disconnects_during_response_do_not_escape(self):
+        for error in (BrokenPipeError, ConnectionResetError, PermissionError):
+            for fail_on_write in (1, 2):  # Headers, then body.
+                with (
+                    self.subTest(error=error.__name__, write=fail_on_write),
+                    make_server(lambda: RESULT, 0) as server,
+                ):
+                    client, connection = socket.socketpair()
+                    with client, connection:
+                        port = server.server_address[1]
+                        client.sendall(
+                            f"GET /api/fleet HTTP/1.0\r\nHost: 127.0.0.1:{port}\r\n\r\n".encode()
+                        )
+                        client.shutdown(socket.SHUT_WR)
+                        sendall = socket.socket.sendall
+                        writes = 0
+                        injected = False
+
+                        def disconnect(
+                            sock, body, *, connection=connection, fail_on_write=fail_on_write,
+                            error=error, sendall=sendall,
+                        ):
+                            nonlocal writes, injected
+                            if sock is connection:
+                                writes += 1
+                                if writes == fail_on_write:
+                                    injected = True
+                                    raise error("response write failed")
+                            return sendall(sock, body)
+
+                        with patch.object(socket.socket, "sendall", disconnect):
+                            if error is PermissionError:
+                                with self.assertRaises(PermissionError):
+                                    server.RequestHandlerClass(connection, ("127.0.0.1", 0), server)
+                            else:
+                                server.RequestHandlerClass(connection, ("127.0.0.1", 0), server)
+                        self.assertTrue(injected)
+
     def test_serves_page_and_fleet_json(self):
         with serving(lambda: RESULT) as base:
             status, content_type, body = get(base + "/")

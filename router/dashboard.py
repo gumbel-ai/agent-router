@@ -32,12 +32,16 @@ def make_server(fetch: Callable[[], dict], port: int) -> ThreadingHTTPServer:
                 self._send(404, "text/plain; charset=utf-8", b"Not found")
 
         def _send(self, status: int, content_type: str, body: bytes) -> None:
-            self.send_response(status)
-            self.send_header("Content-Type", content_type)
-            self.send_header("Content-Length", str(len(body)))
-            self.send_header("Cache-Control", "no-store")
-            self.end_headers()
-            self.wfile.write(body)
+            try:
+                self.send_response(status)
+                self.send_header("Content-Type", content_type)
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                self.wfile.write(body)
+            except (BrokenPipeError, ConnectionResetError):
+                # A closed or reloaded tab no longer needs this response.
+                self.close_connection = True
 
         def log_message(self, format: str, *args) -> None:
             pass  # Polling every few seconds would flood the terminal.
