@@ -820,10 +820,15 @@ class ManagedRunTests(unittest.TestCase):
             finally:
                 release.touch()  # The release remains visible even before the child reads it.
 
-        self.daemon_up = False
+        def reserve_then_miss_start(operation, payload, timeout):
+            result = self.request(operation, payload, timeout)
+            if operation == "managed_reserve":
+                self.daemon_up = False
+            return result
+
         with ThreadPoolExecutor(max_workers=1) as helpers:
             helper = helpers.submit(daemon_returns_then_release)
-            with patch("router.managed.request", side_effect=self.request):
+            with patch("router.managed.request", side_effect=reserve_then_miss_start):
                 code = run([sys.executable, "-c", command], "missed", None, None, self.state)
             self.assertEqual(helper.result(timeout=15), (["missed"], 1))
         self.assertEqual(code, 0)

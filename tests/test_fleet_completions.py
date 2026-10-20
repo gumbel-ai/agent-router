@@ -568,14 +568,15 @@ main()
         from router.fleet import SSHQueryError, ssh_stdout
         from router.fleet_completions import query_completions
         from router.managed import wait
-        from router.paths import PROJECT_MARKER, PROJECT_MARKER_CONTENT
 
         with tempfile.TemporaryDirectory(prefix='ar-active-wait-') as temporary:
             root = Path(temporary)
             project, home = root / 'project', root / 'home'
             project.mkdir()
             home.mkdir()
-            (project / PROJECT_MARKER).write_text(json.dumps(PROJECT_MARKER_CONTENT))
+            # Reader cancellation is independent of managed admission. Keep this
+            # command outside observed projects: new observed launches require
+            # a live daemon reservation, covered by the managed-process tests.
             environment = {key: value for key, value in os.environ.items()
                            if key in {'PATH', 'LANG', 'LC_ALL', 'TMPDIR', 'SHELL', 'USER', 'LOGNAME'}}
             environment.update(HOME=str(home), AGENT_ROUTER_STATE_DIR=str(root / 'state'),

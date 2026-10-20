@@ -20,6 +20,7 @@ from test_runtime import RuntimeHarness
 
 from router.client import request
 from router.daemon import Controller
+from router.managed import run
 from router.paths import PROJECT_MARKER, PROJECT_MARKER_CONTENT
 from router.processes import parent_and_identity
 
@@ -435,12 +436,36 @@ class TransportTests(TransportHarness, unittest.TestCase):
         initial = self.completion_cli("wait", "--consumer", "worker-a", "--timeout", "2")
         self.assertEqual(initial.returncode, 0, initial.stderr)
         self.assertEqual(json.loads(initial.stdout)["status"], "deadline")
-        request("daemon_stop", {}, self.endpoint)
-        self.daemons[-1].wait(timeout=15)
-        completed = subprocess.run([sys.executable, "-m", "router.cli", "run", "--label", "batch-job", "--",
-                                    sys.executable, "-c", identity + "raise SystemExit(3)"], env=self.environment,
-                                   cwd=self.repo, capture_output=True, text=True, timeout=15, check=False)
-        self.assertEqual(completed.returncode, 3)
+        identity_file = self.root / "managed-child-environment.json"
+        offline_identity = (
+            "import json, os, pathlib; "
+            f"pathlib.Path({str(identity_file)!r}).write_text(json.dumps({{key: os.environ.get(key) "
+            "for key in ('ROUTER_MANAGED_ID', 'EXAMPLE_OPTION')})); "
+        )
+
+        def reserve_then_disconnect(operation, payload, timeout):
+            result = request(operation, payload, self.endpoint, timeout=timeout)
+            if operation == "managed_reserve":
+                request("daemon_stop", {}, self.endpoint)
+                self.daemons[-1].wait(timeout=15)
+            return result
+
+        previous_cwd = Path.cwd()
+        try:
+            os.chdir(self.repo)
+            with patch.dict(os.environ, self.environment, clear=True), patch(
+                "router.managed.request", side_effect=reserve_then_disconnect
+            ):
+                completed_code = run(
+                    [sys.executable, "-c", offline_identity + "raise SystemExit(3)"],
+                    "batch-job",
+                    None,
+                    None,
+                    self.root / "state",
+                )
+        finally:
+            os.chdir(previous_cwd)
+        self.assertEqual(completed_code, 3)
         unavailable = self.completion_cli("wait", "--consumer", "worker-a", "--timeout", "5")
         self.assertEqual((unavailable.returncode, json.loads(unavailable.stdout)["status"]), (1, "unavailable"))
         self.boot()
@@ -448,7 +473,7 @@ class TransportTests(TransportHarness, unittest.TestCase):
         self.assertEqual(delivered.returncode, 0, delivered.stderr)
         first = json.loads(delivered.stdout)
         self.assertEqual(first["status"], "failed")
-        child_environment = json.loads(completed.stdout)
+        child_environment = json.loads(identity_file.read_text())
         self.assertEqual(child_environment["ROUTER_MANAGED_ID"], first["event"]["managed_id"])
         self.assertNotIn(child_environment["ROUTER_MANAGED_ID"], (outside_identity, "managed-parent"))
         self.assertEqual(child_environment["EXAMPLE_OPTION"], "preserved")

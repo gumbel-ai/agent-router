@@ -256,7 +256,7 @@ def _checked(payload: object, fields: dict[str, str]) -> dict:
     if fields in (RESERVATION_FIELDS, START_FIELDS) and checked["attribution"] != _attribution(
             checked.get("session_id"), checked.get("agent_id")):
         raise ValueError("Managed process attribution does not match its session and agent")
-    if fields in (RESERVATION_FIELDS, START_FIELDS, ABORT_FIELDS) and not checked.get("wrapper_identity"):
+    if fields in (RESERVATION_FIELDS, ABORT_FIELDS) and not checked.get("wrapper_identity"):
         raise ValueError("Managed launch process identity is unavailable")
     return checked
 
