@@ -168,7 +168,7 @@ class ControlTests(unittest.TestCase):
                     invocation = {"completion": {"files": ["result.txt"]}} if declared else {}
                     task = {
                         "status": state, "attempts": 1, "execution_stopped": True,
-                        "final_tree": "a" * 40, "invocation": invocation,
+                        "final_tree": "a" * 40, "invocation": invocation, "setup_command": "true",
                         "review_retries": 0, "continuations": 0, "review_history": [],
                     }
                     if diagnostic is not None:
@@ -186,6 +186,13 @@ class ControlTests(unittest.TestCase):
                             continue
                         self.router.review(task, payload)
                         self.assertEqual(task["status"], "accepted" if outcome == "accepted" else "retrying")
+        # Runtime validation failed before setup_command existed; a retry would skip validation.
+        unvalidated = {"status": "failed", "attempts": 1, "execution_stopped": True,
+                       "invocation": {"completion": {"files": ["result.txt"]}},
+                       "review_retries": 0, "continuations": 0, "review_history": []}
+        with self.assertRaisesRegex(ValueError, "Invalid review outcome"):
+            self.router.review(unvalidated, {"task_id": "task-a", "request_id": "unvalidated", "expected_attempt": 1,
+                                             "outcome": "rejected", "feedback": "Repair"})
 
     def test_request_status_recovers_committed_start_without_reauthorizing_or_relaunching(self):
         selection = {"session_id": "S", "request_id": "R", "host_id": self.router.host.host_id}

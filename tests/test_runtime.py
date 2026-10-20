@@ -733,6 +733,25 @@ class RuntimeTests(RuntimeHarness, unittest.TestCase):
         self.assertFalse((Path(result["worktree"]) / "result.txt").exists())
         self.assertIn("Task packet", result["failure_reason"])
 
+    def test_preflight_refusal_on_retry_fails_without_a_running_process(self):
+        self.enable_codex()
+        self.config.repositories[str(self.repo.resolve())]["setup_command"] = "printf task > packet.md"
+        invocation = {"request_version": "1", "request_id": "retry-packet", "instruction_id": self.instruction,
+                      "executor": "codex", "model": "test", "task": "fixture", "mode": "write",
+                      "parent_repo": str(self.repo), "parent_worktree": str(self.repo),
+                      "launch": {"task_packets": ["packet.md"]}}
+        task_id = self.mutate("start", invocation)["task_id"]
+        first = self.wait(task_id, {"awaiting_review", "failed"})
+        self.assertEqual(first["status"], "awaiting_review", first)
+        # Setup does not rerun on a retry, so the packet stays missing.
+        (Path(first["worktree"]) / "packet.md").unlink()
+        self.mutate("review", {"task_id": task_id, "request_id": "retry-packet-reject", "expected_attempt": 1,
+                               "outcome": "rejected", "feedback": "Try again"})
+        second = self.wait(task_id, {"failed"})
+        self.assertTrue(second["execution_stopped"], second)
+        self.assertEqual(second["attempts"], 1)
+        self.assertIn("Task packet", second["failure_reason"])
+
     def test_setup_can_create_declared_inputs_and_install_the_runtime(self):
         import shlex
         self.enable_codex()

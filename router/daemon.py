@@ -901,7 +901,7 @@ class Controller:
                                  "existing review lifecycle")
             task["status"] = "accepted"
         elif (outcome == "rejected" and (state == "awaiting_review" or
-                state == "failed" and task["execution_stopped"] and
+                state == "failed" and task["execution_stopped"] and "setup_command" in task and
                 completion_declared and completion_status != "satisfied")) or (
                 outcome == "continue" and state == "blocked"):
             if task["attempts"] >= self.settings.max_attempts:
@@ -1251,7 +1251,7 @@ class Runtime:
                 task,
                 include_tracing_credentials=name == "child",
             )
-        if name == "child" and task["executor"] in {"codex", "claude"}:
+        if name == "child" and task["executor"] in {"codex", "claude"} and "launch" in task["invocation"]:
             launch_preflight(task, command, environment, cwd)
         process = None
         def register(record):
@@ -1510,7 +1510,10 @@ class Runtime:
         except Exception as error:
             LOGGER.exception("Task phase failed: %s", task_id)
             task = self.store.get(task_id)
-            if not task["execution_stopped"]:
+            if not task["execution_stopped"] and task.get("process") is None:
+                # Launch preflight can refuse before this attempt starts any process.
+                self.store.update(task_id, lambda t: t.update(execution_stopped=True))
+            elif not task["execution_stopped"]:
                 try:
                     with self.lock:
                         process = self.processes.get(task_id)
@@ -1633,7 +1636,9 @@ class Runtime:
                             updates[field] = status[field]
                     if "completion" in task["invocation"]:
                         updates["completion_check"] = completion_projection(status.get("completion_check"))
-                        if updates["completion_check"]["status"] != "satisfied":
+                        # A discarded closure needs no acceptance evidence.
+                        if (updates["completion_check"]["status"] != "satisfied"
+                                and status.get("disposition") != "discarded"):
                             completion_diagnostic = updates["completion_check"]
                             raise RemoteChildError("invalid_response", "Remote terminal state lacks satisfied "
                                                    "declared completion evidence")

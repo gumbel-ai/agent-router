@@ -413,9 +413,12 @@ class RemoteChildProtocolTests(unittest.TestCase):
         ]
         config = SimpleNamespace(hosts=(FleetHost("worker", "ssh", target="example"),),
                                  ssh_timeout_seconds=1)
-        for remote_status in ("accepted", "integrated", "closed"):
+        for remote_status, disposition in (("accepted", None), ("integrated", None), ("closed", None),
+                                           ("closed", "integrated"), ("closed", "discarded")):
             for name, included, diagnostic, expected in diagnostics:
                 response = {"status": remote_status, "task_id": "task-a"}
+                if disposition is not None:
+                    response["disposition"] = disposition
                 if included:
                     response["completion_check"] = diagnostic
 
@@ -434,13 +437,13 @@ class RemoteChildProtocolTests(unittest.TestCase):
                 })
                 runtime = Runtime.__new__(Runtime)
                 runtime.store = store
-                with self.subTest(remote_status=remote_status, diagnostic=name), \
+                with self.subTest(remote_status=remote_status, disposition=disposition, diagnostic=name), \
                         patch("router.fleet.load_fleet_config", return_value=config), \
                         patch("router.remote_child.RemoteChildTransport", Transport):
                     runtime.execute_remote("task-a", recovered=True)
                 task = store.get("task-a")
                 self.assertEqual(task["completion_check"]["status"], expected)
-                if expected == "satisfied":
+                if expected == "satisfied" or disposition == "discarded":
                     self.assertEqual(task["status"], remote_status)
                     self.assertTrue(task["execution_stopped"])
                 else:

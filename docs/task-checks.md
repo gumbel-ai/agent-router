@@ -32,8 +32,8 @@ optional files out of these lists; absence of a completion object retains the
 existing behavior. Contracts currently support Codex and Claude only; other
 executors reject them explicitly.
 
-Launch preflight runs after dependency setup and immediately before each child
-process, including resumed attempts. It checks the actual cwd, executable and
+When a start declares `launch`, preflight runs after dependency setup and
+immediately before each child process, including resumed attempts. It checks the actual cwd, executable and
 environment, declared packet readability and declared output writability. Setup
 may create packets or install the executable. Required files can already exist;
 only `launch.writable_paths` requires write capability. Proven incompatible
