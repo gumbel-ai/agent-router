@@ -487,8 +487,8 @@ class ManagedProcesses:
             ).fetchone()
             if row is not None:
                 existing = json.loads(row[0])
-                expected = {key: existing.get(key) for key in RESERVATION_FIELDS}
-                if not existing.get("launch_pending") or expected != reservation:
+                if not existing.get("launch_pending") or any(
+                        existing.get(key) != reservation.get(key) for key in RESERVATION_FIELDS):
                     raise ValueError(
                         "Managed launch reservation conflicts with retained evidence"
                     )
@@ -704,14 +704,11 @@ class ManagedProcesses:
                 wrapper = record.get("wrapper_identity")
                 if wrapper is not None and self.identity(record["wrapper_pid"]) == wrapper:
                     continue
-                if record.get("launch_pending"):
-                    # The wrapper ended before any start evidence; drop the stale reservation.
-                    db.execute("DELETE FROM managed_processes WHERE managed_id=? "
-                               "AND json_extract(data,'$.launch_pending')=1", (record["managed_id"],))
-                    continue
+                # A reservation whose wrapper ended may or may not have launched: report it uncertain.
+                pending = record.pop("launch_pending", None)
                 current = db.execute("SELECT json_extract(data,'$.status') FROM managed_processes "
                                      "WHERE managed_id=?", (record["managed_id"],)).fetchone()
-                if current is None or current[0] != "running" \
+                if current is None or (current[0] != "running" and not pending) \
                         or (directory / f"{record['managed_id']}.json").exists():
                     continue
                 record.pop("group_outlived", None)

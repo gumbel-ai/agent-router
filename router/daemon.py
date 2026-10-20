@@ -658,7 +658,9 @@ class Controller:
         )
         # Session root processes are the sessions counted above, not extra work.
         roots = {root["pid"] for root in self.sessions.process_roots()}
-        inferred = [record for record in self.inferred_process_records(1000) if record.get("pid") not in roots]
+        # Roots sort first, so one more than the roots reaches any descendant.
+        inferred = [record for record in self.inferred_process_records(len(roots) + 1)
+                    if record.get("pid") not in roots]
         after = self.lifecycle_consistency()
         if (
             before[1]
@@ -1206,10 +1208,13 @@ class Controller:
         with self.lifecycle_lock:
             if self.draining:
                 raise ValueError("Router is stopping for maintenance; retry after it restarts")
+            created = []
             def retain_forward(current):
                 existing = current.get("remote_forward_pending")
                 if existing is not None and existing != pending:
                     raise ValueError("A prior remote operation has an uncertain outcome; replay it first")
+                if existing is None:
+                    created.append(True)
                 current["remote_forward_pending"] = pending
             self.store.update(task["task_id"], retain_forward)
         from router.remote_child import RemoteChildError
@@ -1218,6 +1223,8 @@ class Controller:
         except RemoteChildError:
             raise  # The remote outcome is uncertain; replaying this request settles it.
         except ValueError:
+            if not created:
+                raise  # An earlier attempt of this request may still have been sent.
             # Refused before anything was sent, so nothing is uncertain.
             def clear(current):
                 if current.get("remote_forward_pending") == pending:

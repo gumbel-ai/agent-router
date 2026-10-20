@@ -107,6 +107,7 @@ def _record_size(raw_size: str) -> int:
     if (
         not raw_size.isascii()
         or not raw_size.isdecimal()
+        or len(raw_size) > 19
         or (len(raw_size) > 1 and raw_size.startswith("0"))
     ):
         raise _SourceUnavailable(
@@ -172,7 +173,7 @@ def _package_paths(package: Path, root: Path) -> set[str]:
 def _record_snapshot(dist) -> tuple[str, bytes | None, Path]:
     try:
         content = dist.read_text("RECORD")
-    except OSError as error:
+    except (OSError, UnicodeError) as error:
         raise _SourceUnavailable(
             "record_unavailable", "Agent Router RECORD is unavailable"
         ) from error
@@ -275,7 +276,7 @@ def _record_snapshot(dist) -> tuple[str, bytes | None, Path]:
 
     try:
         stable_content = dist.read_text("RECORD")
-    except OSError as error:
+    except (OSError, UnicodeError) as error:
         raise _SourceUnavailable(
             "installation_changed", "Agent Router RECORD changed during capture"
         ) from error

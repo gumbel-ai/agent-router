@@ -549,6 +549,11 @@ class RemoteChildProtocolTests(unittest.TestCase):
             {"operation": "cancel", "request_id": "cancel-a"},
         )
         self.assertTrue(blocks_maintenance(uncertain))
+        # A replay refused before sending keeps the earlier attempt's uncertainty.
+        with patch.object(Controller, "forward_remote", side_effect=ValueError("host no longer configured")), \
+                self.assertRaises(ValueError):
+            controller.handle("cancel", payload)
+        self.assertTrue(blocks_maintenance(controller.store.get("task-a")))
 
         old = {"task_id": "task-a", "request_id": "cancel-old"}
         with controller.store.transaction() as db:

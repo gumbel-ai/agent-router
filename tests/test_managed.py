@@ -135,12 +135,15 @@ class ManagedRunTests(unittest.TestCase):
         self.assertNotIn("launch_pending", record)
         self.assertEqual(record["status"], "exited")
 
-    def test_reservation_of_an_ended_wrapper_is_dropped(self):
-        self.control.managed.reserve({"managed_id": "managed-gone", "label": "gone", "attribution": "host",
-                                      "wrapper_pid": 4242, "wrapper_identity": "ended", "argument_count": 0})
-        self.assertIn("gone", self.managed())
-        self.control.managed.reconcile()
-        self.assertNotIn("gone", self.managed())
+    def test_reservation_of_an_ended_wrapper_becomes_uncertain(self):
+        reservation = {"managed_id": "managed-gone", "label": "gone", "attribution": "host",
+                       "wrapper_pid": 4242, "wrapper_identity": "ended", "argument_count": 0}
+        self.control.managed.reserve(reservation)
+        self.control.managed.reserve(reservation)  # An identical retry is not a conflict.
+        record = self.managed()["gone"]
+        self.assertNotIn("launch_pending", record)
+        self.assertEqual(record["status"], "unknown")
+        self.assertEqual(self.next_completion()["status"], "uncertain")
 
     def test_router_refusal_prevents_launch(self):
         with patch("router.managed.request", side_effect=ValueError("Router is stopping for maintenance")), \
