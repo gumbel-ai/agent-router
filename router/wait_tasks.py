@@ -28,13 +28,12 @@ def _snapshot(task_id: str, task: dict | None) -> dict:
 
 def _poll(latest: dict[str, dict], request: Callable, deadline: float, clock: Callable[[], float]) -> bool | None:
     """Refresh each task's latest state in place: False when any read failed, True when reads
-    succeeded, None when the deadline left time for no read."""
-    attempted = failed = False
+    completed without failure, None when the deadline left no read completed."""
+    completed = failed = False
     for task_id in latest:
         remaining = deadline - clock()
         if remaining <= 0:
             break
-        attempted = True
         try:
             task = request("status", {"task_id": task_id}, timeout=min(REQUEST_SECONDS, remaining), deadline=True)
             if not isinstance(task, dict) or task.get("task_id") != task_id \
@@ -42,7 +41,8 @@ def _poll(latest: dict[str, dict], request: Callable, deadline: float, clock: Ca
                 raise ValueError("Malformed task status response")
         except UnknownTask:
             task = None
-        except (OSError, ValueError):
+        except (OSError, ValueError, KeyError, TypeError, AttributeError):
+            # Transport failures and malformed replies alike (as in router/managed.py's waiter).
             if deadline - clock() <= 0:
                 break  # The wait's own deadline cut this read short; that is not a Router failure.
             # Unreachable, restarting or briefly failing Router: keep this task's last state
@@ -50,7 +50,8 @@ def _poll(latest: dict[str, dict], request: Callable, deadline: float, clock: Ca
             failed = True
             continue
         latest[task_id] = _snapshot(task_id, task)
-    return None if not attempted else not failed
+        completed = True
+    return False if failed else True if completed else None
 
 
 def wait_tasks(task_ids: list[str], mode: str, timeout: float, *, request: Callable | None = None,

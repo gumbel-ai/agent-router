@@ -185,9 +185,15 @@ class WaitTasksTests(unittest.TestCase):
 
     def test_malformed_status_responses_are_failed_reads_not_readiness(self):
         for response in (None, {}, {"task_id": "task-a", "status": "bogus"}, {"task_id": "task-other",
-                                                                             "status": "failed"}, ["task-a"]):
+                                                                             "status": "failed"}, ["task-a"],
+                         {"task_id": "task-a", "status": []}, {"task_id": "task-a", "status": {}},
+                         KeyError("result"), AttributeError("list has no get")):
             with self.subTest(response=response):
-                router = FakeRouter([{"task-a": lambda response=response: response}])
+                def reply(response=response):
+                    if isinstance(response, Exception):
+                        raise response  # Client-side envelope errors, e.g. {"ok": true} without result.
+                    return response
+                router = FakeRouter([{"task-a": reply}])
                 result = router.wait(["task-a"], "any", timeout=2)
                 self.assertEqual((result["condition_met"], result["daemon_unavailable"]), (False, True))
                 self.assertEqual(statuses(result), {"task-a": ("unknown", False)})
@@ -198,6 +204,12 @@ class WaitTasksTests(unittest.TestCase):
         result = router.wait(["task-a"], "any", timeout=1.375)
         self.assertEqual((result["timed_out"], result["daemon_unavailable"]), (True, False))
         self.assertEqual(statuses(result), {"task-a": ("running", False)})
+
+    def test_deadline_cut_retry_does_not_clear_an_earlier_outage(self):
+        router = FakeRouter([UNREACHABLE], latency=.25)
+        # The first read fails by 0.25 s; after sleeping to 1.25 s the retry is cut off at 1.375 s.
+        result = router.wait(["task-a"], "any", timeout=1.375)
+        self.assertEqual((result["timed_out"], result["daemon_unavailable"]), (True, True))
 
     def test_rejects_invalid_arguments(self):
         router = FakeRouter([{}])
