@@ -79,7 +79,7 @@ const TONES = {
   running: "ok", available: "ok", completed: "ok", accepted: "ok", integrated: "ok",
   idle: "info", stopped: "info", created: "info", validating: "info", preparing: "info",
   retrying: "info", cancelling: "info", cancelled: "info", closed: "info",
-  needs_input: "warn", awaiting_review: "warn", busy: "warn", partial: "warn", unknown: "warn",
+  needs_input: "warn", needs_attention: "bad", awaiting_review: "warn", busy: "warn", partial: "warn", unknown: "warn",
   failed: "bad", interrupted: "bad", blocked: "bad", offline: "bad", saturated: "bad",
 };
 
@@ -174,11 +174,19 @@ function sessionRows(snapshot, now) {
   return rows;
 }
 
+// Conditions that need an operator come before the executor's last activity.
+function taskActivity(task) {
+  if (task.shutdown_unconfirmed) return "shutdown unconfirmed";
+  if (task.cleanup_failed) return "cleanup failed";
+  if (["failed", "interrupted", "blocked"].includes(task.status) && task.failure_reason) return task.failure_reason;
+  return task.activity || task.failure_reason || task.task;
+}
+
 function routerTaskRows(snapshot, now) {
   return (snapshot.router_tasks || []).map(task => row({
     name: `${task.executor || "?"} · ${task.task_id}`,
-    state: task.status,
-    activity: task.failure_reason || task.activity || task.task,
+    state: task.shutdown_unconfirmed || task.cleanup_failed ? "needs_attention" : task.status,
+    activity: taskActivity(task),
     time: duration(task.elapsed_ms) || since(task.created_at, now),
   }));
 }
@@ -244,8 +252,8 @@ function hostCard(record) {
 function summary(result) {
   const live = result.hosts.filter(host => host.ok).map(host => host.snapshot);
   const count = key => live.reduce((total, snapshot) => total + (snapshot[key] || []).length, 0);
-  // Counts from a partial snapshot are lower bounds.
-  const bound = live.some(snapshot => snapshot.partial) ? "≥" : "";
+  // Counts are lower bounds when any host is offline, omitted or partial.
+  const bound = result.partial ? "≥" : "";
   const waiting = live.reduce((total, snapshot) =>
     total + (snapshot.sessions || []).filter(session => session.needs_input).length
           + (snapshot.agents || []).filter(agent => agent.status === "needs_input").length, 0);
