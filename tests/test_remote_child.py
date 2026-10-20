@@ -423,7 +423,7 @@ class RemoteChildProtocolTests(unittest.TestCase):
                     def __init__(self, _host, _timeout):
                         pass
 
-                    def status(self, _session_id, _request_id):
+                    def status(self, _session_id, _request_id, response=response):
                         return response
 
                 invocation = {**self.invocation, "executor": "codex",
