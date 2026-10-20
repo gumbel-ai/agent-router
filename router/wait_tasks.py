@@ -6,8 +6,10 @@ from collections.abc import Callable
 from router.client import UnknownTask
 from router.client import request as router_request
 from router.daemon import ACTIVE
+from router.managed import _identifier
 
 POLL_SECONDS = 1
+REQUEST_SECONDS = 2
 MAX_WAIT_SECONDS = 3600
 MAX_TASKS = 100
 
@@ -23,19 +25,22 @@ def _snapshot(task_id: str, task: dict | None) -> dict:
     return result
 
 
-def _poll(task_ids: list[str], request: Callable, deadline: float, clock: Callable[[], float]) -> list[dict] | None:
-    """One status read per task; None when the daemon could not be reached."""
-    snapshots = []
-    for task_id in task_ids:
+def _poll(latest: dict[str, dict], request: Callable, deadline: float, clock: Callable[[], float]) -> bool | None:
+    """Refresh each task's latest state in place: True when every read succeeded, False when
+    Router could not be read, None when the deadline left no time to finish the round."""
+    for task_id in latest:
+        remaining = deadline - clock()
+        if remaining <= 0:
+            return None
         try:
-            task = request("status", {"task_id": task_id}, timeout=max(.1, min(2, deadline - clock())), deadline=True)
+            task = request("status", {"task_id": task_id}, timeout=min(REQUEST_SECONDS, remaining), deadline=True)
         except UnknownTask:
             task = None
         except (OSError, ValueError):
-            # Unreachable, restarting or briefly failing daemon: keep the previous states.
-            return None
-        snapshots.append(_snapshot(task_id, task))
-    return snapshots
+            # Unreachable, restarting or briefly failing Router: keep the states already read.
+            return False
+        latest[task_id] = _snapshot(task_id, task)
+    return True
 
 
 def wait_tasks(task_ids: list[str], mode: str, timeout: float, *, request: Callable | None = None,
@@ -45,23 +50,23 @@ def wait_tasks(task_ids: list[str], mode: str, timeout: float, *, request: Calla
     task_ids = list(dict.fromkeys(task_ids))
     if not 1 <= len(task_ids) <= MAX_TASKS:
         raise ValueError(f"Give 1 to {MAX_TASKS} task IDs")
-    if any(not task_id or task_id.startswith("native-") for task_id in task_ids):
-        raise ValueError("wait-tasks accepts Router task IDs only")
+    for task_id in task_ids:
+        if _identifier(task_id, "task").startswith("native-"):
+            raise ValueError("wait-tasks accepts Router task IDs only")
     if mode not in {"any", "all"}:
         raise ValueError("mode must be any or all")
     if not 0 < timeout <= MAX_WAIT_SECONDS:
         raise ValueError(f"--timeout must be greater than 0 and at most {MAX_WAIT_SECONDS}")
     deadline = clock() + timeout
-    latest = [{"task_id": task_id, "status": "unknown", "ready": False} for task_id in task_ids]
+    latest = {task_id: {"task_id": task_id, "status": "unknown", "ready": False} for task_id in task_ids}
+    available = True
     while True:
-        snapshots = _poll(task_ids, request, deadline, clock)
-        if snapshots is not None:
-            latest = snapshots
-            ready = [task["ready"] for task in latest]
-            if any(ready) if mode == "any" else all(ready):
-                return {"mode": mode, "condition_met": True, "timed_out": False, "daemon_unavailable": False,
-                        "tasks": latest}
-        if clock() + POLL_SECONDS > deadline:
-            return {"mode": mode, "condition_met": False, "timed_out": True,
-                    "daemon_unavailable": snapshots is None, "tasks": latest}
-        sleep(POLL_SECONDS)
+        polled = _poll(latest, request, deadline, clock)
+        available = available if polled is None else polled
+        ready = [task["ready"] for task in latest.values()]
+        met = any(ready) if mode == "any" else all(ready)
+        remaining = deadline - clock()
+        if met or remaining <= 0:
+            return {"mode": mode, "condition_met": met, "timed_out": not met,
+                    "daemon_unavailable": not met and not available, "tasks": list(latest.values())}
+        sleep(min(POLL_SECONDS, remaining))

@@ -3,7 +3,7 @@ import json
 import tempfile
 import threading
 import unittest
-from contextlib import contextmanager, redirect_stdout
+from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 
@@ -21,11 +21,13 @@ UNREACHABLE = object()
 class FakeRouter:
     """Serves scripted task states, one script step per poll round; records every request."""
 
-    def __init__(self, rounds: list[dict]):
+    def __init__(self, rounds: list[dict], latency: float = 0):
         self.rounds = rounds
         self.round = 0
         self.now = 0.0
+        self.latency = latency
         self.requests = []
+        self.timeouts = []
 
     def clock(self) -> float:
         return self.now
@@ -36,8 +38,10 @@ class FakeRouter:
 
     def request(self, operation, payload, *, timeout, deadline):
         self.requests.append((operation, payload))
+        self.timeouts.append(timeout)
+        self.now += min(self.latency, timeout)
         state = self.rounds[self.round]
-        if state is UNREACHABLE:
+        if state is UNREACHABLE or state.get(payload["task_id"]) is UNREACHABLE:
             raise ValueError("Agent Router is not reachable.") from ConnectionRefusedError()
         task = state.get(payload["task_id"])
         if task is None:
@@ -135,12 +139,47 @@ class WaitTasksTests(unittest.TestCase):
         self.assertEqual({operation for operation, _ in router.requests}, {"status"})
         self.assertEqual(len(router.requests), 2)  # Duplicate IDs are read once per round.
 
+    def test_fractional_deadline_waits_until_it_expires(self):
+        router = FakeRouter([{"task-a": {"status": "running"}}])
+        result = router.wait(["task-a"], "any", timeout=.5)
+        self.assertTrue(result["timed_out"])
+        self.assertEqual(router.now, .5)
+        router = FakeRouter([{"task-a": {"status": "running"}}, {"task-a": {"status": "awaiting_review"}}])
+        result = router.wait(["task-a"], "any", timeout=1.5)
+        self.assertTrue(result["condition_met"])
+        self.assertEqual(router.now, 1)
+
+    def test_request_latency_never_extends_the_deadline(self):
+        router = FakeRouter([{f"task-{index}": {"status": "running"} for index in range(5)}], latency=.3)
+        result = router.wait([f"task-{index}" for index in range(5)], "any", timeout=1)
+        self.assertTrue(result["timed_out"])
+        self.assertLessEqual(router.now, 1)
+        self.assertTrue(all(0 < timeout <= 2 for timeout in router.timeouts))
+
+    def test_failed_read_keeps_states_already_read_in_the_same_round(self):
+        router = FakeRouter([{"task-a": {"status": "running"}, "task-b": {"status": "running"}},
+                             {"task-a": {"status": "awaiting_review"}, "task-b": UNREACHABLE}])
+        result = router.wait(["task-a", "task-b"], "any")
+        self.assertTrue(result["condition_met"])
+        self.assertEqual(statuses(result), {"task-a": ("awaiting_review", True), "task-b": ("running", False)})
+
     def test_rejects_invalid_arguments(self):
         router = FakeRouter([{}])
         for task_ids, mode, timeout in ((["task-a"], "any", 0), (["task-a"], "any", 3601),
-                                        (["native-x"], "any", 1), (["task-a"], "some", 1), ([], "any", 1)):
+                                        (["native-x"], "any", 1), (["task-a"], "some", 1), ([], "any", 1),
+                                        ([" task-a "], "any", 1), (["task-\x00"], "any", 1),
+                                        (["t" * 241], "any", 1)):
             with self.subTest(task_ids=task_ids, mode=mode, timeout=timeout), self.assertRaises(ValueError):
                 router.wait(task_ids, mode, timeout)
+        self.assertEqual(router.requests, [])
+
+    def test_cli_usage_errors_exit_2_without_reading(self):
+        with patch("router.wait_tasks.router_request") as request, patch("sys.argv", [
+                "router", "wait-tasks", " task-a ", "--any", "--timeout", "5"]), \
+                redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as exit_:
+            main()
+        self.assertEqual(exit_.exception.code, 2)
+        request.assert_not_called()
 
 
 class WaitTasksWireTests(unittest.TestCase):
