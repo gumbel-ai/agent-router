@@ -93,6 +93,11 @@ class ProvenanceTests(unittest.TestCase):
         ):
             return capture_startup_provenance()
 
+    def test_installer_bytecode_rows_do_not_disable_provenance(self):
+        record = self.dist.metadata / "RECORD"
+        record.write_text(record.read_text() + "router/__pycache__/daemon.cpython-314.pyc,,\n")
+        self.assertEqual(self.capture()["source"]["status"], "verified")
+
     def test_capture_binds_current_process_and_freezes_source_snapshot(self):
         first = self.capture()
         self.assertEqual(
