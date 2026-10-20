@@ -62,7 +62,7 @@ from router.process import (
     supervised_state,
     verify_shutdown,
 )
-from router.processes import SessionProcesses
+from router.processes import SessionProcesses, parent_and_identity
 from router.sessions import SessionObserver
 from router.snapshot import cleanup, git, validate_repository
 from router.task_checks import completion as check_completion
@@ -99,12 +99,13 @@ def _lifecycle_result(queued: bool, persistence: dict[str, str],
 
 def blocks_maintenance(task: dict) -> bool:
     return (task["status"] in ACTIVE or not task["execution_stopped"] or
-            bool(task.get("cleanup_requested") or task.get("cleanup_pending") and task.get("cleanup_error") is None))
+            bool(task.get("remote_forward_pending") or task.get("cleanup_requested")
+                 or task.get("cleanup_pending") and task.get("cleanup_error") is None))
 
 
 def public(task: dict, store: Store | None = None, history: list[dict] | None = None) -> dict:
     result = {key: value for key, value in task.items() if key not in {
-        "session_id", "invocation", "feedback", "permission_profile", "setup_command", "cleanup_requested", "token_prices",
+        "session_id", "invocation", "feedback", "permission_profile", "setup_command", "cleanup_requested", "remote_forward_pending", "token_prices",
         "codex_usage_baseline", "codex_usage_total", "codex_baseline_complete", "claude_baseline", "claude_total", "claude_executable", "_claude_tracing", "_codex_tracing"}}
     attempt_history = store.history(task["task_id"]) if history is None and store is not None else history or []
     result.update(visibility(task, attempt_history))
@@ -169,9 +170,178 @@ def require_state_directory(settings: Settings, directory: Path) -> Path:
     return resolved
 
 
+class NativeLaunchReservations:
+    """Durable same-process exec claims made by supported local launchers."""
+
+    def __init__(self, directory: Path, identity=parent_and_identity):
+        self.directory = directory / "native-launch-reservations"
+        self.identity = identity
+
+    @staticmethod
+    def _checked(payload: dict) -> dict:
+        if set(payload) != {"reservation_id", "source", "pid", "creation_identity"}:
+            raise ValueError("Invalid native launch reservation")
+        reservation_id = identifier(payload["reservation_id"], "reservation_id")
+        source = payload["source"]
+        pid = payload["pid"]
+        creation_identity = payload["creation_identity"]
+        if source not in SOURCES:
+            raise ValueError("Unsupported native launch source")
+        if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+            raise ValueError("Invalid native launch PID")
+        if (
+            not isinstance(creation_identity, str)
+            or not creation_identity
+            or len(creation_identity) > 240
+        ):
+            raise ValueError("Invalid native launch process identity")
+        return {
+            "schema_version": 1,
+            "reservation_id": reservation_id,
+            "source": source,
+            "pid": pid,
+            "creation_identity": creation_identity,
+        }
+
+    def _path(self, reservation_id: str) -> Path:
+        name = hashlib.sha256(reservation_id.encode()).hexdigest() + ".json"
+        return self.directory / name
+
+    def _ensure_directory(self) -> None:
+        self.directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+        if self.directory.is_symlink() or not self.directory.is_dir():
+            raise ValueError("Native launch reservation directory is unsafe")
+        self.directory.chmod(0o700)
+
+    def _read(self, path: Path) -> dict:
+        if path.is_symlink() or not path.is_file():
+            raise ValueError("Native launch reservation storage is unsafe")
+        try:
+            record = json.loads(path.read_text())
+        except (OSError, ValueError, UnicodeError, RecursionError) as error:
+            raise ValueError(
+                "Native launch reservation evidence is unavailable"
+            ) from error
+        if not isinstance(record, dict):
+            raise ValueError("Native launch reservation evidence is invalid")  # noqa: TRY004
+        checked = self._checked(
+            {
+                key: record.get(key)
+                for key in ("reservation_id", "source", "pid", "creation_identity")
+            }
+        )
+        if (
+            record != {**checked, "reserved_at": record.get("reserved_at")}
+            or not isinstance(record.get("reserved_at"), int)
+            or isinstance(record["reserved_at"], bool)
+        ):
+            raise ValueError("Native launch reservation evidence is invalid")
+        if path != self._path(checked["reservation_id"]):
+            raise ValueError("Native launch reservation identity is invalid")
+        return record
+
+    def reserve(self, payload: dict) -> dict:
+        record = {**self._checked(payload), "reserved_at": now_ms()}
+        try:
+            current = self.identity(record["pid"])[1]
+        except (OSError, ValueError, TypeError, IndexError) as error:
+            raise ValueError("Native launch process identity is unavailable") from error
+        if current != record["creation_identity"]:
+            raise ValueError("Native launch process identity does not match")
+        self._ensure_directory()
+        path = self._path(record["reservation_id"])
+        if path.exists():
+            existing = self._read(path)
+            comparable = {key: existing[key] for key in record if key != "reserved_at"}
+            requested = {key: record[key] for key in record if key != "reserved_at"}
+            if comparable != requested:
+                raise ValueError(
+                    "Native launch reservation conflicts with retained evidence"
+                )
+            return {
+                "schema_version": 1,
+                "reserved": True,
+                "reservation_id": record["reservation_id"],
+            }
+        descriptor, temporary_name = tempfile.mkstemp(
+            prefix=".reservation-", dir=self.directory
+        )
+        temporary = Path(temporary_name)
+        try:
+            os.fchmod(descriptor, 0o600)
+            with os.fdopen(descriptor, "w") as stream:
+                stream.write(canonical(record))
+                stream.flush()
+                os.fsync(stream.fileno())
+            temporary.replace(path)
+            directory = os.open(self.directory, os.O_RDONLY)
+            try:
+                os.fsync(directory)
+            finally:
+                os.close(directory)
+        finally:
+            temporary.unlink(missing_ok=True)
+        return {
+            "schema_version": 1,
+            "reserved": True,
+            "reservation_id": record["reservation_id"],
+        }
+
+    def abort(self, payload: dict) -> dict:
+        if set(payload) != {"reservation_id", "pid", "creation_identity"}:
+            raise ValueError("Invalid native launch abort")
+        reservation_id = identifier(payload["reservation_id"], "reservation_id")
+        pid, creation_identity = payload["pid"], payload["creation_identity"]
+        if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+            raise ValueError("Invalid native launch PID")
+        if not isinstance(creation_identity, str) or not creation_identity or len(creation_identity) > 240:
+            raise ValueError("Invalid native launch process identity")
+        path = self._path(reservation_id)
+        if not path.exists():
+            return {
+                "schema_version": 1,
+                "aborted": True,
+                "reservation_id": reservation_id,
+            }
+        record = self._read(path)
+        if (
+            record["pid"] != payload["pid"]
+            or record["creation_identity"] != payload["creation_identity"]
+        ):
+            raise ValueError("Native launch abort does not match its reservation")
+        path.unlink()
+        return {"schema_version": 1, "aborted": True, "reservation_id": reservation_id}
+
+    def active(self) -> list[dict]:
+        if not self.directory.exists():
+            return []
+        self._ensure_directory()
+        active = []
+        for path in sorted(self.directory.iterdir()):
+            if path.name.startswith(".reservation-"):
+                raise ValueError("Incomplete native launch reservation is retained")
+            record = self._read(path)
+            try:
+                current = self.identity(record["pid"])[1]
+            except (ProcessLookupError, FileNotFoundError):
+                path.unlink()
+                continue
+            except (OSError, ValueError, TypeError, IndexError) as error:
+                raise ValueError(
+                    "Native launch process liveness is unavailable"
+                ) from error
+            if current != record["creation_identity"]:
+                path.unlink()
+                continue
+            active.append(record)
+        return active
+
+
 class Controller:
-    def __init__(self, settings: Settings, environment: dict[str, str], directory: Path):
+    def __init__(self, settings: Settings, environment: dict[str, str], directory: Path,
+                 provenance: dict | None = None):
         self.settings = settings
+        self.provenance = copy.deepcopy(provenance)
         self.environment = environment
         self.directory = require_state_directory(settings, directory)
         self.directory.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -185,6 +355,7 @@ class Controller:
         self.sessions = SessionObserver(self.store, self.host.host_id)
         self.session_processes = SessionProcesses()
         self.managed = ManagedProcesses(self.store, self.host.host_id, self.directory)
+        self.native_launches = NativeLaunchReservations(self.directory)
         self.capacity = CapacitySampler(self.directory)
         self.alert_history = AlertHistory()
         self.lifecycle_queue: queue.Queue[tuple[dict, threading.Event, dict] | None] = queue.Queue(maxsize=1024)
@@ -410,9 +581,12 @@ class Controller:
     def _observe_lifecycle_direct(self, observer, payload: dict) -> dict:
         # The compatibility endpoints remain synchronous, but must participate
         # in the same snapshot consistency protocol as the queued hook path.
-        with self.lifecycle_health_lock:
-            self.lifecycle_direct_active += 1
-            self._lifecycle_generation += 1
+        with self.lifecycle_lock:
+            if self.draining:
+                raise ValueError("Router is stopping for maintenance; observation was not admitted")
+            with self.lifecycle_health_lock:
+                self.lifecycle_direct_active += 1
+                self._lifecycle_generation += 1
         try:
             if not self.in_scope([payload]):
                 return {"observed": False, "reason": "Session is outside every observed project"}
@@ -425,6 +599,155 @@ class Controller:
     def busy(self) -> int:
         return sum(blocks_maintenance(task) for task in self.store.all())
 
+    def health(self) -> dict:
+        from importlib.metadata import version
+
+        result = {
+            "state_dir": str(self.directory),
+            "delegation_enabled": self.settings.delegation_enabled,
+            "active_tasks": self.busy(),
+            "version": version("agent-router"),
+        }
+        if self.provenance is None:
+            return result
+        result["instance"] = copy.deepcopy(self.provenance)
+        source = self.provenance.get("source")
+        if isinstance(source, dict) and source.get("status") == "verified":
+            result["version"] = source["version"]
+            result["maintenance"] = {
+                "schema_version": 1,
+                "atomic_stop": True,
+                "native_launch_reservation": True,
+            }
+        return result
+
+    @staticmethod
+    def _bounded_workload_records(producer, name: str) -> tuple[list[dict], int]:
+        records, active = producer(1000)
+        if not isinstance(records, list):
+            raise ValueError(f"{name} workload evidence is incomplete")  # noqa: TRY004
+        if not isinstance(active, int) or isinstance(active, bool) or active < 0:
+            raise ValueError(f"{name} workload liveness is unavailable")
+        if any(not isinstance(record, dict) for record in records):
+            raise ValueError(f"{name} workload evidence is invalid")
+        return records, active
+
+    def maintenance_workload(self, current_session: dict | None) -> dict:
+        if current_session is not None:
+            if (
+                not isinstance(current_session, dict)
+                or set(current_session) != {"source", "session_id"}
+                or current_session.get("source") not in SOURCES
+            ):
+                raise ValueError("Invalid current session identity")
+            current_session = {
+                "source": current_session["source"],
+                "session_id": identifier(
+                    current_session.get("session_id"), "session_id"
+                ),
+            }
+        before = self.lifecycle_consistency()
+        sessions, session_count = self._bounded_workload_records(
+            self.sessions.fleet_records, "Session"
+        )
+        _agents, agent_count = self._bounded_workload_records(
+            self.native.fleet_records, "Native agent"
+        )
+        _managed, managed_count = self._bounded_workload_records(
+            self.managed.records, "Managed process"
+        )
+        # Session root processes are the sessions counted above, not extra work.
+        roots = {root["pid"] for root in self.sessions.process_roots()}
+        # Roots sort first, so one more than the roots reaches any descendant.
+        inferred = [record for record in self.inferred_process_records(len(roots) + 1)
+                    if record.get("pid") not in roots]
+        after = self.lifecycle_consistency()
+        if (
+            before[1]
+            or after[1]
+            or before[0] != after[0]
+            or self.lifecycle_health() is not None
+        ):
+            raise ValueError("Lifecycle observation liveness is unavailable")
+        if (
+            not isinstance(inferred, list)
+            or any(
+                not isinstance(record, dict)
+                or record.get("status") not in {"running", "unknown"}
+                for record in inferred
+            )
+        ):
+            raise ValueError("Inferred process liveness is unavailable")
+        matching = (
+            []
+            if current_session is None
+            else [
+                record
+                for record in sessions
+                if record.get("source") == current_session["source"]
+                and record.get("session_id") == current_session["session_id"]
+            ]
+        )
+        if len(matching) > 1:
+            raise ValueError("Current session identity is ambiguous")
+        current = matching[0] if matching else None
+        if current is not None and (
+            current.get("status") in {"running", "needs_input"}
+            or current.get("needs_input") is True
+        ):
+            if session_count < 1:
+                raise ValueError("Current session liveness is inconsistent")
+            session_count -= 1
+        reservations = self.native_launches.active()
+        return {
+            "router_tasks": self.busy(),
+            "sessions": session_count,
+            "agents": agent_count,
+            "managed_processes": managed_count,
+            "inferred_processes": len(inferred),
+            "native_launch_reservations": len(reservations),
+        }
+
+    def stop_for_maintenance(self, payload: dict) -> dict:
+        allowed = {"only_if_idle", "expected_instance", "current_session"}
+        if set(payload) - allowed or payload.get("only_if_idle") is not True:
+            raise ValueError("Invalid atomic daemon stop options")
+        expected = payload.get("expected_instance")
+        if expected is None:
+            raise ValueError("Atomic daemon stop requires the expected daemon instance")
+        with self.lifecycle_lock:
+            if self.draining:
+                raise ValueError("Router is already stopping for maintenance")
+            source = (
+                self.provenance.get("source")
+                if isinstance(self.provenance, dict)
+                else None
+            )
+            if not isinstance(source, dict) or source.get("status") != "verified":
+                raise ValueError("Daemon source provenance is unavailable")
+            if expected != self.provenance:
+                raise ValueError(
+                    "Daemon instance changed before maintenance admission closed"
+                )
+            self.draining = True
+            admitted = False
+            try:
+                workload = self.maintenance_workload(payload.get("current_session"))
+                if any(workload.values()):
+                    raise ValueError(
+                        "Active or uncertain work blocks Router maintenance"
+                    )
+                admitted = True
+            finally:
+                if not admitted:
+                    self.draining = False
+            return {
+                "stopping": True,
+                "admissions_closed": True,
+                "instance": copy.deepcopy(self.provenance),
+                "workload": workload,
+            }
+
     def handle(self, operation: str, payload: dict) -> dict | list:
         if not isinstance(payload, dict):
             raise ValueError("Request payload must be an object")  # noqa: TRY004 - public validation contract
@@ -435,12 +758,35 @@ class Controller:
         if operation == "status":
             return self.status(payload)
         if operation == "health":
-            from importlib.metadata import version
-            return {"version": version("agent-router"), "state_dir": str(self.directory),
-                    "delegation_enabled": self.settings.delegation_enabled,
-                    "active_tasks": self.busy()}
+            if payload:
+                raise ValueError("Health accepts no options")
+            return self.health()
+        if operation == "native_launch_reserve":
+            with self.lifecycle_lock:
+                source = self.provenance.get("source") if isinstance(self.provenance, dict) else None
+                if not isinstance(source, dict) or source.get("status") != "verified":
+                    raise ValueError("Daemon source provenance is unavailable")
+                if self.draining:
+                    raise ValueError("Router is stopping for maintenance; native launch was not reserved")
+                result = self.native_launches.reserve(payload)
+                result["instance"] = copy.deepcopy(self.provenance)
+                return result
+        if operation == "native_launch_abort":
+            with self.lifecycle_lock:
+                return self.native_launches.abort(payload)
+        if operation == "managed_reserve":
+            with self.lifecycle_lock:
+                if self.draining:
+                    raise ValueError("Router is stopping for maintenance; managed launch was not reserved")
+                return self.managed.reserve(payload)
+        if operation == "managed_abort":
+            with self.lifecycle_lock:
+                return self.managed.abort(payload)
         if operation == "managed_start":
-            return self.managed.start(payload)
+            with self.lifecycle_lock:
+                if self.draining:
+                    raise ValueError("Router is stopping for maintenance; managed start was not admitted")
+                return self.managed.start(payload)
         if operation == "managed_finish":
             return self.managed.finish(payload)
         if operation == "completion_next":
@@ -469,6 +815,11 @@ class Controller:
             }
             outcome = {"persistence": dict(requested)}
             with self.lifecycle_lock:
+                if self.draining:
+                    return _lifecycle_result(
+                        False, dict.fromkeys(requested, "rejected"),
+                        "Router is stopping for maintenance; observation was not admitted",
+                    )
                 if (self.lifecycle_stopping or self.lifecycle_thread is None
                         or not self.lifecycle_thread.is_alive()):
                     return _lifecycle_result(
@@ -777,6 +1128,10 @@ class Controller:
                 if tuple(replay)[:2] != (operation, encoded):
                     raise ValueError("request_id was already used with another payload")
                 task = self.store.get(replay[2], db)
+                pending = {"operation": operation, "request_id": request_id}
+                if task.get("remote_forward_pending") == pending:
+                    task.pop("remote_forward_pending")
+                    self.store.put(db, task)
                 if operation == "close" and task.get("cleanup_pending"):
                     task["cleanup_requested"] = True
                     self.store.put(db, task)
@@ -814,6 +1169,9 @@ class Controller:
             else:
                 self.require_forwarded(task, forwarded)
                 self.close(task, payload)
+            pending = {"operation": operation, "request_id": request_id}
+            if task.get("remote_forward_pending") == pending:
+                task.pop("remote_forward_pending")
             self.store.put(db, task)
             db.execute("UPDATE authorizations SET consumed=1 WHERE session_id=? AND request_id=?", (session, request_id))
             db.execute("INSERT INTO operations VALUES(?,?,?,?,?)", (session, request_id, operation, encoded, task["task_id"]))
@@ -838,14 +1196,41 @@ class Controller:
         if (authorization is None or authorization["consumed"] or authorization["operation"] != operation
                 or authorization["payload"] != canonical(payload)):
             raise ValueError("Missing matching single-use dispatch authorization")
-        with self.lifecycle_lock:
-            if self.draining:
-                raise ValueError("Router is stopping for maintenance; retry after it restarts")
-        if operation == "cancel":
+        if operation == "review":
+            self.review(copy.deepcopy(task), payload)
+        elif operation == "close":
+            self.close(copy.deepcopy(task), payload)
+        elif operation == "cancel":
             validate_payload(operation, payload)
             if task["status"] in {"accepted", "integrated", "closed"}:
                 raise ValueError("Finalize accepted work through close")
-        return self.forward_remote(task, operation, payload) is not None
+        pending = {"operation": operation, "request_id": request_id}
+        with self.lifecycle_lock:
+            if self.draining:
+                raise ValueError("Router is stopping for maintenance; retry after it restarts")
+            created = []
+            def retain_forward(current):
+                existing = current.get("remote_forward_pending")
+                if existing is not None and existing != pending:
+                    raise ValueError("A prior remote operation has an uncertain outcome; replay it first")
+                if existing is None:
+                    created.append(True)
+                current["remote_forward_pending"] = pending
+            self.store.update(task["task_id"], retain_forward)
+        from router.remote_child import RemoteChildError
+        try:
+            return self.forward_remote(task, operation, payload) is not None
+        except RemoteChildError:
+            raise  # The remote outcome is uncertain; replaying this request settles it.
+        except ValueError:
+            if not created:
+                raise  # An earlier attempt of this request may still have been sent.
+            # Refused before anything was sent, so nothing is uncertain.
+            def clear(current):
+                if current.get("remote_forward_pending") == pending:
+                    current.pop("remote_forward_pending")
+            self.store.update(task["task_id"], clear)
+            raise
 
     @staticmethod
     def require_forwarded(task: dict, forwarded: bool) -> None:
@@ -1796,13 +2181,18 @@ class Handler(socketserver.StreamRequestHandler):
             if len(line) > 1024 * 1024 and operation != "remote_start":
                 raise ValueError("Request exceeds one MiB")
             if operation == "daemon_stop":
-                if not isinstance(payload, dict) or set(payload) - {"only_if_idle"}:
+                if not isinstance(payload, dict):
                     raise ValueError("Invalid daemon stop options")
-                with self.server.control.lifecycle_lock:
-                    if payload.get("only_if_idle") and self.server.control.busy():
-                        raise ValueError("Finish or explicitly cancel active Router tasks before maintenance")
-                    self.server.control.draining = True
-                result = {"stopping": True}
+                if "expected_instance" in payload:
+                    result = self.server.control.stop_for_maintenance(payload)
+                else:
+                    if set(payload) - {"only_if_idle"}:
+                        raise ValueError("Invalid daemon stop options")
+                    with self.server.control.lifecycle_lock:
+                        if payload.get("only_if_idle") and self.server.control.busy():
+                            raise ValueError("Finish or explicitly cancel active Router tasks before maintenance")
+                        self.server.control.draining = True
+                    result = {"stopping": True}
                 threading.Thread(target=self.server.shutdown, daemon=True).start()
             else:
                 result = self.server.control.handle(operation, payload)
@@ -1846,7 +2236,9 @@ def serve(settings: Settings, environment: dict[str, str], directory: Path, endp
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as error:
             raise ValueError("Agent Router is already running") from error
-        controller = Controller(settings, environment, directory)
+        from router.provenance import capture_startup_provenance
+        provenance = capture_startup_provenance()
+        controller = Controller(settings, environment, directory, provenance)
         if endpoint.exists():
             import stat
             endpoint_info = endpoint.lstat()

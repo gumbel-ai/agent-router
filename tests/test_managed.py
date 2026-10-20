@@ -99,6 +99,69 @@ class ManagedRunTests(unittest.TestCase):
             self.ack_completion(event)
         self.assertEqual(outcomes, ["completed", "failed", "failed", "uncertain"])
 
+    def test_launch_requires_a_confirmed_reservation_before_popen(self):
+        malformed = [
+            {},
+            {
+                "reserved": True,
+                "managed_id": "wrong",
+                "wrapper_pid": os.getpid(),
+                "wrapper_identity": parent_and_identity(os.getpid())[1],
+            },
+        ]
+        for response in malformed:
+            with (
+                self.subTest(response=response),
+                patch("router.managed.request", return_value=response),
+                patch(
+                    "router.managed.subprocess.Popen",
+                    side_effect=AssertionError("must not launch"),
+                ),
+                self.assertRaisesRegex(ValueError, "command was not started"),
+            ):
+                run([sys.executable, "-c", "pass"], "guarded", None, None, self.state)
+
+    def test_lost_reservation_reply_runs_and_binds_the_reservation(self):
+        def lose_reservation_reply(operation, payload, timeout):
+            result = self.request(operation, payload, timeout)
+            if operation == "managed_reserve":
+                raise OSError("reply lost after commit")
+            return result
+
+        with patch("router.managed.request", side_effect=lose_reservation_reply), \
+                redirect_stderr(io.StringIO()):
+            self.assertEqual(run([sys.executable, "-c", "pass"], "lost", None, None, self.state), 0)
+        record = self.managed()["lost"]
+        self.assertNotIn("launch_pending", record)
+        self.assertEqual(record["status"], "exited")
+
+    def test_reservation_of_an_ended_wrapper_becomes_uncertain(self):
+        reservation = {"managed_id": "managed-gone", "label": "gone", "attribution": "host",
+                       "wrapper_pid": 4242, "wrapper_identity": "ended", "argument_count": 0}
+        self.control.managed.reserve(reservation)
+        self.control.managed.reserve(reservation)  # An identical retry is not a conflict.
+        record = self.managed()["gone"]
+        self.assertNotIn("launch_pending", record)
+        self.assertEqual(record["status"], "unknown")
+        self.assertEqual(self.next_completion()["status"], "uncertain")
+
+    def test_router_refusal_prevents_launch(self):
+        with patch("router.managed.request", side_effect=ValueError("Router is stopping for maintenance")), \
+                patch("router.managed.subprocess.Popen", side_effect=AssertionError("must not launch")), \
+                self.assertRaisesRegex(ValueError, "refused the managed launch"):
+            run([sys.executable, "-c", "pass"], "refused", None, None, self.state)
+
+    def test_popen_failure_aborts_the_prelaunch_reservation(self):
+        with (
+            patch(
+                "router.managed.subprocess.Popen",
+                side_effect=FileNotFoundError("missing"),
+            ),
+            self.assertRaises(FileNotFoundError),
+        ):
+            self.run_command("pass", label="not-started")
+        self.assertEqual(self.managed(), {})
+
     def test_declared_work_item_id_is_refused_before_command_launch(self):
         with patch("router.managed.subprocess.Popen", side_effect=AssertionError("must not launch")):
             for value in (True, 1, [], {}, "", " leading", "trailing ", "line\nbreak", "x" * 241):
@@ -122,8 +185,10 @@ class ManagedRunTests(unittest.TestCase):
 
     def test_lost_start_and_finish_replies_replay_evidence_without_duplicate_events(self):
         def lose_reply(operation, payload, timeout):
-            self.request(operation, payload, timeout)
-            raise OSError("reply lost after commit")
+            result = self.request(operation, payload, timeout)
+            if operation != "managed_reserve":
+                raise OSError("reply lost after commit")
+            return result
 
         with patch("router.managed.request", side_effect=lose_reply):
             self.assertEqual(run([sys.executable, "-c", "pass"], "batch-job", None, None, self.state,
@@ -754,10 +819,15 @@ class ManagedRunTests(unittest.TestCase):
             finally:
                 release.touch()  # The release remains visible even before the child reads it.
 
-        self.daemon_up = False
+        def reserve_then_miss_start(operation, payload, timeout):
+            result = self.request(operation, payload, timeout)
+            if operation == "managed_reserve":
+                self.daemon_up = False
+            return result
+
         with ThreadPoolExecutor(max_workers=1) as helpers:
             helper = helpers.submit(daemon_returns_then_release)
-            with patch("router.managed.request", side_effect=self.request):
+            with patch("router.managed.request", side_effect=reserve_then_miss_start):
                 code = run([sys.executable, "-c", command], "missed", None, None, self.state)
             self.assertEqual(helper.result(timeout=15), (["missed"], 1))
         self.assertEqual(code, 0)

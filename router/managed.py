@@ -74,6 +74,9 @@ def run(argv: list[str], label: str | None, session_id: str | None, agent_id: st
                 "argument_count": len(argv) - 1, "cwd": os.getcwd()}
     if work_item_id is not None:
         metadata["work_item_id"] = work_item_id
+    # A reachable Router can refuse the launch (maintenance); an unreachable one cannot, and the
+    # command runs unreserved with its evidence kept for later, as before.
+    reserved = recorded and metadata["wrapper_identity"] is not None and _reserve(metadata)
     started_at, started = _now(), time.monotonic()
     launched: list[int] = []  # The command's PID (its group), once it exists.
     pending: list[int] = []
@@ -92,8 +95,16 @@ def run(argv: list[str], label: str | None, session_id: str | None, agent_id: st
     try:
         # A new session: the command has no controlling terminal, so a prompt fails instead of
         # stopping it in the background, and the group (pgid == pid) is the command's own.
-        child = subprocess.Popen(argv, stdin=subprocess.DEVNULL, start_new_session=True,
-                                 env={**os.environ, "ROUTER_MANAGED_ID": managed_id})
+        try:
+            child = subprocess.Popen(argv, stdin=subprocess.DEVNULL, start_new_session=True,
+                                     env={**os.environ, "ROUTER_MANAGED_ID": managed_id})
+        except (OSError, ValueError):
+            if reserved:
+                abort = {"managed_id": managed_id, "wrapper_pid": metadata["wrapper_pid"],
+                         "wrapper_identity": metadata["wrapper_identity"]}
+                if not _abort(abort):
+                    _write_evidence(state, f"abort-{managed_id}.json", abort)
+            raise
         launched.append(child.pid)
         for signum in pending:
             forward(signum, None)
@@ -170,12 +181,42 @@ def _report(operation: str, payload: dict) -> bool:
         return False
 
 
+def _reserve(payload: dict) -> bool:
+    """True when reserved, False when Router is unreachable; raises when Router refuses."""
+    try:
+        result = request("managed_reserve", payload, timeout=2)
+    except (OSError, ValueError) as error:
+        if isinstance(error, OSError) or isinstance(error.__cause__, OSError):
+            print(f"Agent Router managed reservation unavailable: {error}", file=sys.stderr)
+            return False
+        raise ValueError(f"Agent Router refused the managed launch: {error}; command was not started") from error
+    expected = {key: payload[key] for key in ("managed_id", "wrapper_pid", "wrapper_identity")}
+    if (not isinstance(result, dict) or result.get("reserved") is not True
+            or {key: result.get(key) for key in expected} != expected):
+        raise ValueError("Invalid managed launch reservation response; command was not started")
+    return True
+
+
+def _abort(payload: dict) -> bool:
+    try:
+        result = request("managed_abort", payload, timeout=2)
+        return isinstance(result, dict) and result == {
+            "aborted": True, "managed_id": payload["managed_id"],
+            "wrapper_pid": payload["wrapper_pid"], "wrapper_identity": payload["wrapper_identity"],
+        }
+    except (OSError, ValueError, KeyError, TypeError) as error:
+        print(f"Agent Router managed reservation abort unavailable: {error}", file=sys.stderr)
+        return False
+
+
 # Field -> kind. Text is bounded; integers must fit the wire; flags must be real booleans.
-START_FIELDS = {"managed_id": "id", "label": "text", "session_id": "identifier", "agent_id": "identifier",
-                "work_item_id": "identifier",
-                "attribution": "attribution", "pid": "pid", "pgid": "pid", "wrapper_pid": "pid",
-                "wrapper_identity": "text", "executable": "text", "argument_count": "count",
-                "cwd": "path", "started_at": "count"}
+RESERVATION_FIELDS = {"managed_id": "id", "label": "text", "session_id": "identifier",
+                      "agent_id": "identifier", "work_item_id": "identifier",
+                      "attribution": "attribution", "wrapper_pid": "pid",
+                      "wrapper_identity": "text", "executable": "text",
+                      "argument_count": "count", "cwd": "path"}
+ABORT_FIELDS = {"managed_id": "id", "wrapper_pid": "pid", "wrapper_identity": "text"}
+START_FIELDS = {**RESERVATION_FIELDS, "pid": "pid", "pgid": "pid", "started_at": "count"}
 FINISH_FIELDS = {"managed_id": "id", "finished_at": "count", "elapsed_ms": "count", "exit_code": "count",
                  "signal": "pid", "max_process_rss_bytes": "count", "group_outlived": "flag", "start": "start"}
 
@@ -213,9 +254,11 @@ def _checked(payload: object, fields: dict[str, str]) -> dict:
         if not valid:
             raise ValueError(f"Invalid managed process {key}")
         checked[key] = bound_text(value, 2000 if kind == "path" else 240) if kind in {"text", "path"} else value
-    if fields is START_FIELDS and checked["attribution"] != _attribution(checked.get("session_id"),
-                                                                         checked.get("agent_id")):
+    if fields in (RESERVATION_FIELDS, START_FIELDS) and checked["attribution"] != _attribution(
+            checked.get("session_id"), checked.get("agent_id")):
         raise ValueError("Managed process attribution does not match its session and agent")
+    if fields in (RESERVATION_FIELDS, ABORT_FIELDS) and not checked.get("wrapper_identity"):
+        raise ValueError("Managed launch process identity is unavailable")
     return checked
 
 
@@ -309,7 +352,9 @@ class ManagedProcesses:
         self._reconcile_lock = threading.Lock()
         # Upgrade existing retained evidence without changing the managed-record format.
         with self.store.transaction() as db:
-            for row in db.execute("SELECT data FROM managed_processes WHERE json_extract(data,'$.status')!='running'"):
+            for row in db.execute("""SELECT data FROM managed_processes
+                    WHERE json_extract(data,'$.status')!='running'
+                      AND COALESCE(json_extract(data,'$.launch_pending'),0)!=1"""):
                 self._completion(db, json.loads(row[0]))
 
     def _completion(self, db, record: dict) -> None:
@@ -425,16 +470,97 @@ class ManagedProcesses:
             result["subscription_id"] = subscription
         return result
 
+    def reserve(self, payload: dict) -> dict:
+        reservation = _checked(payload, RESERVATION_FIELDS)
+        record = {
+            **reservation,
+            "host_id": self.host_id,
+            "status": "unknown",
+            "launch_pending": True,
+            "uncertain_at": _now(),
+            "visibility_reason": "Managed command launch is reserved but not yet bound",
+        }
+        with self.store.transaction() as db:
+            row = db.execute(
+                "SELECT data FROM managed_processes WHERE managed_id=?",
+                (record["managed_id"],),
+            ).fetchone()
+            if row is not None:
+                existing = json.loads(row[0])
+                if not existing.get("launch_pending") or any(
+                        existing.get(key) != reservation.get(key) for key in RESERVATION_FIELDS):
+                    raise ValueError(
+                        "Managed launch reservation conflicts with retained evidence"
+                    )
+            elif db.execute(
+                "SELECT 1 FROM completion_events WHERE managed_id=?",
+                (record["managed_id"],),
+            ).fetchone():
+                raise ValueError("Managed launch identity was already completed")
+            else:
+                db.execute(
+                    "INSERT INTO managed_processes(managed_id,data) VALUES(?,?)",
+                    (record["managed_id"], canonical(record)),
+                )
+        return {
+            "reserved": True,
+            "managed_id": record["managed_id"],
+            "wrapper_pid": record["wrapper_pid"],
+            "wrapper_identity": record["wrapper_identity"],
+        }
+
+    def abort(self, payload: dict) -> dict:
+        checked = _checked(payload, ABORT_FIELDS)
+        with self.store.transaction() as db:
+            row = db.execute(
+                "SELECT data FROM managed_processes WHERE managed_id=?",
+                (checked["managed_id"],),
+            ).fetchone()
+            if row is None:
+                return {"aborted": True, **checked}
+            record = json.loads(row[0])
+            if not record.get("launch_pending") or any(
+                record.get(key) != checked[key] for key in ABORT_FIELDS
+            ):
+                raise ValueError("Managed launch reservation does not match")
+            db.execute(
+                "DELETE FROM managed_processes WHERE managed_id=?",
+                (checked["managed_id"],),
+            )
+        return {"aborted": True, **checked}
+
     def start(self, payload: dict) -> dict:
         with self.store.transaction() as db:
             self._start(db, payload)
         return {"recorded": True}
 
     def _start(self, db, payload: dict) -> None:
-        record = {**_checked(payload, START_FIELDS), "host_id": self.host_id, "status": "running"}
-        db.execute("""INSERT OR IGNORE INTO managed_processes(managed_id,data)
+        checked = _checked(payload, START_FIELDS)
+        record = {**checked, "host_id": self.host_id, "status": "running"}
+        row = db.execute(
+            "SELECT data FROM managed_processes WHERE managed_id=?",
+            (record["managed_id"],),
+        ).fetchone()
+        if row is not None:
+            existing = json.loads(row[0])
+            reserved = {key: existing.get(key) for key in RESERVATION_FIELDS}
+            expected = {key: checked.get(key) for key in RESERVATION_FIELDS}
+            if not existing.get("launch_pending") or reserved != expected:
+                if existing == record:
+                    return
+                raise ValueError(
+                    "Managed process start conflicts with retained evidence"
+                )
+            db.execute(
+                "UPDATE managed_processes SET data=? WHERE managed_id=?",
+                (canonical(record), record["managed_id"]),
+            )
+            return
+        db.execute(
+            """INSERT OR IGNORE INTO managed_processes(managed_id,data)
                     SELECT ?,? WHERE NOT EXISTS (SELECT 1 FROM completion_events WHERE managed_id=?)""",
-                   (record["managed_id"], canonical(record), record["managed_id"]))
+            (record["managed_id"], canonical(record), record["managed_id"]),
+        )
 
     def finish(self, payload: dict) -> dict:
         with self.store.transaction() as db:
@@ -442,31 +568,61 @@ class ManagedProcesses:
         return {"recorded": True}
 
     def _finish(self, db, finish: dict) -> None:
-        if db.execute("SELECT 1 FROM completion_events WHERE managed_id=? AND phase='finished'",
-                      (finish["managed_id"],)).fetchone():
+        if db.execute(
+            "SELECT 1 FROM completion_events WHERE managed_id=? AND phase='finished'",
+            (finish["managed_id"],),
+        ).fetchone():
             return  # Final evidence remains final even after its payload has expired.
-        row = db.execute("SELECT data FROM managed_processes WHERE managed_id=?",
-                         (finish["managed_id"],)).fetchone()
+        row = db.execute(
+            "SELECT data FROM managed_processes WHERE managed_id=?",
+            (finish["managed_id"],),
+        ).fetchone()
         start = finish.pop("start", None)
         if row is not None:
             record = json.loads(row[0])
+            if record.get("launch_pending"):
+                if start is None or start["managed_id"] != finish["managed_id"]:
+                    raise ValueError("Managed launch has no matching start evidence")
+                reserved = {key: record.get(key) for key in RESERVATION_FIELDS}
+                expected = {key: start.get(key) for key in RESERVATION_FIELDS}
+                if reserved != expected:
+                    raise ValueError(
+                        "Managed process start conflicts with its reservation"
+                    )
+                record = {**start, "host_id": self.host_id, "status": "running"}
         elif start is not None and start["managed_id"] == finish["managed_id"]:
-            previous = db.execute("SELECT host_id FROM completion_events WHERE managed_id=? AND phase='uncertain'",
-                                  (finish["managed_id"],)).fetchone()
-            record = {**start, "host_id": previous[0] if previous else self.host_id, "status": "running"}
+            previous = db.execute(
+                "SELECT host_id FROM completion_events WHERE managed_id=? AND phase='uncertain'",
+                (finish["managed_id"],),
+            ).fetchone()
+            record = {
+                **start,
+                "host_id": previous[0] if previous else self.host_id,
+                "status": "running",
+            }
         else:
             raise ValueError("Unknown managed process")
         if record.get("status") not in {"running", "unknown"}:
             return  # Completion is recorded once; a repeat cannot rewrite it.
         record.update(finish)
         record.pop("uncertain_at", None)
-        record["status"] = ("signaled" if finish.get("signal") else
-                            "exited" if finish.get("exit_code") == 0 else "failed")
-        record["visibility_reason"] = ("Processes in the command's group outlived it"
-                                       if finish.get("group_outlived") else None)
-        db.execute("INSERT INTO managed_processes(managed_id,data) VALUES(?,?) "
-                   "ON CONFLICT(managed_id) DO UPDATE SET data=excluded.data",
-                   (record["managed_id"], canonical(record)))
+        record["status"] = (
+            "signaled"
+            if finish.get("signal")
+            else "exited"
+            if finish.get("exit_code") == 0
+            else "failed"
+        )
+        record["visibility_reason"] = (
+            "Processes in the command's group outlived it"
+            if finish.get("group_outlived")
+            else None
+        )
+        db.execute(
+            "INSERT INTO managed_processes(managed_id,data) VALUES(?,?) "
+            "ON CONFLICT(managed_id) DO UPDATE SET data=excluded.data",
+            (record["managed_id"], canonical(record)),
+        )
         self._completion(db, record)
 
     def reconcile(self, *, blocking: bool = True, timeout: float = 10) -> None:
@@ -483,12 +639,14 @@ class ManagedProcesses:
         directory = completion_directory(self.state)
         files = sorted(directory.glob("managed-*.json")) if directory.exists() else []
         starts = sorted(directory.glob("start-managed-*.json")) if directory.exists() else []
+        aborts = sorted(directory.glob("abort-managed-*.json")) if directory.exists() else []
         with self.store.connect(timeout=timeout) as db:
             running = [json.loads(row[0]) for row in db.execute("""SELECT data FROM managed_processes
-                    WHERE json_extract(data,'$.status')='running'""")]
+                    WHERE json_extract(data,'$.status')='running'
+                       OR json_extract(data,'$.launch_pending')=1""")]
         now = _now()
         # Stable wrappers need no write between retention passes; new evidence bypasses this check.
-        if not files and not starts and now - self._pruned_at < PRUNE_INTERVAL_MS and all(
+        if not files and not starts and not aborts and now - self._pruned_at < PRUNE_INTERVAL_MS and all(
                 record.get("wrapper_identity") is not None
                 and self.identity(record["wrapper_pid"]) == record["wrapper_identity"] for record in running):
             return
@@ -503,8 +661,27 @@ class ManagedProcesses:
                     invalid.append(path)
                     continue
                 consumed.append(path)
+            for path in aborts:
+                try:
+                    checked_abort = _checked(json.loads(path.read_text()), ABORT_FIELDS)
+                    row = db.execute("SELECT data FROM managed_processes WHERE managed_id=?",
+                                     (checked_abort["managed_id"],)).fetchone()
+                    if row is not None:
+                        record = json.loads(row[0])
+                        if not record.get("launch_pending") or any(
+                                record.get(key) != checked_abort[key] for key in ABORT_FIELDS):
+                            raise ValueError("Managed launch reservation does not match")
+                        db.execute("DELETE FROM managed_processes WHERE managed_id=?",
+                                   (checked_abort["managed_id"],))
+                except OSError:
+                    continue
+                except (ValueError, TypeError):
+                    invalid.append(path)
+                    continue
+                consumed.append(path)
             running = db.execute("""SELECT data FROM managed_processes
-                    WHERE json_extract(data,'$.status')='running'""").fetchall()
+                    WHERE json_extract(data,'$.status')='running'
+                       OR json_extract(data,'$.launch_pending')=1""").fetchall()
             for path in files:
                 try:
                     evidence = json.loads(path.read_text())
@@ -527,9 +704,11 @@ class ManagedProcesses:
                 wrapper = record.get("wrapper_identity")
                 if wrapper is not None and self.identity(record["wrapper_pid"]) == wrapper:
                     continue
+                # A reservation whose wrapper ended may or may not have launched: report it uncertain.
+                pending = record.pop("launch_pending", None)
                 current = db.execute("SELECT json_extract(data,'$.status') FROM managed_processes "
                                      "WHERE managed_id=?", (record["managed_id"],)).fetchone()
-                if current is None or current[0] != "running" \
+                if current is None or (current[0] != "running" and not pending) \
                         or (directory / f"{record['managed_id']}.json").exists():
                     continue
                 record.pop("group_outlived", None)
@@ -544,6 +723,7 @@ class ManagedProcesses:
                     COALESCE((SELECT MIN(cursor) FROM completion_consumers),
                              (SELECT MAX(sequence) FROM completion_events))""", (_now() - RETENTION_MS,))
             db.execute("""DELETE FROM managed_processes WHERE json_extract(data,'$.status')!='running'
+                    AND COALESCE(json_extract(data,'$.launch_pending'),0)!=1
                     AND COALESCE(json_extract(data,'$.finished_at'), json_extract(data,'$.uncertain_at'),
                                  json_extract(data,'$.started_at')) < ?
                     AND NOT EXISTS (SELECT 1 FROM completion_events e
@@ -566,6 +746,7 @@ class ManagedProcesses:
         with self.store.snapshot() as db:  # The page and the count describe one database state.
             rows = [json.loads(row[0]) for row in db.execute("""SELECT data FROM managed_processes
                     WHERE json_extract(data,'$.status')='running'
+                       OR json_extract(data,'$.launch_pending')=1
                        OR COALESCE(json_extract(data,'$.finished_at'), json_extract(data,'$.uncertain_at'))>=?
                     ORDER BY CASE WHEN json_extract(data,'$.status') IN ('failed','signaled','unknown')
                                         OR json_extract(data,'$.group_outlived')=1 THEN 0
@@ -575,6 +756,7 @@ class ManagedProcesses:
                     SUM(json_extract(data,'$.status')='running'),
                     SUM(json_extract(data,'$.status')='unknown' OR json_extract(data,'$.group_outlived')=1)
                     FROM managed_processes WHERE json_extract(data,'$.status')='running'
+                       OR json_extract(data,'$.launch_pending')=1
                        OR COALESCE(json_extract(data,'$.finished_at'), json_extract(data,'$.uncertain_at'))>=?""",
                                           (cutoff,)).fetchone()
         active = None if uncertain else (running or 0)
