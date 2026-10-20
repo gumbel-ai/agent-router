@@ -6,6 +6,7 @@ from collections.abc import Callable
 from router.client import UnknownTask
 from router.client import request as router_request
 from router.daemon import ACTIVE
+from router.fleet import ROUTER_TASK_STATUSES
 from router.managed import _identifier
 
 POLL_SECONDS = 1
@@ -36,9 +37,14 @@ def _poll(latest: dict[str, dict], request: Callable, deadline: float, clock: Ca
         attempted = True
         try:
             task = request("status", {"task_id": task_id}, timeout=min(REQUEST_SECONDS, remaining), deadline=True)
+            if not isinstance(task, dict) or task.get("task_id") != task_id \
+                    or task.get("status") not in ROUTER_TASK_STATUSES:
+                raise ValueError("Malformed task status response")
         except UnknownTask:
             task = None
         except (OSError, ValueError):
+            if deadline - clock() <= 0:
+                break  # The wait's own deadline cut this read short; that is not a Router failure.
             # Unreachable, restarting or briefly failing Router: keep this task's last state
             # and still read the others, so one failing read cannot hide a ready task.
             failed = True

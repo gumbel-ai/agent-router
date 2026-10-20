@@ -39,8 +39,13 @@ class FakeRouter:
     def request(self, operation, payload, *, timeout, deadline):
         self.requests.append((operation, payload))
         self.timeouts.append(timeout)
-        self.now += min(self.latency, timeout)
+        if self.latency > timeout:
+            self.now += timeout
+            raise TimeoutError("Router request deadline expired")
+        self.now += self.latency
         state = self.rounds[self.round]
+        if callable(state.get(payload["task_id"]) if isinstance(state, dict) else None):
+            return state[payload["task_id"]]()
         if state is UNREACHABLE or state.get(payload["task_id"]) is UNREACHABLE:
             raise ValueError("Agent Router is not reachable.") from ConnectionRefusedError()
         task = state.get(payload["task_id"])
@@ -150,7 +155,7 @@ class WaitTasksTests(unittest.TestCase):
         self.assertEqual(router.now, 1)
 
     def test_request_latency_never_extends_the_deadline(self):
-        router = FakeRouter([{f"task-{index}": {"status": "running"} for index in range(5)}], latency=.3)
+        router = FakeRouter([{f"task-{index}": {"status": "running"} for index in range(5)}], latency=.25)
         result = router.wait([f"task-{index}" for index in range(5)], "any", timeout=1)
         self.assertTrue(result["timed_out"])
         self.assertLessEqual(router.now, 1)
@@ -177,6 +182,22 @@ class WaitTasksTests(unittest.TestCase):
         result = router.wait(["task-a", "task-b"], "all", timeout=1.75)
         self.assertEqual((result["timed_out"], result["daemon_unavailable"]), (True, False))
         self.assertEqual(statuses(result)["task-a"], ("running", False))
+
+    def test_malformed_status_responses_are_failed_reads_not_readiness(self):
+        for response in (None, {}, {"task_id": "task-a", "status": "bogus"}, {"task_id": "task-other",
+                                                                             "status": "failed"}, ["task-a"]):
+            with self.subTest(response=response):
+                router = FakeRouter([{"task-a": lambda response=response: response}])
+                result = router.wait(["task-a"], "any", timeout=2)
+                self.assertEqual((result["condition_met"], result["daemon_unavailable"]), (False, True))
+                self.assertEqual(statuses(result), {"task-a": ("unknown", False)})
+
+    def test_read_cut_short_by_the_wait_deadline_is_not_router_unavailability(self):
+        router = FakeRouter([{"task-a": {"status": "running"}}], latency=.25)
+        # The first read ends at 0.25 s; after sleeping to 1.25 s the next read has only 0.125 s left.
+        result = router.wait(["task-a"], "any", timeout=1.375)
+        self.assertEqual((result["timed_out"], result["daemon_unavailable"]), (True, False))
+        self.assertEqual(statuses(result), {"task-a": ("running", False)})
 
     def test_rejects_invalid_arguments(self):
         router = FakeRouter([{}])
