@@ -7,7 +7,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from router import remote_child
-from router.daemon import Controller, PhaseStopped, Runtime
+from router.daemon import Controller, PhaseStopped, Runtime, blocks_maintenance
 from router.db import Store
 from router.dispatch import canonical
 from router.fleet import FleetHost
@@ -523,6 +523,53 @@ class RemoteChildProtocolTests(unittest.TestCase):
         self.assertEqual(result["status"], "cancelling")
         with controller.store.snapshot() as db:
             self.assertIsNotNone(db.execute("SELECT 1 FROM operations WHERE request_id='cancel-a'").fetchone())
+
+    def test_uncertain_remote_forward_remains_a_maintenance_blocker_until_replay(self):
+        controller = Controller.__new__(Controller)
+        controller.settings = SimpleNamespace(delegation_enabled=True, max_attempts=3)
+        controller.lifecycle_lock = threading.Lock()
+        controller.changed = threading.Event()
+        controller.draining = False
+        controller.store = self.remote_store(
+            {"task_id": "task-a", "status": "running", "execution_stopped": False}
+        )
+        payload = {"task_id": "task-a", "request_id": "cancel-a"}
+        with controller.store.transaction() as db:
+            db.execute(
+                "INSERT INTO authorizations(session_id,request_id,operation,payload,instruction_id) "
+                "VALUES(?,?,?,?,?)",
+                ("S", "cancel-a", "cancel", canonical(payload), "instruction-a"),
+            )
+        with patch.object(Controller, "forward_remote", side_effect=OSError("reply lost")), \
+                self.assertRaisesRegex(OSError, "reply lost"):
+            controller.handle("cancel", payload)
+        uncertain = controller.store.get("task-a")
+        self.assertEqual(
+            uncertain["remote_forward_pending"],
+            {"operation": "cancel", "request_id": "cancel-a"},
+        )
+        self.assertTrue(blocks_maintenance(uncertain))
+
+        old = {"task_id": "task-a", "request_id": "cancel-old"}
+        with controller.store.transaction() as db:
+            db.execute(
+                "INSERT INTO operations VALUES(?,?,?,?,?)",
+                ("S", "cancel-old", "cancel", canonical(old), "task-a"),
+            )
+        controller.handle("cancel", old)
+        self.assertEqual(
+            controller.store.get("task-a")["remote_forward_pending"],
+            {"operation": "cancel", "request_id": "cancel-a"},
+        )
+
+        with patch.object(
+            Controller,
+            "forward_remote",
+            return_value={"status": "cancelling", "task_id": "task-a"},
+        ):
+            result = controller.handle("cancel", payload)
+        self.assertEqual(result["status"], "cancelling")
+        self.assertNotIn("remote_forward_pending", controller.store.get("task-a"))
 
     def test_remote_cleanup_failure_is_projected_after_one_retry(self):
         store = self.remote_store({"task_id": "task-a", "status": "closed", "execution_stopped": True,

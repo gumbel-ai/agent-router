@@ -99,6 +99,70 @@ class ManagedRunTests(unittest.TestCase):
             self.ack_completion(event)
         self.assertEqual(outcomes, ["completed", "failed", "failed", "uncertain"])
 
+    def test_launch_requires_a_confirmed_reservation_before_popen(self):
+        malformed = [
+            {},
+            {
+                "reserved": True,
+                "managed_id": "wrong",
+                "wrapper_pid": os.getpid(),
+                "wrapper_identity": parent_and_identity(os.getpid())[1],
+            },
+        ]
+        for response in malformed:
+            with (
+                self.subTest(response=response),
+                patch("router.managed.request", return_value=response),
+                patch(
+                    "router.managed.subprocess.Popen",
+                    side_effect=AssertionError("must not launch"),
+                ),
+                self.assertRaisesRegex(ValueError, "could not reserve"),
+            ):
+                run([sys.executable, "-c", "pass"], "guarded", None, None, self.state)
+
+    def test_lost_reservation_reply_refuses_launch_and_remains_uncertain(self):
+        def lose_reservation_reply(operation, payload, timeout):
+            self.assertEqual(operation, "managed_reserve")
+            self.request(operation, payload, timeout)
+            raise OSError("reply lost after commit")
+
+        with (
+            patch("router.managed.request", side_effect=lose_reservation_reply),
+            patch(
+                "router.managed.subprocess.Popen",
+                side_effect=AssertionError("must not launch"),
+            ),
+            redirect_stderr(io.StringIO()),
+            self.assertRaisesRegex(ValueError, "could not reserve"),
+        ):
+            run([sys.executable, "-c", "pass"], "uncertain", None, None, self.state)
+        record = self.managed()["uncertain"]
+        self.assertTrue(record["launch_pending"])
+        self.assertEqual(record["status"], "unknown")
+        self.assertIsNone(self.control.managed.records()[1])
+        # Restart reconstruction keeps the reservation uncertain and does not
+        # synthesize a completion for a command whose launch outcome is unknown.
+        reloaded = ManagedProcesses(
+            self.control.store,
+            self.control.host.host_id,
+            self.state,
+            identity=lambda _pid: None,
+        )
+        self.assertIsNone(reloaded.records()[1])
+        self.assertEqual(self.next_completion()["status"], "pending")
+
+    def test_popen_failure_aborts_the_prelaunch_reservation(self):
+        with (
+            patch(
+                "router.managed.subprocess.Popen",
+                side_effect=FileNotFoundError("missing"),
+            ),
+            self.assertRaises(FileNotFoundError),
+        ):
+            self.run_command("pass", label="not-started")
+        self.assertEqual(self.managed(), {})
+
     def test_declared_work_item_id_is_refused_before_command_launch(self):
         with patch("router.managed.subprocess.Popen", side_effect=AssertionError("must not launch")):
             for value in (True, 1, [], {}, "", " leading", "trailing ", "line\nbreak", "x" * 241):
@@ -122,8 +186,10 @@ class ManagedRunTests(unittest.TestCase):
 
     def test_lost_start_and_finish_replies_replay_evidence_without_duplicate_events(self):
         def lose_reply(operation, payload, timeout):
-            self.request(operation, payload, timeout)
-            raise OSError("reply lost after commit")
+            result = self.request(operation, payload, timeout)
+            if operation != "managed_reserve":
+                raise OSError("reply lost after commit")
+            return result
 
         with patch("router.managed.request", side_effect=lose_reply):
             self.assertEqual(run([sys.executable, "-c", "pass"], "batch-job", None, None, self.state,
