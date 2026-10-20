@@ -365,6 +365,9 @@ def main() -> None:
     fleet_ack.add_argument("--subscription-id", required=True)
     fleet_ack.add_argument("--config", type=Path)
     fleet_ack.add_argument("event_id")
+    dashboard = commands.add_parser("dashboard", help="Serve a live fleet dashboard on localhost")
+    dashboard.add_argument("--port", type=int, default=8765)
+    dashboard.add_argument("--config", type=Path)
     daemon = commands.add_parser("daemon")
     daemon.add_argument("action", choices=["start", "stop"])
     commands.add_parser("plugin-path", help="Print the bundled Claude plugin directory")
@@ -582,6 +585,15 @@ def main() -> None:
             print(json.dumps(result, separators=(",", ":")))
             if failed:
                 parser.exit(1, "Agent Router: completion delivery failed; inspect per-host errors.\n")
+        elif args.command == "dashboard":
+            from router.dashboard import make_server
+            from router.fleet import DEFAULT_CONFIG, load_fleet_config, query_fleet
+            from router.fleet_snapshot import AlertHistory
+            config = load_fleet_config(args.config or DEFAULT_CONFIG)
+            alert_history = AlertHistory()
+            with make_server(lambda: query_fleet(config, alert_history=alert_history), args.port) as server:
+                print(f"Router dashboard: http://127.0.0.1:{server.server_address[1]}/ (Ctrl-C to stop)", flush=True)
+                server.serve_forever()
         elif args.command == "fleet":
             from router.fleet import (
                 DEFAULT_CONFIG,
