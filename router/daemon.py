@@ -901,7 +901,7 @@ class Controller:
                                  "existing review lifecycle")
             task["status"] = "accepted"
         elif (outcome == "rejected" and (state == "awaiting_review" or
-                state == "failed" and task["execution_stopped"] and
+                state == "failed" and task["execution_stopped"] and "resolved_model" in task and
                 completion_declared and completion_status != "satisfied")) or (
                 outcome == "continue" and state == "blocked"):
             if task["attempts"] >= self.settings.max_attempts:
@@ -1251,7 +1251,7 @@ class Runtime:
                 task,
                 include_tracing_credentials=name == "child",
             )
-        if name == "child" and task["executor"] in {"codex", "claude"}:
+        if name == "child" and task["executor"] in {"codex", "claude"} and "launch" in task["invocation"]:
             launch_preflight(task, command, environment, cwd)
         process = None
         def register(record):
@@ -1633,7 +1633,10 @@ class Runtime:
                             updates[field] = status[field]
                     if "completion" in task["invocation"]:
                         updates["completion_check"] = completion_projection(status.get("completion_check"))
-                        if updates["completion_check"]["status"] != "satisfied":
+                        # A discarded closure needs no acceptance evidence.
+                        if (updates["completion_check"]["status"] != "satisfied"
+                                and not (remote_status == "closed"
+                                         and status.get("disposition") == "discarded")):
                             completion_diagnostic = updates["completion_check"]
                             raise RemoteChildError("invalid_response", "Remote terminal state lacks satisfied "
                                                    "declared completion evidence")

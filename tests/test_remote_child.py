@@ -288,6 +288,37 @@ class RemoteChildProtocolTests(unittest.TestCase):
         load.assert_not_called()
         self.assertEqual(task["status"], "awaiting_review")
 
+    def test_validated_remote_failed_repair_is_forwarded(self):
+        controller = Controller.__new__(Controller)
+        controller.settings = SimpleNamespace(max_attempts=2)
+        diagnostic = {"status": "violated", "violations": [{"reason": "required output missing"}],
+                      "unchecked": [], "evidence_source": "stopped_worktree"}
+        task = {"task_id": "task-a", "remote_host": "worker", "remote_task_id": "task-a",
+                "status": "failed", "attempts": 0, "execution_stopped": True,
+                "resolved_model": "provider/model-a", "invocation": {"completion": {"files": ["result.txt"]}},
+                "completion_check": diagnostic, "review_retries": 0, "continuations": 0,
+                "review_history": []}
+        payload = {"task_id": "task-a", "request_id": "repair", "expected_attempt": 0,
+                   "outcome": "rejected", "feedback": "Repair declared output"}
+        sent = []
+
+        class Transport:
+            def __init__(self, _host, _timeout):
+                pass
+
+            def review(self, forwarded):
+                sent.append(forwarded)
+                return {"status": "retrying", "task_id": "task-a"}
+
+        config = SimpleNamespace(hosts=(FleetHost("worker", "ssh", target="example"),),
+                                 ssh_timeout_seconds=1)
+        with patch("router.fleet.load_fleet_config", return_value=config), \
+                patch("router.remote_child.RemoteChildTransport", Transport):
+            self.assertEqual(controller.forward_remote(task, "review", payload)["status"], "retrying")
+        self.assertEqual(sent, [payload])
+        self.assertEqual(task["status"], "failed")
+        self.assertNotIn("setup_command", task)
+
     def test_known_unsent_task_closes_without_fleet_config(self):
         controller = Controller.__new__(Controller)
         task = {"task_id": "task-a", "remote_host": "worker", "status": "failed", "execution_stopped": True}
@@ -413,9 +444,14 @@ class RemoteChildProtocolTests(unittest.TestCase):
         ]
         config = SimpleNamespace(hosts=(FleetHost("worker", "ssh", target="example"),),
                                  ssh_timeout_seconds=1)
-        for remote_status in ("accepted", "integrated", "closed"):
+        for remote_status, disposition in (("accepted", None), ("accepted", "discarded"),
+                                           ("integrated", None), ("integrated", "discarded"),
+                                           ("closed", None), ("closed", "integrated"),
+                                           ("closed", "discarded")):
             for name, included, diagnostic, expected in diagnostics:
                 response = {"status": remote_status, "task_id": "task-a"}
+                if disposition is not None:
+                    response["disposition"] = disposition
                 if included:
                     response["completion_check"] = diagnostic
 
@@ -434,13 +470,14 @@ class RemoteChildProtocolTests(unittest.TestCase):
                 })
                 runtime = Runtime.__new__(Runtime)
                 runtime.store = store
-                with self.subTest(remote_status=remote_status, diagnostic=name), \
+                with self.subTest(remote_status=remote_status, disposition=disposition, diagnostic=name), \
                         patch("router.fleet.load_fleet_config", return_value=config), \
                         patch("router.remote_child.RemoteChildTransport", Transport):
                     runtime.execute_remote("task-a", recovered=True)
                 task = store.get("task-a")
                 self.assertEqual(task["completion_check"]["status"], expected)
-                if expected == "satisfied":
+                if (expected == "satisfied"
+                        or remote_status == "closed" and disposition == "discarded"):
                     self.assertEqual(task["status"], remote_status)
                     self.assertTrue(task["execution_stopped"])
                 else:
