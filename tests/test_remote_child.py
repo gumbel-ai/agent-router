@@ -414,7 +414,8 @@ class RemoteChildProtocolTests(unittest.TestCase):
         config = SimpleNamespace(hosts=(FleetHost("worker", "ssh", target="example"),),
                                  ssh_timeout_seconds=1)
         for remote_status, disposition in (("accepted", None), ("integrated", None), ("closed", None),
-                                           ("closed", "integrated"), ("closed", "discarded")):
+                                           ("closed", "integrated"), ("closed", "discarded"),
+                                           ("accepted", "discarded"), ("integrated", "discarded")):
             for name, included, diagnostic, expected in diagnostics:
                 response = {"status": remote_status, "task_id": "task-a"}
                 if disposition is not None:
@@ -443,7 +444,7 @@ class RemoteChildProtocolTests(unittest.TestCase):
                     runtime.execute_remote("task-a", recovered=True)
                 task = store.get("task-a")
                 self.assertEqual(task["completion_check"]["status"], expected)
-                if expected == "satisfied" or disposition == "discarded":
+                if expected == "satisfied" or (remote_status, disposition) == ("closed", "discarded"):
                     self.assertEqual(task["status"], remote_status)
                     self.assertTrue(task["execution_stopped"])
                 else:

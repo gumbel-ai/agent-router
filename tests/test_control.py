@@ -193,6 +193,11 @@ class ControlTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Invalid review outcome"):
             self.router.review(unvalidated, {"task_id": "task-a", "request_id": "unvalidated", "expected_attempt": 1,
                                              "outcome": "rejected", "feedback": "Repair"})
+        # The serving Router validated a remote task; the parent never stores setup_command.
+        remote = {**unvalidated, "remote_host": "worker"}
+        self.router.review(remote, {"task_id": "task-a", "request_id": "remote-repair", "expected_attempt": 1,
+                                    "outcome": "rejected", "feedback": "Repair"})
+        self.assertEqual(remote["status"], "retrying")
 
     def test_request_status_recovers_committed_start_without_reauthorizing_or_relaunching(self):
         selection = {"session_id": "S", "request_id": "R", "host_id": self.router.host.host_id}
