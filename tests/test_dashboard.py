@@ -23,9 +23,10 @@ def serving(fetch):
         thread.join(5)
 
 
-def get(url: str) -> tuple[int, str, bytes]:
+def get(url: str, host: str | None = None) -> tuple[int, str, bytes]:
+    request = urllib.request.Request(url, headers={"Host": host} if host else {})
     try:
-        with urllib.request.urlopen(url, timeout=5) as response:
+        with urllib.request.urlopen(request, timeout=5) as response:
             return response.status, response.headers["Content-Type"], response.read()
     except urllib.error.HTTPError as error:
         return error.code, error.headers["Content-Type"], error.read()
@@ -50,6 +51,13 @@ class DashboardTests(unittest.TestCase):
     def test_unknown_path_is_not_found(self):
         with serving(lambda: RESULT) as base:
             self.assertEqual(get(base + "/other")[0], 404)
+
+    def test_rejects_non_loopback_host_header(self):
+        with serving(lambda: RESULT) as base:
+            port = base.rsplit(":", 1)[1]
+            self.assertEqual(get(base + "/api/fleet", "attacker.example")[0], 403)
+            self.assertEqual(get(base + "/api/fleet", f"attacker.example:{port}")[0], 403)
+            self.assertEqual(get(base + "/api/fleet", f"localhost:{port}")[0], 200)
 
     def test_binds_loopback_only(self):
         server = make_server(lambda: RESULT, 0)

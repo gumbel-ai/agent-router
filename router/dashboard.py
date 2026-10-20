@@ -14,7 +14,12 @@ def make_server(fetch: Callable[[], dict], port: int) -> ThreadingHTTPServer:
 
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self) -> None:
-            if self.path == "/":
+            # Only loopback names, so a DNS-rebound website cannot read fleet data.
+            port = self.server.server_address[1]
+            hosts = self.headers.get_all("Host") or []
+            if len(hosts) != 1 or hosts[0] not in {f"127.0.0.1:{port}", f"localhost:{port}"}:
+                self._send(403, "text/plain; charset=utf-8", b"Forbidden host")
+            elif self.path == "/":
                 self._send(200, "text/html; charset=utf-8", page)
             elif self.path == "/api/fleet":
                 try:
