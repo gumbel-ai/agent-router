@@ -5,7 +5,7 @@ On macOS it also installs the background service. On Linux it installs no servic
 run `router daemon start` in a separate terminal and keep it running, then use
 `router enable` from another terminal. Before rerunning setup, stop any manual daemon
 with `router daemon stop`; restart it after setup. The macOS `router service`
-commands do not manage a Linux daemon. Linux live-host verification is **NOT CHECKED**.
+commands do not manage a Linux daemon. This Linux path has been verified on a live host.
 `router uninstall` removes the CLI and Router's user plugin installation while
 retaining configuration and history; on Linux, stop the manual daemon first.
 

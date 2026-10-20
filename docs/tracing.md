@@ -107,15 +107,15 @@ Without a serving selection the child records `available: false` with a reason.
 
 ## Other executors
 
-Claude remains explicitly unavailable for the default route:
+The default Claude route remains unavailable; only the explicit Claude route below traces:
 
 | Executor | Reason recorded when tracing is requested |
 | --- | --- |
-| Claude | Default children run with `--safe-mode`; the explicit candidate below uses `--restricted` and a selected plugin, but real tracer exports remain unverified. |
+| Claude | Default children run with `--safe-mode`; the explicit route below uses `--restricted` and a selected plugin. |
 
 Their tracing request is retained in task and attempt history with `available:
 false`; their child environments also strip Langfuse variables. The explicit
-Claude candidate below is the only exception. No executor fallback is attempted.
+Claude route below is the only exception. No executor fallback is attempted.
 
 ## Verification boundary
 
@@ -130,7 +130,7 @@ a Codex child on a Linux host over SSH from a parent on another machine; Langfus
 received its trace with the parent's Router task ID, the serving host ID and the
 work-item ID.
 
-## Explicit Claude candidate (live verification required)
+## Explicit Claude route
 
 An operator repository entry may contain one `claude_tracing` JSON string:
 
@@ -143,7 +143,7 @@ audited Langfuse Observability Plugin 1.2.1 source from the durable-export fork:
 `git clone https://github.com/gumbel-ai/claude-observability-plugin` and check out
 `d5829be6628cb67dc45eca699575348a152ae565`. Router verifies the pinned
 manifest, hooks and digest, freezes the private selection per task, and refuses
-launch if the source changes. The candidate uses `--restricted`, `--plugin-dir`
+launch if the source changes. The route uses `--restricted`, `--plugin-dir`
 and empty setting sources.
 
 Claude loads a `--plugin-dir` plugin under the `langfuse-observability@inline`
@@ -169,14 +169,13 @@ Router sets `CC_LANGFUSE_STATE_DIR` to private task storage,
 `CC_LANGFUSE_TRACE_SEED` to the child session ID, and `CC_LANGFUSE_TRACE_TAGS`
 to the Router task and host identifiers plus a bounded work-item tag when
 supported. Router usage and cost accounting remain unchanged, and
-`traced: "unknown"` remains until an exporter is independently verified.
+the correlation export still reports `traced: "unknown"`.
 
 Running `router init` without `--tracing` also removes `claude_tracing`. A task
 selected before such a revocation refuses its next launch instead of continuing
-untraced, and selections recorded by earlier builds of this candidate (schema 1,
+untraced, and selections recorded by earlier builds of this route (schema 1,
 native plugin options) refuse to resume; start a new task.
 
-The required live checks—a fresh Router Claude export, a rejected/resumed
-export, environment isolation for non-selected processes, and changed-plugin
-refusal—remain pending on an approved Claude environment. Synthetic hook tests
-do not count as tracer-export evidence.
+A live check with the pinned fork exported a fresh Router-launched Claude child
+and a rejected/resumed attempt to Langfuse as separate per-attempt traces with
+exact tokens and cost.

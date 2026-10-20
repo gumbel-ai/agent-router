@@ -1,18 +1,17 @@
 # Codex lifecycle observation: design note
 
 This note records what the Codex CLI's hooks provide, what they do not, and how Agent
-Router should map them onto its existing session and agent lifecycle. It is the
-output of TODO item 1 and the input to items 3 (transition table) and 4 (native Codex
-observation). No product code changes accompany it.
+Router should map them onto its existing session and agent lifecycle. It informed
+Router's native Codex observation.
 
 **Pinned version:** `codex-cli 0.162.1`. Everything below was checked against that
-version only. Expect drift in other versions; item 4 must re-verify on upgrade.
+version only. Expect drift in other versions; re-verify on upgrade.
 
 **Evidence markers:**
 - **V** verified in a real local Codex session (hook payloads captured to a log),
 - **D** stated in the official hook documentation (<https://learn.chatgpt.com/docs/hooks>),
 - **S** read from the source at tag `rust-v0.162.1` (`codex-rs/hooks`, `codex-rs/core`),
-- **I** inferred, not verified. Inferred behaviour must be tested in item 4 before it
+- **I** inferred, not verified. Inferred behaviour must be tested before it
   is relied on.
 
 ## Events
@@ -79,7 +78,7 @@ Codex fits Router's existing keys, `(host_id, source, session_id)` for sessions 
 deduplication key for a Codex event is `(session_id, agent_id, turn_id, tool_use_id,
 hook_event_name)`. [I]
 
-This namespace is shared with the Langfuse correlation bridge (TODO item 9): runtime is
+This namespace is shared with the Langfuse correlation export: runtime is
 `claude` or `codex`, and Langfuse traces join on `(runtime, session_id)`.
 
 ## Lifecycle mapping notes
@@ -88,7 +87,7 @@ This namespace is shared with the Langfuse correlation bridge (TODO item 9): run
   example after `send_input`), and `SubagentStart` fires only at spawn or fork.
   `SubagentStop` therefore maps to *idle*; later tool events carrying the same
   `agent_id` mean it is running again. A subagent becomes *stopped* only when its root
-  session ends. [I from source; verify in item 4]
+  session ends. [I from source]
 - **Root `Stop` can be continued.** Another hook may block `Stop` and create a
   continuation prompt, so further events can follow a `Stop` in the same session. The
   transition table must treat this like a new turn, not a reopened terminal state. [D]
@@ -168,11 +167,10 @@ Router's `failed` agent state therefore never appears for Codex.
   `AGENT_ROUTER_*` variables; the plugin's hook command must locate the Router socket
   itself. [S]
 - **Detectability.** Router cannot tell an untrusted or disabled hook from an idle
-  Codex: both produce no events. Item 4 must decide how to report this. Options:
-  record the last Codex event seen per host, and, on explicit request, read Codex's
-  config read-only for Router's trusted-hash entries.
+  Codex: both produce no events. `router status` reports
+  readiness instead (see below).
 
-## Live verification (item 4b)
+## Live verification
 
 Verified on 2026-10-17 with Codex CLI 0.162.1. Real `codex exec` sessions ran with
 this repository's `router/plugin/codex/hooks.json` supplied as per-run overrides,
@@ -242,7 +240,7 @@ Whether ordinary interactive or exec startup creates the required control socket
 is **NOT CHECKED**; this fixture did not exercise that client startup path. See the
 [explicit fixture setup](project-enablement.md#codex-prerequisites).
 
-## Testing implications for item 4
+## Testing implications
 
 - Router-launched Codex children disable delegation and ignore user config
   (`router/child.py`), so they cannot stand in for native Codex sessions.
