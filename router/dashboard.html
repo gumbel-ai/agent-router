@@ -88,7 +88,7 @@ const REFRESH_MS = 3000;
 
 const TONES = {
   running: "ok", available: "ok", completed: "ok", accepted: "ok", integrated: "ok",
-  tool_running: "ok", idle: "info", stopped: "info", exited: "info", created: "info", validating: "info", preparing: "info",
+  idle: "info", stopped: "info", exited: "info", created: "info", validating: "info", preparing: "info",
   retrying: "info", cancelling: "info", cancelled: "info", closed: "info",
   needs_input: "warn", needs_attention: "bad", awaiting_review: "warn", busy: "warn", partial: "warn", unknown: "warn",
   failed: "bad", signaled: "bad", interrupted: "bad", blocked: "bad", offline: "bad", saturated: "bad",
@@ -144,13 +144,15 @@ function section(title, rows) {
 
 // ---- rendering --------------------------------------------------------------
 
-const ACTIVE = new Set(["running", "tool_running", "created", "validating", "preparing", "retrying", "cancelling"]);
+const ACTIVE = new Set(["running", "created", "validating", "preparing", "retrying", "cancelling"]);
 const ATTENTION = new Set(["needs_input", "needs_attention", "awaiting_review", "blocked", "failed", "interrupted", "signaled"]);
 
 function workState(record) {
   if (record.status === "unknown" || !record.status) return "unknown";
+  if (record.status === "idle" && record.last_event === "stop_failure") return "failed";
   if (record.needs_input) return "needs_input";
-  if (record.status === "idle" && record.inflight_tool_count > 0) return record.tool_visibility_partial ? "unknown" : "tool_running";
+  // Counts retain expired correlations; the wire record cannot prove tool freshness.
+  if (record.status === "idle" && record.inflight_tool_count > 0) return "unknown";
   return record.status;
 }
 

@@ -311,6 +311,9 @@ item before requesting review.
 
 **Ordering and terminal state**
 
+- A session can be idle after a failed turn. Trace structured terminal events such as
+  `stop_failure` through the producer and presentation; do not hide failures in idle
+  history or override an explicitly unknown session state.
 - Every terminal kind (`stop` and `failed`) needs the same handling for delayed,
   same-timestamp, result-watermark, and session-end cases.
 - Watermarks must advance on metadata-only paths as well as state-changing paths.
@@ -330,6 +333,9 @@ item before requesting review.
 
 **Clocks and freshness**
 
+- Retained tool correlations are not proof of live work. When a wire count omits
+  freshness evidence, do not promote an idle record to running. Test the expired-tool
+  case with a real observer-produced record, not only a hand-written fixture.
 - Never compare one host's wall clock with another's. Advance the source clock by
   monotonic elapsed time.
 - Choose the conservative boundary: measure from request start when aging a sample,

@@ -12,8 +12,10 @@ const cases = [
   [{ status: "preparing" }, "active"],
   [{ status: "retrying" }, "active"],
   [{ status: "cancelling" }, "active"],
-  [{ status: "idle", inflight_tool_count: 1 }, "active"],
+  [{ status: "idle", inflight_tool_count: 1 }, "uncertain"],
   [{ status: "idle", inflight_tool_count: 1, tool_visibility_partial: true }, "uncertain"],
+  [{ status: "idle", last_event: "stop_failure" }, "attention"],
+  [{ status: "unknown", last_event: "stop_failure" }, "uncertain"],
   [{ status: "idle", needs_input: true }, "attention"],
   ...["awaiting_review", "blocked", "failed", "interrupted", "signaled"].map(status => [{ status }, "attention"]),
   ...["cleanup_failed", "shutdown_unconfirmed", "group_outlived"].map(flag => [
@@ -30,7 +32,13 @@ for (const [record, expected] of cases) {
   assert.equal(context.workGroup(record), expected, JSON.stringify(record));
 }
 assert.equal(context.workState({ status: "unknown", needs_input: true }), "unknown");
-assert.equal(context.workState({ status: "idle", inflight_tool_count: 1 }), "tool_running");
+assert.equal(context.workState({ status: "idle", inflight_tool_count: 1 }), "unknown");
+assert.equal(context.workState({ status: "idle", last_event: "stop_failure" }), "failed");
+if (process.argv[2]) {
+  const wire = JSON.parse(process.argv[2]);
+  assert.equal(context.workGroup(wire.expired), "uncertain", "An expired retained tool must not imply live work");
+  assert.equal(context.workGroup(wire.failed), "attention", "A failed root turn must not disappear into idle history");
+}
 
 // A command's owner is not its identity, even when multiple commands share that owner.
 for (const managed_id of ["command-one", "command-two"]) {

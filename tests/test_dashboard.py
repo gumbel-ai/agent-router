@@ -2,6 +2,7 @@ import json
 import shutil
 import socket
 import subprocess
+import tempfile
 import threading
 import unittest
 import urllib.error
@@ -12,6 +13,8 @@ from pathlib import Path
 from unittest.mock import patch
 
 from router.dashboard import make_server
+from router.db import Store, now_ms
+from router.sessions import MAX_INFLIGHT_AGE_MS, SessionObserver
 
 RESULT = {"schema_version": 1, "generated_at": 1, "partial": False, "version_mismatch": False, "hosts": []}
 
@@ -60,8 +63,21 @@ class DashboardTests(unittest.TestCase):
         chunks = []
         root = Path(__file__).resolve().parents[1]
         Scripts().feed((root / "router" / "dashboard.html").read_text())
+        with tempfile.TemporaryDirectory() as temp:
+            observer = SessionObserver(Store(Path(temp) / "router.sqlite3", "host"), "host")
+            at = now_ms() - 1000
+            observer.observe({"source": "claude", "session_id": "expired", "kind": "tool_start",
+                              "tool_use_id": "old", "observed_at": at - MAX_INFLIGHT_AGE_MS - 1})
+            expired = observer.observe({"source": "claude", "session_id": "expired", "kind": "notification",
+                                        "notification_type": "agent_completed", "observed_at": at})
+            failed = observer.observe({"source": "claude", "session_id": "failed", "kind": "stop_failure",
+                                       "observed_at": at})
+        self.assertEqual((expired["status"], expired["inflight_tool_count"], expired["tool_visibility_partial"]),
+                         ("idle", 1, False))
+        self.assertEqual((failed["status"], failed["last_event"]), ("idle", "stop_failure"))
         result = subprocess.run(
-            [shutil.which("node"), str(root / "tests" / "dashboard_contract.cjs")],
+            [shutil.which("node"), str(root / "tests" / "dashboard_contract.cjs"),
+             json.dumps({"expired": expired, "failed": failed})],
             input="".join(chunks), capture_output=True, text=True, timeout=15, check=False,
         )
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
