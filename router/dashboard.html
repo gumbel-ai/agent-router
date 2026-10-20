@@ -79,7 +79,7 @@ const TONES = {
   running: "ok", available: "ok", completed: "ok", accepted: "ok", integrated: "ok",
   idle: "info", stopped: "info", created: "info", validating: "info", preparing: "info",
   retrying: "info", cancelling: "info", cancelled: "info", closed: "info",
-  needs_input: "warn", awaiting_review: "warn", busy: "warn", unknown: "warn",
+  needs_input: "warn", awaiting_review: "warn", busy: "warn", partial: "warn", unknown: "warn",
   failed: "bad", interrupted: "bad", blocked: "bad", offline: "bad", saturated: "bad",
 };
 
@@ -139,10 +139,15 @@ function section(title, rows) {
 
 // ---- rendering --------------------------------------------------------------
 
+// Session IDs are unique per source only, so subagents join on (source, session ID).
+function sessionKey(source, sessionId) {
+  return JSON.stringify([source, sessionId]);
+}
+
 function sessionRows(snapshot, now) {
   const agentsByParent = new Map();
   for (const agent of snapshot.agents || []) {
-    const key = agent.parent_session_id;
+    const key = sessionKey(agent.source, agent.parent_session_id);
     if (!agentsByParent.has(key)) agentsByParent.set(key, []);
     agentsByParent.get(key).push(agent);
   }
@@ -161,8 +166,9 @@ function sessionRows(snapshot, now) {
       activity: session.activity || (session.last_event && `last: ${session.last_event}`) || session.cwd,
       time: since(session.started_at, now),
     }));
-    rows.push(...(agentsByParent.get(session.session_id) || []).map(agentRow));
-    agentsByParent.delete(session.session_id);
+    const key = sessionKey(session.source, session.session_id);
+    rows.push(...(agentsByParent.get(key) || []).map(agentRow));
+    agentsByParent.delete(key);
   }
   for (const orphans of agentsByParent.values()) rows.push(...orphans.map(agentRow));
   return rows;
@@ -204,7 +210,13 @@ function metrics(capacity) {
     ...items.map(([label, value]) => append(el("span", null, `${label} `), el("b", null, value))));
 }
 
-function hostCard(record, now) {
+function partialRows(snapshot) {
+  return Object.entries(snapshot.errors || {}).map(([part, message]) => append(el("div", "alert"),
+    el("span", "chip warn", words(part)), el("span", "evidence", message)));
+}
+
+// Host timestamps are compared with that host's own clock, never the viewer's.
+function hostCard(record) {
   const card = el("div", "host");
   const head = append(el("div", "host-head"), el("h2", null, record.name));
   card.appendChild(head);
@@ -215,8 +227,11 @@ function hostCard(record, now) {
   }
   const snapshot = record.snapshot;
   const capacity = snapshot.capacity || {};
-  append(head, chip(capacity.capacity_state), el("span", "chip", snapshot.host.platform), metrics(capacity));
+  const now = snapshot.generated_at;
+  append(head, chip(capacity.capacity_state), snapshot.partial && chip("partial"),
+         el("span", "chip", snapshot.host.platform), metrics(capacity));
   const sections = [
+    section("Incomplete data", partialRows(snapshot)),
     section("Sessions & subagents", sessionRows(snapshot, now)),
     section("Router children", routerTaskRows(snapshot, now)),
     section("Managed runs", managedRows(snapshot, now)),
@@ -229,26 +244,26 @@ function hostCard(record, now) {
 function summary(result) {
   const live = result.hosts.filter(host => host.ok).map(host => host.snapshot);
   const count = key => live.reduce((total, snapshot) => total + (snapshot[key] || []).length, 0);
+  // Counts from a partial snapshot are lower bounds.
+  const bound = live.some(snapshot => snapshot.partial) ? "≥" : "";
   const waiting = live.reduce((total, snapshot) =>
     total + (snapshot.sessions || []).filter(session => session.needs_input).length
           + (snapshot.agents || []).filter(agent => agent.status === "needs_input").length, 0);
   const stats = [
     [`${live.length}/${result.hosts.length}`, "Hosts online"],
-    [count("sessions"), "Sessions"],
-    [count("agents"), "Subagents"],
-    [count("router_tasks"), "Router children"],
-    [waiting, "Needs input"],
+    [bound + count("sessions"), "Sessions"],
+    [bound + count("agents"), "Subagents"],
+    [bound + count("router_tasks"), "Router children"],
+    [bound + waiting, "Needs input"],
   ];
   return append(el("div", "summary"),
     ...stats.map(([value, label]) => append(el("div", "stat"), el("b", null, value), el("span", null, label))));
 }
 
 function render(result) {
-  const now = result.generated_at;
-  document.getElementById("app").replaceChildren(
-    summary(result), ...result.hosts.map(record => hostCard(record, now)));
+  document.getElementById("app").replaceChildren(summary(result), ...result.hosts.map(hostCard));
   document.getElementById("updated").textContent =
-    `Updated ${new Date(now).toLocaleTimeString()}`;
+    `Updated ${new Date(result.generated_at).toLocaleTimeString()}`;
   document.getElementById("live").classList.remove("stale");
 }
 
