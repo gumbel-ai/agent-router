@@ -38,7 +38,7 @@ router enable            # in each Git project to observe; commit the files it w
 router status --watch    # sessions, subagents and Router children on this machine
 ```
 
-Then use plain `claude` or `codex`. To delegate to child agents, run `router init` (OpenCode), `router init --executor codex`, or see [Claude children](docs/claude-executor.md). Optional Langfuse tracing: [child tracing](docs/tracing.md).
+Start fresh sessions (for Codex, trust the project and approve Router's hooks with `/hooks`; see [project enablement](docs/project-enablement.md)), then use plain `claude` or `codex`. To delegate to child agents, run `router init` (OpenCode), `router init --executor codex`, or see [Claude children](docs/claude-executor.md). Optional Langfuse tracing: [child tracing](docs/tracing.md).
 
 ## Fleet and dashboard
 
