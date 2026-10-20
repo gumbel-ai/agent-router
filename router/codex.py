@@ -45,6 +45,8 @@ def collect(task: dict, event: dict) -> None:
             task["executor_activity"] = item["type"][:80]
         if kind == "item.completed" and item.get("type") == "agent_message" and isinstance(item.get("text"), str):
             task["summary"] = "\n".join(filter(None, (task.get("summary"), item["text"])))[-8000:]
+            if "completion" in task.get("invocation", {}):
+                task["completion_final_response_present"] = bool(item["text"].strip())
     elif kind == "turn.completed":
         task["executor_completed"] = True
         raw = event.get("usage")

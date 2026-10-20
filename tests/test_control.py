@@ -98,10 +98,120 @@ class ControlTests(unittest.TestCase):
         instruction = self.submission()
         for index, value in enumerate((None, True, 1, [], {}, "", " leading", "trailing ", "line\nbreak", "x" * 241)):
             payload = {**self.payload(instruction, f"invalid-{index}"), "work_item_id": value}
-            self.authorize(payload)
             with self.subTest(value=value), self.assertRaisesRegex(ValueError, "work_item_id"):
-                self.router.handle("start", payload)
+                self.authorize(payload)
         self.assertEqual(self.router.store.all(), [])
+
+    def test_invalid_schema_never_reserves_authorization_and_hook_needs_no_daemon(self):
+        import json
+        import shlex
+
+        from router import hooks
+
+        instruction = self.submission()
+        start = self.payload(instruction)
+        invalid = [("start", {**start, "timeout_seconds": 1}),
+                   ("start", {key: value for key, value in start.items() if key != "model"}),
+                   ("start", {**start, "context": []}),
+                   ("review", {"task_id": "task-x", "request_id": "bad-review", "request_version": "1"}),
+                   ("review", {"task_id": "task-x", "request_id": "bad-review", "expected_attempt": True, "outcome": "accepted"}),
+                   ("review", {"task_id": "task-x", "request_id": "negative-review", "expected_attempt": -1, "outcome": "accepted"}),
+                   ("cancel", {"task_id": "task-x", "request_id": "bad-cancel", "extra": 1}),
+                   ("close", {"task_id": "task-x", "request_id": "bad-close", "disposition": "discarded", "keep_artifacts": 1})]
+        for operation, payload in invalid:
+            with self.subTest(operation=operation, payload=payload):
+                command = shlex.join(["router", operation, "--json", json.dumps(payload)])
+                with patch.object(hooks, "request", side_effect=AssertionError("invalid schema reached socket")):
+                    result = hooks.authorize({"tool_name": "Bash", "tool_input": {"command": command}})
+                self.assertEqual(result["hookSpecificOutput"]["permissionDecision"], "deny")
+                with self.assertRaises(ValueError):
+                    self.authorize(payload, operation=operation)
+        hostile_key = "\x1b[2J" + "x" * 100_000
+        hostile = {**start, hostile_key: True}
+        command = shlex.join(["router", "start", "--json", json.dumps(hostile)])
+        with patch.object(hooks, "request", side_effect=AssertionError("invalid schema reached socket")):
+            result = hooks.authorize({"tool_name": "Bash", "tool_input": {"command": command}})
+        rendered = json.dumps(result)
+        self.assertLess(len(rendered), 1000)
+        self.assertNotIn("\x1b", rendered)
+        with self.assertRaises(ValueError) as error:
+            self.authorize(hostile)
+        self.assertLess(len(str(error.exception)), 1000)
+        self.assertNotIn("\x1b", str(error.exception))
+        with self.router.store.connect() as db:
+            self.assertEqual(db.execute("SELECT count(*) FROM authorizations").fetchone()[0], 0)
+        # The exact same request ID is usable with the corrected payload.
+        self.authorize(start)
+        task_id = self.router.handle("start", start)["task_id"]
+        review = {"task_id": task_id, "request_id": "review", "expected_attempt": 0, "outcome": "accepted"}
+        self.submission(session="other")
+        with self.assertRaisesRegex(ValueError, "another parent"):
+            self.authorize(review, session="other", operation="review")
+
+    def test_declared_completion_evidence_controls_acceptance_and_failed_repair(self):
+        good = {"status": "satisfied", "violations": [], "unchecked": [],
+                "evidence_source": "stopped_worktree"}
+        violated = {**good, "status": "violated",
+                    "violations": [{"reason": "required output missing"}]}
+        cases = [
+            ("satisfied", True, good, True, False),
+            ("violated", True, violated, False, True),
+            ("unknown", True, {**good, "status": "unknown",
+                               "unchecked": [{"reason": "evidence unavailable"}]}, False, True),
+            ("missing", True, None, False, True),
+            ("malformed", True, [], False, True),
+            ("contradictory", True, {**good, "violations": [{"reason": "missing"}]}, False, True),
+            ("legacy", False, {"status": "violated"}, True, False),
+        ]
+        # Exact markers returned by Runtime.validate for local and parent-side remote tasks.
+        validated_tasks = [
+            ("local", {"resolved_model": "provider/exact", "setup_command": "true"}),
+            ("remote", {"resolved_model": "provider/exact", "remote_host": "worker",
+                        "remote_repo": "/srv/project", "remote_worktree": "/srv/project"}),
+        ]
+        for state in ("awaiting_review", "failed"):
+            for validated_name, validated in validated_tasks:
+                for name, declared, diagnostic, acceptance_allowed, failed_repair in cases:
+                    for outcome in ("accepted", "rejected"):
+                        invocation = {"completion": {"files": ["result.txt"]}} if declared else {}
+                        attempts = 0 if state == "failed" else 1
+                        task = {
+                            "status": state, "attempts": attempts, "execution_stopped": True,
+                            "final_tree": "a" * 40, "invocation": invocation,
+                            "review_retries": 0, "continuations": 0, "review_history": [], **validated,
+                        }
+                        if diagnostic is not None:
+                            task["completion_check"] = diagnostic
+                        payload = {"task_id": "task-a", "request_id": f"{state}-{name}-{outcome}",
+                                   "expected_attempt": attempts, "outcome": outcome}
+                        if outcome == "rejected":
+                            payload["feedback"] = "Repair declared output"
+                        allowed = (acceptance_allowed if outcome == "accepted" else
+                                   state == "awaiting_review" or state == "failed" and failed_repair)
+                        with self.subTest(state=state, validation=validated_name, check=name, outcome=outcome):
+                            if not allowed:
+                                with self.assertRaises(ValueError):
+                                    self.router.review(task, payload)
+                                continue
+                            self.router.review(task, payload)
+                            self.assertEqual(task["status"], "accepted" if outcome == "accepted" else "retrying")
+        # Runtime validation failed before resolved_model existed; a retry would skip validation.
+        unvalidated = {"status": "failed", "attempts": 0, "execution_stopped": True,
+                       "invocation": {"completion": {"files": ["result.txt"]}},
+                       "review_retries": 0, "continuations": 0, "review_history": []}
+        with self.assertRaisesRegex(ValueError, "Invalid review outcome"):
+            self.router.review(unvalidated, {"task_id": "task-a", "request_id": "unvalidated", "expected_attempt": 0,
+                                             "outcome": "rejected", "feedback": "Repair"})
+        for validated_name, validated in validated_tasks:
+            exhausted = {"status": "failed", "attempts": 2, "execution_stopped": True,
+                         "invocation": {"completion": {"files": ["result.txt"]}},
+                         "completion_check": violated, "review_retries": 0,
+                         "continuations": 0, "review_history": [], **validated}
+            payload = {"task_id": "task-a", "request_id": f"exhausted-{validated_name}",
+                       "expected_attempt": 2, "outcome": "rejected", "feedback": "Repair"}
+            with self.subTest(validation=validated_name, budget="exhausted"), \
+                    self.assertRaisesRegex(ValueError, "ceiling"):
+                self.router.review(exhausted, payload)
 
     def test_request_status_recovers_committed_start_without_reauthorizing_or_relaunching(self):
         selection = {"session_id": "S", "request_id": "R", "host_id": self.router.host.host_id}

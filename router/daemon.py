@@ -42,11 +42,15 @@ from router.client import CompletionRefused, UnknownTask
 from router.codex import collect as collect_codex
 from router.codex import price_metadata
 from router.config import Settings
-from router.correlation import identifier as correlation_identifier
 from router.db import Store, now_ms
 from router.dispatch import MUTATIONS, canonical
 from router.fleet_snapshot import AlertHistory
 from router.host import HostIdentity
+from router.lifecycle import close as close_schema
+from router.lifecycle import required_text
+from router.lifecycle import review as review_schema
+from router.lifecycle import start as start_schema
+from router.lifecycle import validate as validate_payload
 from router.managed import ManagedProcesses
 from router.native import SOURCES, NativeObserver, identifier, safe_text
 from router.paths import observed_project
@@ -61,6 +65,9 @@ from router.process import (
 from router.processes import SessionProcesses
 from router.sessions import SessionObserver
 from router.snapshot import cleanup, git, validate_repository
+from router.task_checks import completion as check_completion
+from router.task_checks import completion_projection
+from router.task_checks import preflight as launch_preflight
 
 ACTIVE = {"created", "validating", "preparing", "running", "retrying", "cancelling"}
 DECISIONS = {"awaiting_review", "blocked", "failed", "interrupted"}
@@ -93,13 +100,6 @@ def _lifecycle_result(queued: bool, persistence: dict[str, str],
 def blocks_maintenance(task: dict) -> bool:
     return (task["status"] in ACTIVE or not task["execution_stopped"] or
             bool(task.get("cleanup_requested") or task.get("cleanup_pending") and task.get("cleanup_error") is None))
-
-
-def required_text(payload: dict, key: str) -> str:
-    value = payload.get(key)
-    if not isinstance(value, str) or not value.strip():
-        raise ValueError(f"{key} must be a non-empty string")
-    return value
 
 
 def public(task: dict, store: Store | None = None, history: list[dict] | None = None) -> dict:
@@ -529,6 +529,7 @@ class Controller:
             return compose(self, history_limit=history_limit)
         if operation not in MUTATIONS:
             raise ValueError("Unknown operation")
+        validate_payload(operation, payload)
         if str(payload.get("task_id", "")).startswith("native-"):
             raise ValueError("Native agent is host-managed; Router cannot control it")
         if not self.settings.delegation_enabled and (operation == "start" or
@@ -730,6 +731,7 @@ class Controller:
         invocation = payload.get("invocation")
         if operation not in MUTATIONS or not isinstance(invocation, dict):
             raise ValueError("Invalid dispatch authorization")
+        validate_payload(operation, invocation)
         request_id = required_text(invocation, "request_id")
         encoded = canonical(invocation)
         with self.store.transaction() as db:
@@ -757,6 +759,7 @@ class Controller:
         return {"authorized": True, "request_id": request_id}
 
     def mutate(self, operation: str, payload: dict, forwarded: bool = False) -> dict:
+        validate_payload(operation, payload)
         request_id = required_text(payload, "request_id")
         encoded = canonical(payload)
         with self.store.transaction() as db:
@@ -799,8 +802,6 @@ class Controller:
                 self.require_forwarded(task, forwarded)
                 self.review(task, payload)
             elif operation == "cancel":
-                if set(payload) - {"task_id", "request_id"}:
-                    raise ValueError("Unknown cancel field")
                 if task["status"] in {"accepted", "integrated", "closed"}:
                     raise ValueError("Finalize accepted work through close")
                 self.require_forwarded(task, forwarded)
@@ -841,8 +842,7 @@ class Controller:
             if self.draining:
                 raise ValueError("Router is stopping for maintenance; retry after it restarts")
         if operation == "cancel":
-            if set(payload) - {"task_id", "request_id"}:
-                raise ValueError("Unknown cancel field")
+            validate_payload(operation, payload)
             if task["status"] in {"accepted", "integrated", "closed"}:
                 raise ValueError("Finalize accepted work through close")
         return self.forward_remote(task, operation, payload) is not None
@@ -879,33 +879,10 @@ class Controller:
             return transport.cancel(forwarded)
         return transport.close(forwarded)
 
-    @staticmethod
-    def envelope(payload: dict) -> None:
-        allowed = {"request_version", "request_id", "instruction_id", "executor", "model", "task", "parent_repo", "parent_worktree", "mode", "context", "work_item_id", "host", "remote_repo", "remote_worktree"}
-        if set(payload) - allowed:
-            raise ValueError("Unknown invocation field; operator limits are not task inputs")
-        for key in ("request_version", "request_id", "instruction_id", "executor", "model", "task",
-                    "parent_repo", "parent_worktree", "mode"):
-            required_text(payload, key)
-        if "work_item_id" in payload:
-            correlation_identifier(payload["work_item_id"], "work_item_id")
-        if payload["request_version"] != "1" or payload["mode"] != "write":
-            raise ValueError("Only request_version 1 and write mode are supported")
-        if any(not Path(payload[key]).is_absolute() for key in ("parent_repo", "parent_worktree")):
-            raise ValueError("Repository and worktree paths must be absolute")
-        if {"host", "remote_repo", "remote_worktree"} & set(payload):
-            required_text(payload, "host")
-            if any(key not in payload or not Path(payload[key]).is_absolute() for key in ("remote_repo", "remote_worktree")):
-                raise ValueError("Remote dispatch requires absolute remote_repo and remote_worktree")
-        context = payload.get("context", {})
-        if not isinstance(context, dict) or set(context) - {"relevant_paths", "constraints"}:
-            raise ValueError("Invalid context")
-        if any(not isinstance(values, list) or any(not isinstance(item, str) for item in values) for values in context.values()):
-            raise ValueError("Context paths and constraints must be arrays of strings")
+    envelope = staticmethod(start_schema)
 
     def review(self, task: dict, payload: dict) -> None:
-        if set(payload) - {"task_id", "request_id", "expected_attempt", "outcome", "feedback"}:
-            raise ValueError("Unknown review field")
+        review_schema(payload)
         expected = payload.get("expected_attempt")
         if type(expected) is not int or expected != task["attempts"]:
             raise ValueError("Stale expected_attempt")
@@ -913,11 +890,20 @@ class Controller:
             raise ValueError("Task is marked for cancellation")
         outcome = required_text(payload, "outcome")
         state = task["status"]
+        completion_declared = "completion" in task.get("invocation", {})
+        completion_status = (completion_projection(task.get("completion_check"))["status"]
+                             if completion_declared else "not_declared")
         if outcome == "accepted" and state in {"awaiting_review", "failed"}:
             if not task["execution_stopped"] or not task.get("final_tree"):
                 raise ValueError("Acceptance requires verified stopped execution and a current final tree")
+            if completion_declared and completion_status != "satisfied":
+                raise ValueError("Declared completion requirements are not satisfied; repair through the "
+                                 "existing review lifecycle")
             task["status"] = "accepted"
-        elif (outcome == "rejected" and state == "awaiting_review") or (outcome == "continue" and state == "blocked"):
+        elif (outcome == "rejected" and (state == "awaiting_review" or
+                state == "failed" and task["execution_stopped"] and "resolved_model" in task and
+                completion_declared and completion_status != "satisfied")) or (
+                outcome == "continue" and state == "blocked"):
             if task["attempts"] >= self.settings.max_attempts:
                 raise ValueError("Operator-configured launch ceiling is exhausted")
             task["feedback"] = required_text(payload, "feedback")
@@ -930,11 +916,8 @@ class Controller:
 
     @staticmethod
     def close(task: dict, payload: dict) -> None:
-        if set(payload) - {"task_id", "request_id", "disposition", "keep_artifacts"}:
-            raise ValueError("Unknown close field")
+        close_schema(payload)
         disposition = payload.get("disposition")
-        if disposition not in {"integrated", "discarded"} or type(payload.get("keep_artifacts", False)) is not bool:
-            raise ValueError("Invalid final disposition or keep_artifacts")
         if task["status"] in ACTIVE | {"interrupted"} or not task["execution_stopped"]:
             raise ValueError("Cannot close active execution or uncertain liveness")
         if disposition == "integrated" and task["status"] not in {"accepted", "integrated"}:
@@ -1268,6 +1251,8 @@ class Runtime:
                 task,
                 include_tracing_credentials=name == "child",
             )
+        if name == "child" and task["executor"] in {"codex", "claude"} and "launch" in task["invocation"]:
+            launch_preflight(task, command, environment, cwd)
         process = None
         def register(record):
             record["interrupt_first"] = name == "child" and task["executor"] in {"codex", "claude"}
@@ -1451,8 +1436,10 @@ class Runtime:
                                    attempt_started_at=now_ms(), deadline_at=now_ms() + int(self.control.settings.attempt_timeout_seconds * 1000),
                                    artifact_dir=str(self.control.directory / "tasks" / task_id),
                                    max_attempts=self.control.settings.max_attempts)
-                    for key in ("final_tree", "patch", "execution_outcome", "failure_reason", "exit_code", "last_event_at", "summary", "cost", "usage", "usage_complete", "cost_note", "cost_source", "executor_completed", "thread_observed", "executor_activity", "execution_error", "event_offset", "process", "phase", "phase_started_at"):
+                    for key in ("final_tree", "patch", "execution_outcome", "failure_reason", "exit_code", "last_event_at", "summary", "cost", "usage", "usage_complete", "cost_note", "cost_source", "executor_completed", "thread_observed", "executor_activity", "execution_error", "event_offset", "process", "phase", "phase_started_at", "completion_check", "completion_final_response_present"):
                         current.pop(key, None)
+                    if "completion" in current["invocation"]:
+                        current["completion_final_response_present"] = False
                 self.store.update(task_id, begin)
                 if task["executor"] == "claude" and not self.store.get(task_id).get("remote_host"):
                     executable = resolve_executable(self.control.settings.claude_command, self.control.environment,
@@ -1580,6 +1567,7 @@ class Runtime:
                     raise PhaseStopped("cancelled")
                 current.update(status="running", execution_stopped=False)
             self.store.update(task_id, claim)
+        completion_diagnostic = None
         try:
             if not recovered and not task.get("remote_task_id"):
                 try:
@@ -1629,7 +1617,12 @@ class Runtime:
                                   "duration_ms", "exit_code", "snapshot_commit", "snapshot_tree", "tracing"):
                         if field in status:
                             updates[field] = status[field]
-                    self.store.update_with_attempt(task_id, lambda current, updates=updates: current.update(updates))
+                    if "completion" in task["invocation"]:
+                        updates["completion_check"] = completion_projection(status.get("completion_check"))
+                    def project(current, updates=updates):
+                        current.pop("completion_check", None)
+                        current.update(updates)
+                    self.store.update_with_attempt(task_id, project)
                     return
                 if remote_status in {"accepted", "integrated", "closed"}:
                     updates = {"status": remote_status, "execution_stopped": True,
@@ -1638,7 +1631,19 @@ class Runtime:
                                   "duration_ms", "exit_code", "snapshot_commit", "snapshot_tree", "tracing"):
                         if field in status:
                             updates[field] = status[field]
-                    self.store.update_with_attempt(task_id, lambda current, updates=updates: current.update(updates))
+                    if "completion" in task["invocation"]:
+                        updates["completion_check"] = completion_projection(status.get("completion_check"))
+                        # A discarded closure needs no acceptance evidence.
+                        if (updates["completion_check"]["status"] != "satisfied"
+                                and not (remote_status == "closed"
+                                         and status.get("disposition") == "discarded")):
+                            completion_diagnostic = updates["completion_check"]
+                            raise RemoteChildError("invalid_response", "Remote terminal state lacks satisfied "
+                                                   "declared completion evidence")
+                    def project(current, updates=updates):
+                        current.pop("completion_check", None)
+                        current.update(updates)
+                    self.store.update_with_attempt(task_id, project)
                     return
                 if remote_status not in {"created", "validating", "preparing", "running", "retrying", "cancelling"}:
                     raise RemoteChildError("invalid_response", "Remote task returned an unknown state")
@@ -1651,12 +1656,18 @@ class Runtime:
                 for field in ("attempts", "attempt_number", "duration_ms", "snapshot_commit", "snapshot_tree", "tracing"):
                     if field in status:
                         updates[field] = status[field]
-                self.store.update_with_attempt(task_id, lambda current, updates=updates: current.update(updates))
+                def project_active(current, updates=updates):
+                    current.pop("completion_check", None)
+                    current.update(updates)
+                self.store.update_with_attempt(task_id, project_active)
                 time.sleep(.2)
         except RemoteChildError as error:
             reason = f"Remote transport {error.code}; execution outcome is unknown"
-            self.store.update_with_attempt(task_id, lambda current, reason=reason: current.update(
-                status="interrupted", execution_stopped=False, failure_reason=reason))
+            def interrupt(current):
+                current.update(status="interrupted", execution_stopped=False, failure_reason=reason)
+                if completion_diagnostic is not None:
+                    current["completion_check"] = completion_diagnostic
+            self.store.update_with_attempt(task_id, interrupt)
 
     @staticmethod
     def child_failed(task: dict) -> bool:
@@ -1679,6 +1690,13 @@ class Runtime:
             except Exception:
                 LOGGER.exception("Final-tree capture failed: %s", task_id)
                 outcome, reason = "failed", "Final-tree capture failed; worktree retained"
+        task = self.store.get(task_id)
+        if ("completion" in task["invocation"] and task["executor"] in {"codex", "claude"}
+                and task.get("worktree") and outcome in {"completed", "failed"}):
+            diagnostic = check_completion(task)
+            self.store.update(task_id, lambda t: t.update(completion_check=diagnostic))
+            if diagnostic["status"] == "violated" and outcome == "completed":
+                reason = "Declared completion requirements violated; inspect completion_check"
         def finalize(current):
             current.update(status={"completed": "awaiting_review", "failed": "failed", "cancelled": "cancelled"}[outcome],
                            execution_stopped=True,

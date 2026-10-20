@@ -697,6 +697,99 @@ class RuntimeTests(RuntimeHarness, unittest.TestCase):
         self.config.repositories[str(self.repo.resolve())]["codex_sandbox"] = "workspace-write"
         (self.repo / "opencode.json").unlink()
 
+    def test_declared_completion_blocks_acceptance_but_keeps_existing_repair_lifecycle(self):
+        self.enable_codex()
+        invocation = {"request_version": "1", "request_id": "contract-start", "instruction_id": self.instruction,
+                      "executor": "codex", "model": "test", "task": "empty final", "mode": "write",
+                      "parent_repo": str(self.repo), "parent_worktree": str(self.repo),
+                      "completion": {"files": ["result.txt"], "final_response": True}}
+        task_id = self.mutate("start", invocation)["task_id"]
+        first = self.wait(task_id, {"awaiting_review", "failed"})
+        self.assertEqual(first["status"], "awaiting_review", first)
+        self.assertEqual(first["completion_check"]["status"], "violated")
+        self.assertTrue((Path(first["worktree"]) / "result.txt").is_file())
+        with self.assertRaisesRegex(ValueError, "completion requirements"):
+            self.mutate("review", {"task_id": task_id, "request_id": "cannot-accept", "expected_attempt": 1,
+                                   "outcome": "accepted"})
+        self.mutate("review", {"task_id": task_id, "request_id": "repair", "expected_attempt": 1,
+                               "outcome": "rejected", "feedback": "Provide a final response"})
+        second = self.wait(task_id, {"awaiting_review", "failed"})
+        self.assertEqual(second["completion_check"]["status"], "satisfied", second)
+        self.assertEqual(second["status"], "awaiting_review")
+        accepted = self.mutate("review", {"task_id": task_id, "request_id": "independent-acceptance",
+                                          "expected_attempt": 2, "outcome": "accepted"})
+        self.assertEqual(accepted["status"], "accepted")
+
+    def test_missing_declared_packet_refuses_before_child_or_attempt(self):
+        self.enable_codex()
+        invocation = {"request_version": "1", "request_id": "missing-packet", "instruction_id": self.instruction,
+                      "executor": "codex", "model": "test", "task": "must not launch", "mode": "write",
+                      "parent_repo": str(self.repo), "parent_worktree": str(self.repo),
+                      "launch": {"task_packets": ["missing-packet.md"]}}
+        task_id = self.mutate("start", invocation)["task_id"]
+        result = self.wait(task_id, {"failed"})
+        self.assertEqual(result["attempts"], 0)
+        self.assertNotEqual(result.get("phase"), "child")
+        self.assertFalse((Path(result["worktree"]) / "result.txt").exists())
+        self.assertIn("Task packet", result["failure_reason"])
+
+    def test_preflight_refusal_on_retry_fails_without_a_running_process(self):
+        self.enable_codex()
+        self.config.repositories[str(self.repo.resolve())]["setup_command"] = "printf task > packet.md"
+        invocation = {"request_version": "1", "request_id": "retry-packet", "instruction_id": self.instruction,
+                      "executor": "codex", "model": "test", "task": "fixture", "mode": "write",
+                      "parent_repo": str(self.repo), "parent_worktree": str(self.repo),
+                      "launch": {"task_packets": ["packet.md"]}}
+        task_id = self.mutate("start", invocation)["task_id"]
+        first = self.wait(task_id, {"awaiting_review", "failed"})
+        self.assertEqual(first["status"], "awaiting_review", first)
+        # Setup does not rerun on a retry, so the packet stays missing.
+        (Path(first["worktree"]) / "packet.md").unlink()
+        self.mutate("review", {"task_id": task_id, "request_id": "retry-packet-reject", "expected_attempt": 1,
+                               "outcome": "rejected", "feedback": "Try again"})
+        second = self.wait(task_id, {"failed"})
+        self.assertTrue(second["execution_stopped"], second)
+        self.assertEqual(second["attempts"], 1)
+        self.assertIn("Task packet", second["failure_reason"])
+
+    def test_setup_can_create_declared_inputs_and_install_the_runtime(self):
+        import shlex
+        self.enable_codex()
+        self.config.codex_command = ["./tools/fixture-python", str(Path(__file__).with_name("fixture_executor.py"))]
+        self.config.repositories[str(self.repo.resolve())]["setup_command"] = (
+            "mkdir -p tools; ln -s " + shlex.quote(sys.executable) + " tools/fixture-python; printf task > generated.md")
+        invocation = {"request_version": "1", "request_id": "setup-packet", "instruction_id": self.instruction,
+                      "executor": "codex", "model": "test", "task": "fixture", "mode": "write",
+                      "parent_repo": str(self.repo), "parent_worktree": str(self.repo),
+                      "launch": {"task_packets": ["generated.md"]}}
+        task_id = self.mutate("start", invocation)["task_id"]
+        result = self.wait(task_id, {"awaiting_review", "failed"})
+        self.assertEqual(result["status"], "awaiting_review", result)
+        self.assertFalse((self.repo / "generated.md").exists())
+
+    def test_failed_attempts_still_obey_declared_completion_during_salvage(self):
+        self.enable_codex()
+        for index, file in enumerate(("missing.json", "result.txt")):
+            with self.subTest(file=file):
+                invocation = {"request_version": "1", "request_id": f"failed-{index}", "instruction_id": self.instruction,
+                              "executor": "codex", "model": "test", "task": "error", "mode": "write",
+                              "parent_repo": str(self.repo), "parent_worktree": str(self.repo),
+                              "completion": {"files": [file]}}
+                task_id = self.mutate("start", invocation)["task_id"]
+                result = self.wait(task_id, {"failed"})
+                expected = "violated" if index == 0 else "satisfied"
+                self.assertEqual(result["completion_check"]["status"], expected, result)
+                review = {"task_id": task_id, "request_id": f"salvage-{index}", "expected_attempt": 1, "outcome": "accepted"}
+                if index == 0:
+                    with self.assertRaisesRegex(ValueError, "completion requirements"):
+                        self.mutate("review", review)
+                    self.mutate("review", {**review, "request_id": "failed-repair", "outcome": "rejected", "feedback": "Create missing.json"})
+                    repaired = self.wait(task_id, {"awaiting_review", "failed"})
+                    self.assertEqual(repaired["completion_check"]["status"], "satisfied", repaired)
+                    self.assertEqual(self.mutate("review", {**review, "request_id": "repaired-accept", "expected_attempt": 2})["status"], "accepted")
+                else:
+                    self.assertEqual(self.mutate("review", review)["status"], "accepted")
+
     def test_codex_resume_telemetry_and_integration_without_opencode_permissions(self):
         self.enable_codex()
         task_id = self.start("codex", executor="codex")

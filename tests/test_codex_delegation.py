@@ -118,7 +118,9 @@ class CodexDelegationTests(unittest.TestCase):
 
     def test_unknown_identity_subagents_and_missing_scope_never_gain_authorization(self):
         instruction = self.submit()
-        invocation = {"request_version": "1", "request_id": "not-authorized", "instruction_id": instruction}
+        invocation = {"request_version": "1", "request_id": "not-authorized", "instruction_id": instruction,
+                      "executor": "codex", "model": "test", "task": "task", "mode": "write",
+                      "parent_repo": str(self.project), "parent_worktree": str(self.project)}
         variants = [{"turn_id": value} for value in (None, "", 7, " padded ", "turn\n")]
         variants += [{"session_id": value} for value in (None, "", 7, " padded ", "session\n")]
         variants += [{"agent_id": value} for value in ("worker-a", "", None, 7)]

@@ -6,6 +6,7 @@ from functools import partial
 
 from router.client import request
 from router.dispatch import literal_payload, mutation_operation
+from router.lifecycle import validate as validate_payload
 from router.native import identifier
 from router.paths import configuration, delegation_target, observed_project
 
@@ -52,13 +53,14 @@ def authorize(event: dict, *, source: str = "claude") -> dict:
         if operation == "remote":
             # The SSH serving entry point has no session authorization of its own.
             raise ValueError("router remote is the SSH serving entry point; dispatch through router start")
+        payload = literal_payload(command, operation)
+        validate_payload(operation, payload)
         if source == "codex":
             event = codex_parent(event, "PreToolUse")
             values, _ = configuration()
             if (observed_project(event.get("cwd")) is None or
                     not delegation_target(event.get("cwd"), values.get("AGENT_ROUTER_REPOSITORIES", {}))):
                 raise ValueError("Codex delegation requires an enabled project registered with router init")
-        payload = literal_payload(command, operation)
         request("authorize", {"session_id": event["session_id"], "prompt_id": event["prompt_id"],
                               "operation": operation, "invocation": payload,
                               "parent_agent_id": None if source == "codex" else event.get("agent_id") or "main"})
