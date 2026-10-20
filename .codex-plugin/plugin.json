@@ -1,6 +1,6 @@
 {
   "name": "agent-router",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "description": "Observe native Codex lifecycle and delegate explicitly requested children through Agent Router",
   "skills": ["./router/plugin/skills/"],
   "hooks": "./router/plugin/codex/hooks.json"
