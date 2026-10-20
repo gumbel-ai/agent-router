@@ -135,6 +135,13 @@ class ManagedRunTests(unittest.TestCase):
         self.assertNotIn("launch_pending", record)
         self.assertEqual(record["status"], "exited")
 
+    def test_reservation_of_an_ended_wrapper_is_dropped(self):
+        self.control.managed.reserve({"managed_id": "managed-gone", "label": "gone", "attribution": "host",
+                                      "wrapper_pid": 4242, "wrapper_identity": "ended", "argument_count": 0})
+        self.assertIn("gone", self.managed())
+        self.control.managed.reconcile()
+        self.assertNotIn("gone", self.managed())
+
     def test_router_refusal_prevents_launch(self):
         with patch("router.managed.request", side_effect=ValueError("Router is stopping for maintenance")), \
                 patch("router.managed.subprocess.Popen", side_effect=AssertionError("must not launch")), \

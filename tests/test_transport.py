@@ -267,6 +267,17 @@ class MaintenanceAdmissionTests(unittest.TestCase):
         self.assertEqual(workload["sessions"], 0)
         self.assertEqual(workload["inferred_processes"], 1)
 
+    def test_idle_session_root_process_is_not_inferred_work(self):
+        root = {"source": "claude", "session_id": "idle", "pid": 4242, "identity": "x"}
+        process = {"source": "claude", "session_id": "idle", "status": "running", "pid": 4242}
+        with patch.object(self.control.sessions, "fleet_records", return_value=([], 0)), \
+                patch.object(self.control.native, "fleet_records", return_value=([], 0)), \
+                patch.object(self.control.managed, "records", return_value=([], 0)), \
+                patch.object(self.control.sessions, "process_roots", return_value=[root]), \
+                patch.object(self.control, "inferred_process_records", return_value=[process]):
+            workload = self.control.maintenance_workload(None)
+        self.assertEqual(workload["inferred_processes"], 0)
+
 
 class TransportHarness(RuntimeHarness):
     # Exercise the same lifecycle over a real separate daemon and Unix socket.

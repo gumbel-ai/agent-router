@@ -704,20 +704,22 @@ class ManagedProcesses:
                 wrapper = record.get("wrapper_identity")
                 if wrapper is not None and self.identity(record["wrapper_pid"]) == wrapper:
                     continue
+                if record.get("launch_pending"):
+                    # The wrapper ended before any start evidence; drop the stale reservation.
+                    db.execute("DELETE FROM managed_processes WHERE managed_id=? "
+                               "AND json_extract(data,'$.launch_pending')=1", (record["managed_id"],))
+                    continue
                 current = db.execute("SELECT json_extract(data,'$.status') FROM managed_processes "
                                      "WHERE managed_id=?", (record["managed_id"],)).fetchone()
-                if current is None or (current[0] != "running" and not record.get("launch_pending")) \
+                if current is None or current[0] != "running" \
                         or (directory / f"{record['managed_id']}.json").exists():
                     continue
                 record.pop("group_outlived", None)
-                reason = ("The managed launch outcome is unavailable"
-                          if record.get("launch_pending")
-                          else "The router run wrapper ended without completion evidence")
-                record.update(status="unknown", uncertain_at=_now(), visibility_reason=reason)
+                record.update(status="unknown", uncertain_at=_now(),
+                              visibility_reason="The router run wrapper ended without completion evidence")
                 db.execute("UPDATE managed_processes SET data=? WHERE managed_id=?",
                            (canonical(record), record["managed_id"]))
-                if not record.get("launch_pending"):
-                    self._completion(db, record)
+                self._completion(db, record)
             # Every registered consumer protects everything after its durable cursor.
             # Keep identity tombstones so expired evidence can never acquire a new event ID.
             db.execute("""UPDATE completion_events SET data=NULL WHERE data IS NOT NULL AND created_at < ? AND sequence <=

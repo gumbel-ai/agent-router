@@ -600,15 +600,15 @@ class Controller:
         return sum(blocks_maintenance(task) for task in self.store.all())
 
     def health(self) -> dict:
+        from importlib.metadata import version
+
         result = {
             "state_dir": str(self.directory),
             "delegation_enabled": self.settings.delegation_enabled,
             "active_tasks": self.busy(),
+            "version": version("agent-router"),
         }
         if self.provenance is None:
-            from importlib.metadata import version
-
-            result["version"] = version("agent-router")
             return result
         result["instance"] = copy.deepcopy(self.provenance)
         source = self.provenance.get("source")
@@ -656,7 +656,9 @@ class Controller:
         _managed, managed_count = self._bounded_workload_records(
             self.managed.records, "Managed process"
         )
-        inferred = self.inferred_process_records(1)
+        # Session root processes are the sessions counted above, not extra work.
+        roots = {root["pid"] for root in self.sessions.process_roots()}
+        inferred = [record for record in self.inferred_process_records(1000) if record.get("pid") not in roots]
         after = self.lifecycle_consistency()
         if (
             before[1]
@@ -1210,7 +1212,18 @@ class Controller:
                     raise ValueError("A prior remote operation has an uncertain outcome; replay it first")
                 current["remote_forward_pending"] = pending
             self.store.update(task["task_id"], retain_forward)
-        return self.forward_remote(task, operation, payload) is not None
+        from router.remote_child import RemoteChildError
+        try:
+            return self.forward_remote(task, operation, payload) is not None
+        except RemoteChildError:
+            raise  # The remote outcome is uncertain; replaying this request settles it.
+        except ValueError:
+            # Refused before anything was sent, so nothing is uncertain.
+            def clear(current):
+                if current.get("remote_forward_pending") == pending:
+                    current.pop("remote_forward_pending")
+            self.store.update(task["task_id"], clear)
+            raise
 
     @staticmethod
     def require_forwarded(task: dict, forwarded: bool) -> None:

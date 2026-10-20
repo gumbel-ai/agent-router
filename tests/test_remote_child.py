@@ -571,6 +571,19 @@ class RemoteChildProtocolTests(unittest.TestCase):
         self.assertEqual(result["status"], "cancelling")
         self.assertNotIn("remote_forward_pending", controller.store.get("task-a"))
 
+        # A refusal before anything is sent leaves no uncertain operation behind.
+        refused = {"task_id": "task-a", "request_id": "cancel-refused"}
+        with controller.store.transaction() as db:
+            db.execute(
+                "INSERT INTO authorizations(session_id,request_id,operation,payload,instruction_id) "
+                "VALUES(?,?,?,?,?)",
+                ("S", "cancel-refused", "cancel", canonical(refused), "instruction-a"),
+            )
+        with patch.object(Controller, "forward_remote", side_effect=ValueError("host no longer configured")), \
+                self.assertRaisesRegex(ValueError, "no longer configured"):
+            controller.handle("cancel", refused)
+        self.assertNotIn("remote_forward_pending", controller.store.get("task-a"))
+
     def test_remote_cleanup_failure_is_projected_after_one_retry(self):
         store = self.remote_store({"task_id": "task-a", "status": "closed", "execution_stopped": True,
                                    "cleanup_pending": True})
