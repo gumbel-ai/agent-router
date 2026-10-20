@@ -33,6 +33,9 @@ def _open_file(root: Path, relative: str) -> int:
     try:
         parts = Path(relative).parts
         for part in parts[:-1]:
+            mode = os.stat(part, dir_fd=descriptor, follow_symlinks=False).st_mode
+            if not stat.S_ISDIR(mode) and not stat.S_ISLNK(mode):
+                raise ValueError(f"{relative} has a non-directory ancestor")
             child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=descriptor)
             os.close(descriptor)
             descriptor = child
@@ -85,7 +88,13 @@ def preflight(task: dict, command: list[str], environment: dict[str, str], root:
     launch = task["invocation"].get("launch", {})
     if launch.get("requires_router"):
         state = Path(environment.get("AGENT_ROUTER_STATE_DIR", "~/.agent-router")).expanduser()
-        endpoint = Path(environment.get("AGENT_ROUTER_SOCKET", str(state / "router.sock"))).expanduser()
+        if not state.is_absolute():
+            state = root / state
+        configured_endpoint = environment.get("AGENT_ROUTER_SOCKET")
+        endpoint = (Path(configured_endpoint).expanduser()
+                    if configured_endpoint is not None else state / "router.sock")
+        if not endpoint.is_absolute():
+            endpoint = root / endpoint
         with socket.socket(socket.AF_UNIX) as connection:
             connection.settimeout(.01)
             try:

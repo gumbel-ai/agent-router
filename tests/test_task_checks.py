@@ -46,16 +46,21 @@ class TaskCheckTests(unittest.TestCase):
         (self.root / "link.json").symlink_to("outside.json")
         (self.root / "directory").mkdir()
         (self.root / "parent-link").symlink_to("directory", target_is_directory=True)
+        (self.root / "file-parent").write_text("not a directory")
         os.mkfifo(self.root / "fifo")
         cases = [("link.json", "json_files", "unknown"),
                  ("parent-link/missing.json", "json_files", "unknown"),
+                 ("file-parent/answer.txt", "files", "violated"),
                  ("fifo", "json_files", "violated"), ("large.json", "json_files", "unknown"),
                  ("duplicate-setup.json", "setup_status_file", "violated")]
         for name, field, expected in cases:
             with self.subTest(path=name):
-                requirement = [name] if field == "json_files" else name
+                requirement = [name] if field in {"files", "json_files"} else name
                 task = {**self.task, "invocation": {"completion": {field: requirement}}}
                 self.assertEqual(completion(task)["status"], expected)
+        inaccessible = {**self.task, "invocation": {"completion": {"files": ["directory/a"]}}}
+        with patch("router.task_checks.os.stat", side_effect=PermissionError):
+            self.assertEqual(completion(inaccessible)["status"], "unknown")
 
     def test_declared_ignored_artifacts_are_checked_without_adding_them_to_git(self):
         (self.root / ".gitignore").write_text("results/\n")
@@ -117,6 +122,40 @@ class TaskCheckTests(unittest.TestCase):
             preflight(task, [sys.executable], environment, self.root)
         with patch("router.task_checks.socket.socket.connect", side_effect=TimeoutError):
             preflight(task, [sys.executable], environment, self.root)
+
+    def test_relative_router_paths_are_resolved_from_the_child_root(self):
+        daemon_root = self.root / "daemon"
+        child_root = self.root / "child"
+        daemon_root.mkdir()
+        child_root.mkdir()
+        (daemon_root / "state").mkdir()
+        (child_root / "state").mkdir()
+        (daemon_root / "router.sock").write_text("not a socket")
+        (daemon_root / "state/router.sock").write_text("not a socket")
+        task = {**self.task, "invocation": {"launch": {"requires_router": True}}}
+        cases = [({"AGENT_ROUTER_SOCKET": "router.sock"}, child_root / "router.sock",
+                  daemon_root / "router.sock"),
+                 ({"AGENT_ROUTER_STATE_DIR": "state"}, child_root / "state/router.sock",
+                  daemon_root / "state/router.sock")]
+        previous_cwd = Path.cwd()
+        try:
+            os.chdir(daemon_root)
+            for environment, child_endpoint, _daemon_endpoint in cases:
+                with self.subTest(environment=environment), socket.socket(socket.AF_UNIX) as server:
+                    server.bind(str(child_endpoint))
+                    server.listen(1)
+                    preflight(task, [sys.executable], environment, child_root)
+                child_endpoint.unlink()
+            for environment, _child_endpoint, daemon_endpoint in cases:
+                daemon_endpoint.unlink()
+                with self.subTest(daemon_only=environment), socket.socket(socket.AF_UNIX) as server:
+                    server.bind(str(daemon_endpoint))
+                    server.listen(1)
+                    with self.assertRaisesRegex(ValueError, "Router socket"):
+                        preflight(task, [sys.executable], environment, child_root)
+                daemon_endpoint.unlink()
+        finally:
+            os.chdir(previous_cwd)
 
     def test_remote_projection_preserves_unknown_and_bounds_diagnostics(self):
         good = {"status": "satisfied", "violations": [], "unchecked": [], "evidence_source": "stopped_worktree"}
