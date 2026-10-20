@@ -1,0 +1,280 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Router Fleet</title>
+<style>
+  :root {
+    --bg: #f6f7f9; --card: #ffffff; --text: #1d2330; --muted: #6b7385; --line: #e3e6ec;
+    --ok: #1f9d55; --warn: #c58a00; --bad: #d64545; --info: #3b6fd4; --chip: #eef1f6;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #12151b; --card: #1b1f27; --text: #e6e9ef; --muted: #8b93a5; --line: #2a303b;
+      --ok: #3ccf7c; --warn: #e7b23a; --bad: #f06a6a; --info: #6f9cf5; --chip: #262c37;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+         font: 14px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+  header { display: flex; align-items: center; gap: 12px; padding: 16px 24px;
+           border-bottom: 1px solid var(--line); background: var(--card); position: sticky; top: 0; }
+  header h1 { font-size: 18px; margin: 0; }
+  .live { width: 10px; height: 10px; border-radius: 50%; background: var(--ok); }
+  .live.stale { background: var(--bad); }
+  .updated { color: var(--muted); margin-left: auto; font-size: 13px; }
+  main { padding: 20px 24px; display: grid; gap: 16px; max-width: 1400px; margin: 0 auto; }
+  .banner { padding: 10px 14px; border-radius: 8px; background: var(--bad); color: #fff; }
+  .summary { display: flex; flex-wrap: wrap; gap: 12px; }
+  .stat { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 10px 16px; }
+  .stat b { display: block; font-size: 22px; }
+  .stat span { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .04em; }
+  .host { background: var(--card); border: 1px solid var(--line); border-radius: 12px; overflow: hidden; }
+  .host-head { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; padding: 12px 16px;
+               border-bottom: 1px solid var(--line); }
+  .host-head h2 { font-size: 16px; margin: 0; }
+  .metrics { display: flex; flex-wrap: wrap; gap: 14px; margin-left: auto; color: var(--muted); font-size: 13px; }
+  .metrics b { color: var(--text); font-weight: 600; }
+  section { padding: 10px 16px; }
+  section + section { border-top: 1px dashed var(--line); }
+  section h3 { font-size: 12px; margin: 0 0 6px; color: var(--muted); text-transform: uppercase; letter-spacing: .05em; }
+  .row { display: grid; grid-template-columns: minmax(180px, 1.2fr) 110px minmax(0, 2fr) 90px;
+         gap: 10px; align-items: center; padding: 6px 0; }
+  .row.child { padding-left: 22px; }
+  .row.child .name::before { content: "↳ "; color: var(--muted); }
+  .name { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 13px;
+          overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .activity { color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .time { color: var(--muted); text-align: right; font-size: 13px; }
+  .empty { color: var(--muted); padding: 4px 0; }
+  .chip { display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 12px;
+          background: var(--chip); white-space: nowrap; }
+  .chip.ok { color: var(--ok); } .chip.warn { color: var(--warn); }
+  .chip.bad { color: var(--bad); } .chip.info { color: var(--info); }
+  .alert { display: flex; gap: 8px; align-items: baseline; padding: 4px 0; }
+  .alert .evidence { color: var(--muted); }
+  @media (max-width: 720px) {
+    header, main { padding-left: 16px; padding-right: 16px; }
+    .row { grid-template-columns: 1fr auto; }
+    .row .activity, .row .time { grid-column: 1 / -1; text-align: left; }
+  }
+</style>
+</head>
+<body>
+<header>
+  <div class="live" id="live"></div>
+  <h1>Router Fleet</h1>
+  <div class="updated" id="updated">Loading…</div>
+</header>
+<main id="app"></main>
+<script>
+"use strict";
+
+const REFRESH_MS = 3000;
+
+// ---- formatting -----------------------------------------------------------
+
+const TONES = {
+  running: "ok", available: "ok", completed: "ok", accepted: "ok", integrated: "ok",
+  idle: "info", stopped: "info", created: "info", validating: "info", preparing: "info",
+  retrying: "info", cancelling: "info", cancelled: "info", closed: "info",
+  needs_input: "warn", awaiting_review: "warn", busy: "warn", unknown: "warn",
+  failed: "bad", interrupted: "bad", blocked: "bad", offline: "bad", saturated: "bad",
+};
+
+function words(value) {
+  return String(value).split("_").join(" ");
+}
+
+function bytes(value) {
+  if (typeof value !== "number") return "—";
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  let index = 0;
+  while (value >= 1024 && index < units.length - 1) { value /= 1024; index++; }
+  return `${value.toFixed(index ? 1 : 0)} ${units[index]}`;
+}
+
+function duration(ms) {
+  if (typeof ms !== "number" || ms < 0) return "";
+  const seconds = Math.floor(ms / 1000);
+  if (seconds < 60) return `${seconds}s`;
+  if (seconds < 3600) return `${Math.floor(seconds / 60)}m ${seconds % 60}s`;
+  return `${Math.floor(seconds / 3600)}h ${Math.floor(seconds % 3600 / 60)}m`;
+}
+
+function since(timestamp, now) {
+  return typeof timestamp === "number" ? duration(now - timestamp) : "";
+}
+
+// ---- DOM helpers (textContent only, never innerHTML) ----------------------
+
+function el(tag, className, text) {
+  const node = document.createElement(tag);
+  if (className) node.className = className;
+  if (text !== undefined && text !== null) node.textContent = String(text);
+  return node;
+}
+
+function append(parent, ...children) {
+  for (const child of children) if (child) parent.appendChild(child);
+  return parent;
+}
+
+function chip(state) {
+  const label = state || "unknown";
+  return el("span", `chip ${TONES[label] || ""}`, words(label));
+}
+
+function row({ name, state, activity, time, child }) {
+  return append(el("div", child ? "row child" : "row"),
+    el("div", "name", name), append(el("div"), chip(state)),
+    el("div", "activity", activity || "—"), el("div", "time", time));
+}
+
+function section(title, rows) {
+  if (!rows.length) return null;
+  return append(el("section"), el("h3", null, title), ...rows);
+}
+
+// ---- rendering --------------------------------------------------------------
+
+function sessionRows(snapshot, now) {
+  const agentsByParent = new Map();
+  for (const agent of snapshot.agents || []) {
+    const key = agent.parent_session_id;
+    if (!agentsByParent.has(key)) agentsByParent.set(key, []);
+    agentsByParent.get(key).push(agent);
+  }
+  const agentRow = agent => row({
+    child: true,
+    name: agent.agent_type || agent.agent_id || "subagent",
+    state: agent.status,
+    activity: agent.activity || agent.task,
+    time: duration(agent.elapsed_ms) || since(agent.started_at, now),
+  });
+  const rows = [];
+  for (const session of snapshot.sessions || []) {
+    rows.push(row({
+      name: `${session.source || "?"} · ${session.session_id}`,
+      state: session.needs_input ? "needs_input" : session.status,
+      activity: session.activity || (session.last_event && `last: ${session.last_event}`) || session.cwd,
+      time: since(session.started_at, now),
+    }));
+    rows.push(...(agentsByParent.get(session.session_id) || []).map(agentRow));
+    agentsByParent.delete(session.session_id);
+  }
+  for (const orphans of agentsByParent.values()) rows.push(...orphans.map(agentRow));
+  return rows;
+}
+
+function routerTaskRows(snapshot, now) {
+  return (snapshot.router_tasks || []).map(task => row({
+    name: `${task.executor || "?"} · ${task.task_id}`,
+    state: task.status,
+    activity: task.failure_reason || task.activity || task.task,
+    time: duration(task.elapsed_ms) || since(task.created_at, now),
+  }));
+}
+
+function managedRows(snapshot, now) {
+  return (snapshot.managed_processes || []).map(process => row({
+    name: process.label || process.executable || process.managed_id,
+    state: process.status,
+    activity: process.cwd,
+    time: duration(process.elapsed_ms) || since(process.started_at, now),
+  }));
+}
+
+function alertRows(record) {
+  const alerts = [...record.alerts, ...((record.snapshot && record.snapshot.alerts) || [])];
+  return alerts.map(alert => append(el("div", "alert"),
+    el("span", "chip warn", words(alert.kind)),
+    el("span", "evidence", alert.evidence)));
+}
+
+function metrics(capacity) {
+  const items = [
+    ["CPU", typeof capacity.cpu_busy_pct === "number" ? `${capacity.cpu_busy_pct.toFixed(0)}%` : "—"],
+    ["Load", typeof capacity.load_1m === "number" ? capacity.load_1m.toFixed(1) : "—"],
+    ["Mem free", bytes(capacity.memory_available_bytes)],
+    ["Disk free", bytes(capacity.disk_available_bytes)],
+  ];
+  return append(el("div", "metrics"),
+    ...items.map(([label, value]) => append(el("span", null, `${label} `), el("b", null, value))));
+}
+
+function hostCard(record, now) {
+  const card = el("div", "host");
+  const head = append(el("div", "host-head"), el("h2", null, record.name));
+  card.appendChild(head);
+  if (!record.ok) {
+    append(head, chip("offline"));
+    append(card, section("Alerts", alertRows(record)));
+    return card;
+  }
+  const snapshot = record.snapshot;
+  const capacity = snapshot.capacity || {};
+  append(head, chip(capacity.capacity_state), el("span", "chip", snapshot.host.platform), metrics(capacity));
+  const sections = [
+    section("Sessions & subagents", sessionRows(snapshot, now)),
+    section("Router children", routerTaskRows(snapshot, now)),
+    section("Managed runs", managedRows(snapshot, now)),
+    section("Alerts", alertRows(record)),
+  ].filter(Boolean);
+  if (!sections.length) sections.push(append(el("section"), el("div", "empty", "No active sessions")));
+  return append(card, ...sections);
+}
+
+function summary(result) {
+  const live = result.hosts.filter(host => host.ok).map(host => host.snapshot);
+  const count = key => live.reduce((total, snapshot) => total + (snapshot[key] || []).length, 0);
+  const waiting = live.reduce((total, snapshot) =>
+    total + (snapshot.sessions || []).filter(session => session.needs_input).length
+          + (snapshot.agents || []).filter(agent => agent.status === "needs_input").length, 0);
+  const stats = [
+    [`${live.length}/${result.hosts.length}`, "Hosts online"],
+    [count("sessions"), "Sessions"],
+    [count("agents"), "Subagents"],
+    [count("router_tasks"), "Router children"],
+    [waiting, "Needs input"],
+  ];
+  return append(el("div", "summary"),
+    ...stats.map(([value, label]) => append(el("div", "stat"), el("b", null, value), el("span", null, label))));
+}
+
+function render(result) {
+  const now = result.generated_at;
+  document.getElementById("app").replaceChildren(
+    summary(result), ...result.hosts.map(record => hostCard(record, now)));
+  document.getElementById("updated").textContent =
+    `Updated ${new Date(now).toLocaleTimeString()}`;
+  document.getElementById("live").classList.remove("stale");
+}
+
+function showError(message) {
+  document.getElementById("live").classList.add("stale");
+  const app = document.getElementById("app");
+  const banner = app.querySelector(".banner") || app.insertBefore(el("div", "banner"), app.firstChild);
+  banner.textContent = `Refresh failed: ${message}. Showing last data.`;
+}
+
+// ---- polling ----------------------------------------------------------------
+
+async function refresh() {
+  try {
+    const response = await fetch("/api/fleet", { cache: "no-store" });
+    const body = await response.json();
+    if (!response.ok) throw new Error(body.error || response.statusText);
+    render(body);
+  } catch (error) {
+    showError(error.message);
+  } finally {
+    setTimeout(refresh, REFRESH_MS);
+  }
+}
+
+refresh();
+</script>
+</body>
+</html>
