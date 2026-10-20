@@ -26,21 +26,25 @@ def _snapshot(task_id: str, task: dict | None) -> dict:
 
 
 def _poll(latest: dict[str, dict], request: Callable, deadline: float, clock: Callable[[], float]) -> bool | None:
-    """Refresh each task's latest state in place: True when every read succeeded, False when
-    Router could not be read, None when the deadline left no time to finish the round."""
+    """Refresh each task's latest state in place: False when any read failed, True when reads
+    succeeded, None when the deadline left time for no read."""
+    attempted = failed = False
     for task_id in latest:
         remaining = deadline - clock()
         if remaining <= 0:
-            return None
+            break
+        attempted = True
         try:
             task = request("status", {"task_id": task_id}, timeout=min(REQUEST_SECONDS, remaining), deadline=True)
         except UnknownTask:
             task = None
         except (OSError, ValueError):
-            # Unreachable, restarting or briefly failing Router: keep the states already read.
-            return False
+            # Unreachable, restarting or briefly failing Router: keep this task's last state
+            # and still read the others, so one failing read cannot hide a ready task.
+            failed = True
+            continue
         latest[task_id] = _snapshot(task_id, task)
-    return True
+    return None if not attempted else not failed
 
 
 def wait_tasks(task_ids: list[str], mode: str, timeout: float, *, request: Callable | None = None,

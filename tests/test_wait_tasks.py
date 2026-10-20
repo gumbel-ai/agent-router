@@ -163,6 +163,21 @@ class WaitTasksTests(unittest.TestCase):
         self.assertTrue(result["condition_met"])
         self.assertEqual(statuses(result), {"task-a": ("awaiting_review", True), "task-b": ("running", False)})
 
+    def test_a_failing_read_does_not_hide_a_ready_task_after_it(self):
+        router = FakeRouter([{"task-a": UNREACHABLE, "task-b": {"status": "awaiting_review"}}])
+        result = router.wait(["task-a", "task-b"], "any")
+        self.assertTrue(result["condition_met"])
+        self.assertEqual(statuses(result), {"task-a": ("unknown", False), "task-b": ("awaiting_review", True)})
+        self.assertEqual(router.now, 0)
+
+    def test_recovered_partial_round_at_deadline_is_not_reported_unavailable(self):
+        router = FakeRouter([UNREACHABLE, {"task-a": {"status": "running"}, "task-b": {"status": "running"}}],
+                            latency=.25)
+        # Round 1 fails both reads by 0.5 s; round 2 reads task-a by 1.75 s, leaving no time for task-b.
+        result = router.wait(["task-a", "task-b"], "all", timeout=1.75)
+        self.assertEqual((result["timed_out"], result["daemon_unavailable"]), (True, False))
+        self.assertEqual(statuses(result)["task-a"], ("running", False))
+
     def test_rejects_invalid_arguments(self):
         router = FakeRouter([{}])
         for task_ids, mode, timeout in ((["task-a"], "any", 0), (["task-a"], "any", 3601),

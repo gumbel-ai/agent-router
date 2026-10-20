@@ -48,9 +48,10 @@ status from model turns:
 router wait-tasks task-a task-b --any --timeout 540
 ```
 
-Then act on the ready tasks (`router task-diff`, `router review`, `router close`, …) and
-call `router wait-tasks` again with the tasks still running. If `timed_out` is true,
-nothing needs you yet: call it again with the same IDs.
+On **every** return, including `timed_out`, check each task's `ready` flag and handle the
+ready ones first (`router task-diff`, `router review`, `router close`, …): with `--all`
+a timeout can still list ready tasks, and during an outage the states are only the last
+ones read. Then call `router wait-tasks` again with the tasks still running.
 
 - **Claude Code:** the Bash tool allows up to 10 minutes per command; give the call a
   tool timeout above `--timeout` (for example `--timeout 540` with a 600000 ms tool
