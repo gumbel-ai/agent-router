@@ -30,6 +30,13 @@
   .stat { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 10px 16px; }
   .stat b { display: block; font-size: 22px; }
   .stat span { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .04em; }
+  .notice { margin: 0; color: var(--warn); }
+  .work { background: var(--card); border: 1px solid var(--line); border-radius: 12px; }
+  .work h2 { font-size: 15px; margin: 0 0 8px; }
+  details { background: var(--card); border: 1px solid var(--line); border-radius: 12px; }
+  details > summary { cursor: pointer; padding: 12px 16px; font-weight: 600; }
+  summary:focus-visible { outline: 2px solid var(--info); outline-offset: -3px; border-radius: 10px; }
+  .hint { margin: 0; color: var(--muted); font-size: 13px; }
   .host { background: var(--card); border: 1px solid var(--line); border-radius: 12px; overflow: hidden; }
   .host-head { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; padding: 12px 16px;
                border-bottom: 1px solid var(--line); }
@@ -39,13 +46,15 @@
   section { padding: 10px 16px; }
   section + section { border-top: 1px dashed var(--line); }
   section h3 { font-size: 12px; margin: 0 0 6px; color: var(--muted); text-transform: uppercase; letter-spacing: .05em; }
-  .row { display: grid; grid-template-columns: minmax(180px, 1.2fr) 110px minmax(0, 2fr) 90px;
-         gap: 10px; align-items: center; padding: 6px 0; }
-  .row.child { padding-left: 22px; }
-  .row.child .name::before { content: "↳ "; color: var(--muted); }
+  .row { display: grid; grid-template-columns: minmax(180px, 1.3fr) 130px minmax(0, 1.6fr) 180px;
+         gap: 14px; align-items: center; padding: 12px 0; }
+  .row + .row { border-top: 1px solid var(--line); }
+  .identity { min-width: 0; }
   .name { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 13px;
           overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .activity { color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .context, .model { color: var(--muted); font-size: 12px; overflow-wrap: anywhere; margin-top: 3px; }
+  .host + .host { margin-top: 10px; }
   .time { color: var(--muted); text-align: right; font-size: 13px; }
   .empty { color: var(--muted); padding: 4px 0; }
   .chip { display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 12px;
@@ -56,7 +65,9 @@
   .alert .evidence { color: var(--muted); }
   @media (max-width: 720px) {
     header, main { padding-left: 16px; padding-right: 16px; }
+    .summary { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); }
     .row { grid-template-columns: 1fr auto; }
+    .name { white-space: normal; overflow-wrap: anywhere; }
     .row .activity, .row .time { grid-column: 1 / -1; text-align: left; }
   }
 </style>
@@ -77,10 +88,10 @@ const REFRESH_MS = 3000;
 
 const TONES = {
   running: "ok", available: "ok", completed: "ok", accepted: "ok", integrated: "ok",
-  idle: "info", stopped: "info", created: "info", validating: "info", preparing: "info",
+  tool_running: "ok", idle: "info", stopped: "info", exited: "info", created: "info", validating: "info", preparing: "info",
   retrying: "info", cancelling: "info", cancelled: "info", closed: "info",
   needs_input: "warn", needs_attention: "bad", awaiting_review: "warn", busy: "warn", partial: "warn", unknown: "warn",
-  failed: "bad", interrupted: "bad", blocked: "bad", offline: "bad", saturated: "bad",
+  failed: "bad", signaled: "bad", interrupted: "bad", blocked: "bad", offline: "bad", saturated: "bad",
 };
 
 function words(value) {
@@ -96,7 +107,7 @@ function bytes(value) {
 }
 
 function duration(ms) {
-  if (typeof ms !== "number" || ms < 0) return "";
+  if (!Number.isFinite(ms) || ms < 0) return "";
   const seconds = Math.floor(ms / 1000);
   if (seconds < 60) return `${seconds}s`;
   if (seconds < 3600) return `${Math.floor(seconds / 60)}m ${seconds % 60}s`;
@@ -104,7 +115,7 @@ function duration(ms) {
 }
 
 function since(timestamp, now) {
-  return typeof timestamp === "number" ? duration(now - timestamp) : "";
+  return Number.isFinite(timestamp) && Number.isFinite(now) ? duration(now - timestamp) : "";
 }
 
 // ---- DOM helpers (textContent only, never innerHTML) ----------------------
@@ -126,12 +137,6 @@ function chip(state) {
   return el("span", `chip ${TONES[label] || ""}`, words(label));
 }
 
-function row({ name, state, activity, time, child }) {
-  return append(el("div", child ? "row child" : "row"),
-    el("div", "name", name), append(el("div"), chip(state)),
-    el("div", "activity", activity || "—"), el("div", "time", time));
-}
-
 function section(title, rows) {
   if (!rows.length) return null;
   return append(el("section"), el("h3", null, title), ...rows);
@@ -139,72 +144,119 @@ function section(title, rows) {
 
 // ---- rendering --------------------------------------------------------------
 
-// Session IDs are unique per source only, so subagents join on (source, session ID).
-function sessionKey(source, sessionId) {
-  return JSON.stringify([source, sessionId]);
+const ACTIVE = new Set(["running", "tool_running", "created", "validating", "preparing", "retrying", "cancelling"]);
+const ATTENTION = new Set(["needs_input", "needs_attention", "awaiting_review", "blocked", "failed", "interrupted", "signaled"]);
+
+function workState(record) {
+  if (record.status === "unknown" || !record.status) return "unknown";
+  if (record.needs_input) return "needs_input";
+  if (record.status === "idle" && record.inflight_tool_count > 0) return record.tool_visibility_partial ? "unknown" : "tool_running";
+  return record.status;
 }
 
-function sessionRows(snapshot, now) {
-  const agentsByParent = new Map();
-  for (const agent of snapshot.agents || []) {
-    const key = sessionKey(agent.source, agent.parent_session_id);
-    if (!agentsByParent.has(key)) agentsByParent.set(key, []);
-    agentsByParent.get(key).push(agent);
+function workGroup(record) {
+  if (record.cleanup_failed || record.shutdown_unconfirmed || record.group_outlived) return "attention";
+  const state = workState(record);
+  if (state === "unknown") return "uncertain";
+  if (ATTENTION.has(state)) return "attention";
+  return ACTIVE.has(state) ? "active" : "history";
+}
+
+function collectWork(result) {
+  const items = [];
+  for (const host of result.hosts) {
+    if (!host.ok) continue;
+    const snapshot = host.snapshot;
+    for (const [key, kind] of [["router_tasks", "Router task"], ["agents", "Subagent"],
+                               ["sessions", "Session"], ["managed_processes", "Command"]]) {
+      for (const record of snapshot[key] || []) {
+        items.push({ record, kind, host: host.name, now: snapshot.generated_at, group: workGroup(record) });
+      }
+    }
   }
-  const agentRow = agent => row({
-    child: true,
-    name: agent.agent_type || agent.agent_id || "subagent",
-    state: agent.status,
-    activity: agent.activity || agent.task,
-    time: duration(agent.elapsed_ms) || since(agent.started_at, now),
-  });
-  const rows = [];
-  for (const session of snapshot.sessions || []) {
-    rows.push(row({
-      name: `${session.source || "?"} · ${session.session_id}`,
-      state: session.needs_input ? "needs_input" : session.status,
-      activity: session.activity || (session.last_event && `last: ${session.last_event}`) || session.cwd,
-      time: since(session.started_at, now),
-    }));
-    const key = sessionKey(session.source, session.session_id);
-    rows.push(...(agentsByParent.get(key) || []).map(agentRow));
-    agentsByParent.delete(key);
+  return items;
+}
+
+function workTiming(record, kind, now) {
+  if (kind === "Session") {
+    const ended = typeof record.finished_at === "number";
+    const age = since(record.started_at, ended ? record.finished_at : now);
+    return `${ended ? "Session span" : "Session age"}: ${age || "unknown"}`;
   }
-  for (const orphans of agentsByParent.values()) rows.push(...orphans.map(agentRow));
-  return rows;
+  return `Elapsed: ${duration(record.elapsed_ms) || "unknown"}`;
 }
 
 // Conditions that need an operator come before the executor's last activity.
 function taskActivity(task) {
   if (task.shutdown_unconfirmed) return "shutdown unconfirmed";
   if (task.cleanup_failed) return "cleanup failed";
+  if (task.group_outlived) return "Command exited; its process group may still be running";
   if (["failed", "interrupted", "blocked"].includes(task.status) && task.failure_reason) return task.failure_reason;
   return task.activity || task.failure_reason || task.task;
 }
 
-function routerTaskRows(snapshot, now) {
-  return (snapshot.router_tasks || []).map(task => row({
-    name: `${task.executor || "?"} · ${task.task_id}`,
-    state: task.shutdown_unconfirmed || task.cleanup_failed ? "needs_attention" : task.status,
-    activity: taskActivity(task),
-    time: duration(task.elapsed_ms) || since(task.created_at, now),
-  }));
+function workIdentity(record, kind) {
+  const key = { Command: "managed_id", "Router task": "task_id", Subagent: "agent_id", Session: "session_id" }[kind];
+  const session = kind === "Command" ? record.session_id : record.parent_session_id;
+  const agent = kind === "Command" ? record.agent_id : record.parent_agent_id;
+  return { id: record[key] || "unknown", parents: [
+    session && { label: "parent session", id: session }, agent && { label: "parent agent", id: agent },
+  ].filter(Boolean) };
 }
 
-function managedRows(snapshot, now) {
-  return (snapshot.managed_processes || []).map(process => row({
-    name: process.label || process.executable || process.managed_id,
-    state: process.status,
-    activity: process.cwd,
-    time: duration(process.elapsed_ms) || since(process.started_at, now),
-  }));
+function workRow({ record, kind, host, now }) {
+  const project = record.cwd && record.cwd.split("/").filter(Boolean).at(-1);
+  const name = record.task || record.label || record.work_item_id || project || record.agent_type || "Project / task unknown";
+  const { id, parents } = workIdentity(record, kind);
+  const brief = value => value.length > 16 ? `${value.slice(0, 12)}…` : value;
+  const identity = el("div", "identity");
+  const title = el("div", "name", name);
+  title.title = name;
+  append(identity, title, el("div", "context", `${host} · ${record.source || record.executor || record.executable || "runtime unknown"} · ${kind}`));
+  const reference = el("div", "context", [brief(id), ...parents.map(parent => `${parent.label} ${brief(parent.id)}`)].join(" · "));
+  reference.title = [id, ...parents.map(parent => `${parent.label} ${parent.id}`)].join(" · ");
+  append(identity, reference);
+  const model = record.resolved_model || record.model;
+  if (kind !== "Command") append(identity, el("div", "model", model ? `Model: ${model}` :
+    record.requested_model ? `Requested model: ${record.requested_model}` : "Model unknown"));
+  const states = append(el("div"), chip(workState(record)));
+  if (record.cleanup_failed || record.shutdown_unconfirmed || record.group_outlived) append(states, chip("needs_attention"));
+  const activity = (record.cleanup_failed || record.shutdown_unconfirmed || record.group_outlived ? taskActivity(record) :
+    record.visibility_reason || taskActivity(record)) ||
+    (record.last_event && `Last event: ${words(record.last_event)}`) || "Activity unknown";
+  const activityNode = el("div", "activity", activity);
+  activityNode.title = activity;
+  const last = since(record.last_event_at ?? record.finished_at ?? record.started_at, now);
+  const timing = append(el("div", "time"), el("div", null, workTiming(record, kind, now)),
+    el("div", "context", last ? `Last activity: ${last} ago` : "Last activity unknown"));
+  return append(el("div", "row"), identity, states, activityNode, timing);
+}
+
+function workSection(title, items, empty) {
+  return append(el("section", "work"), el("h2", null, `${title} (${items.length})`),
+    ...(items.length ? items.map(workRow) : [el("div", "empty", empty)]));
+}
+
+function disclosure(id, title, content) {
+  const details = el("details");
+  details.id = id;
+  details.open = document.getElementById(id)?.open || false;
+  const toggle = el("summary", null, title);
+  toggle.id = `${id}-toggle`;
+  return append(details, toggle, ...content);
 }
 
 function alertRows(record) {
-  const alerts = [...record.alerts, ...((record.snapshot && record.snapshot.alerts) || [])];
-  return alerts.map(alert => append(el("div", "alert"),
+  const alerts = new Map();
+  for (const alert of [...(record.alerts || []), ...((record.snapshot && record.snapshot.alerts) || [])]) {
+    const key = JSON.stringify([alert.kind, alert.evidence]);
+    const item = alerts.get(key) || { ...alert, count: 0 };
+    item.count++;
+    alerts.set(key, item);
+  }
+  return [...alerts.values()].map(alert => append(el("div", "alert"),
     el("span", "chip warn", words(alert.kind)),
-    el("span", "evidence", alert.evidence)));
+    el("span", "evidence", `${alert.evidence}${alert.count > 1 ? ` (×${alert.count})` : ""}`)));
 }
 
 function metrics(capacity) {
@@ -235,41 +287,46 @@ function hostCard(record) {
   }
   const snapshot = record.snapshot;
   const capacity = snapshot.capacity || {};
-  const now = snapshot.generated_at;
   append(head, chip(capacity.capacity_state), snapshot.partial && chip("partial"),
          el("span", "chip", snapshot.host.platform), metrics(capacity));
   const sections = [
     section("Incomplete data", partialRows(snapshot)),
-    section("Sessions & subagents", sessionRows(snapshot, now)),
-    section("Router children", routerTaskRows(snapshot, now)),
-    section("Managed runs", managedRows(snapshot, now)),
     section("Alerts", alertRows(record)),
   ].filter(Boolean);
-  if (!sections.length) sections.push(append(el("section"), el("div", "empty", "No active sessions")));
+  if (!sections.length) sections.push(append(el("section"), el("div", "empty", "No host diagnostics")));
   return append(card, ...sections);
 }
 
-function summary(result) {
-  const live = result.hosts.filter(host => host.ok).map(host => host.snapshot);
-  const count = key => live.reduce((total, snapshot) => total + (snapshot[key] || []).length, 0);
-  // Counts are lower bounds when any host is offline, omitted or partial.
-  const bound = result.partial ? "≥" : "";
-  const waiting = live.reduce((total, snapshot) =>
-    total + (snapshot.sessions || []).filter(session => session.needs_input).length
-          + (snapshot.agents || []).filter(agent => agent.status === "needs_input").length, 0);
+function summary(result, groups) {
+  const live = result.hosts.filter(host => host.ok).length;
+  const unknown = Object.values(groups).flat().filter(item => workState(item.record) === "unknown").length;
   const stats = [
-    [`${live.length}/${result.hosts.length}`, "Hosts online"],
-    [bound + count("sessions"), "Sessions"],
-    [bound + count("agents"), "Subagents"],
-    [bound + count("router_tasks"), "Router children"],
-    [bound + waiting, "Needs input"],
+    [`${live}/${result.hosts.length}`, "Hosts online"],
+    [groups.attention.length, "Attention rows"],
+    [groups.active.length, "In-progress rows"],
+    [unknown, "Unknown status rows"],
   ];
   return append(el("div", "summary"),
     ...stats.map(([value, label]) => append(el("div", "stat"), el("b", null, value), el("span", null, label))));
 }
 
 function render(result) {
-  document.getElementById("app").replaceChildren(summary(result), ...result.hosts.map(hostCard));
+  const focus = document.activeElement?.id;
+  const groups = { attention: [], active: [], uncertain: [], history: [] };
+  for (const item of collectWork(result)) groups[item.group].push(item);
+  const content = [summary(result, groups),
+    el("p", "hint", "Reported sessions, subagents, Router tasks and commands. Related rows can describe the same work."),
+    result.partial && el("p", "notice", "Fleet data is incomplete. Counts cover returned rows only; more work may be running. See host diagnostics."),
+    workSection("Needs attention", groups.attention, "No attention items in the returned records."),
+    workSection("In progress", groups.active, "No confirmed work in progress in the returned records."),
+    disclosure("uncertain", `Visibility unknown (${groups.uncertain.length}) — not confirmed running`,
+      [workSection("Last observed work", groups.uncertain, "No uncertain records.")]),
+    disclosure("history", `Idle & finished (${groups.history.length})`,
+      [workSection("Recent history", groups.history, "No idle or finished records.")]),
+    disclosure("hosts", "Host capacity & diagnostics", result.hosts.map(hostCard)),
+  ].filter(Boolean);
+  document.getElementById("app").replaceChildren(...content);
+  if (focus) document.getElementById(focus)?.focus({ preventScroll: true });
   document.getElementById("updated").textContent =
     `Updated ${new Date(result.generated_at).toLocaleTimeString()}`;
   document.getElementById("live").classList.remove("stale");

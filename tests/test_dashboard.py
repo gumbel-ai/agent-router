@@ -1,10 +1,14 @@
 import json
+import shutil
 import socket
+import subprocess
 import threading
 import unittest
 import urllib.error
 import urllib.request
 from contextlib import contextmanager
+from html.parser import HTMLParser
+from pathlib import Path
 from unittest.mock import patch
 
 from router.dashboard import make_server
@@ -36,6 +40,32 @@ def get(url: str, host: str | None = None) -> tuple[int, str, bytes]:
 
 
 class DashboardTests(unittest.TestCase):
+    @unittest.skipUnless(shutil.which("node"), "Dashboard JavaScript checks require Node.js")
+    def test_work_presentation_contracts(self):
+        class Scripts(HTMLParser):
+            inside = False
+
+            def handle_starttag(self, tag, attrs):
+                if tag == "script":
+                    self.inside = True
+
+            def handle_endtag(self, tag):
+                if tag == "script":
+                    self.inside = False
+
+            def handle_data(self, data):
+                if self.inside:
+                    chunks.append(data)
+
+        chunks = []
+        root = Path(__file__).resolve().parents[1]
+        Scripts().feed((root / "router" / "dashboard.html").read_text())
+        result = subprocess.run(
+            [shutil.which("node"), str(root / "tests" / "dashboard_contract.cjs")],
+            input="".join(chunks), capture_output=True, text=True, timeout=15, check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
     def test_client_disconnects_during_response_do_not_escape(self):
         for error in (BrokenPipeError, ConnectionResetError, PermissionError):
             for fail_on_write in (1, 2):  # Headers, then body.
