@@ -117,40 +117,29 @@ class ManagedRunTests(unittest.TestCase):
                     "router.managed.subprocess.Popen",
                     side_effect=AssertionError("must not launch"),
                 ),
-                self.assertRaisesRegex(ValueError, "could not reserve"),
+                self.assertRaisesRegex(ValueError, "command was not started"),
             ):
                 run([sys.executable, "-c", "pass"], "guarded", None, None, self.state)
 
-    def test_lost_reservation_reply_refuses_launch_and_remains_uncertain(self):
+    def test_lost_reservation_reply_runs_and_binds_the_reservation(self):
         def lose_reservation_reply(operation, payload, timeout):
-            self.assertEqual(operation, "managed_reserve")
-            self.request(operation, payload, timeout)
-            raise OSError("reply lost after commit")
+            result = self.request(operation, payload, timeout)
+            if operation == "managed_reserve":
+                raise OSError("reply lost after commit")
+            return result
 
-        with (
-            patch("router.managed.request", side_effect=lose_reservation_reply),
-            patch(
-                "router.managed.subprocess.Popen",
-                side_effect=AssertionError("must not launch"),
-            ),
-            redirect_stderr(io.StringIO()),
-            self.assertRaisesRegex(ValueError, "could not reserve"),
-        ):
-            run([sys.executable, "-c", "pass"], "uncertain", None, None, self.state)
-        record = self.managed()["uncertain"]
-        self.assertTrue(record["launch_pending"])
-        self.assertEqual(record["status"], "unknown")
-        self.assertIsNone(self.control.managed.records()[1])
-        # Restart reconstruction keeps the reservation uncertain and does not
-        # synthesize a completion for a command whose launch outcome is unknown.
-        reloaded = ManagedProcesses(
-            self.control.store,
-            self.control.host.host_id,
-            self.state,
-            identity=lambda _pid: None,
-        )
-        self.assertIsNone(reloaded.records()[1])
-        self.assertEqual(self.next_completion()["status"], "pending")
+        with patch("router.managed.request", side_effect=lose_reservation_reply), \
+                redirect_stderr(io.StringIO()):
+            self.assertEqual(run([sys.executable, "-c", "pass"], "lost", None, None, self.state), 0)
+        record = self.managed()["lost"]
+        self.assertNotIn("launch_pending", record)
+        self.assertEqual(record["status"], "exited")
+
+    def test_router_refusal_prevents_launch(self):
+        with patch("router.managed.request", side_effect=ValueError("Router is stopping for maintenance")), \
+                patch("router.managed.subprocess.Popen", side_effect=AssertionError("must not launch")), \
+                self.assertRaisesRegex(ValueError, "refused the managed launch"):
+            run([sys.executable, "-c", "pass"], "refused", None, None, self.state)
 
     def test_popen_failure_aborts_the_prelaunch_reservation(self):
         with (

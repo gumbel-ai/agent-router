@@ -74,11 +74,9 @@ def run(argv: list[str], label: str | None, session_id: str | None, agent_id: st
                 "argument_count": len(argv) - 1, "cwd": os.getcwd()}
     if work_item_id is not None:
         metadata["work_item_id"] = work_item_id
-    if recorded:
-        if metadata["wrapper_identity"] is None:
-            raise ValueError("Managed launch process identity is unavailable")
-        if not _reserve(metadata):
-            raise ValueError("Agent Router could not reserve the managed launch; command was not started")
+    # A reachable Router can refuse the launch (maintenance); an unreachable one cannot, and the
+    # command runs unreserved with its evidence kept for later, as before.
+    reserved = recorded and metadata["wrapper_identity"] is not None and _reserve(metadata)
     started_at, started = _now(), time.monotonic()
     launched: list[int] = []  # The command's PID (its group), once it exists.
     pending: list[int] = []
@@ -101,7 +99,7 @@ def run(argv: list[str], label: str | None, session_id: str | None, agent_id: st
             child = subprocess.Popen(argv, stdin=subprocess.DEVNULL, start_new_session=True,
                                      env={**os.environ, "ROUTER_MANAGED_ID": managed_id})
         except (OSError, ValueError):
-            if recorded:
+            if reserved:
                 abort = {"managed_id": managed_id, "wrapper_pid": metadata["wrapper_pid"],
                          "wrapper_identity": metadata["wrapper_identity"]}
                 if not _abort(abort):
@@ -184,16 +182,19 @@ def _report(operation: str, payload: dict) -> bool:
 
 
 def _reserve(payload: dict) -> bool:
+    """True when reserved, False when Router is unreachable; raises when Router refuses."""
     try:
         result = request("managed_reserve", payload, timeout=2)
-        expected = {key: payload[key] for key in ("managed_id", "wrapper_pid", "wrapper_identity")}
-        if (not isinstance(result, dict) or result.get("reserved") is not True
-                or {key: result.get(key) for key in expected} != expected):
-            raise ValueError("Invalid managed launch reservation response")
-        return True
-    except (OSError, ValueError, KeyError, TypeError) as error:
-        print(f"Agent Router managed reservation unavailable: {error}", file=sys.stderr)
-        return False
+    except (OSError, ValueError) as error:
+        if isinstance(error, OSError) or isinstance(error.__cause__, OSError):
+            print(f"Agent Router managed reservation unavailable: {error}", file=sys.stderr)
+            return False
+        raise ValueError(f"Agent Router refused the managed launch: {error}; command was not started") from error
+    expected = {key: payload[key] for key in ("managed_id", "wrapper_pid", "wrapper_identity")}
+    if (not isinstance(result, dict) or result.get("reserved") is not True
+            or {key: result.get(key) for key in expected} != expected):
+        raise ValueError("Invalid managed launch reservation response; command was not started")
+    return True
 
 
 def _abort(payload: dict) -> bool:
