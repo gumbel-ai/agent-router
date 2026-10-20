@@ -67,6 +67,6 @@ router dashboard              # same view, live at http://127.0.0.1:8765/
 - [Install and operation](docs/install.md): setup details, Codex/OpenCode init, service, recovery
 - [Fleet monitoring](docs/fleet.md): config, dashboard, snapshots, managed runs, reservations
 - [Project enablement](docs/project-enablement.md), [Codex delegation](docs/codex-delegation.md), [Codex lifecycle](docs/codex-lifecycle.md)
-- [Completions](docs/completions.md), [Request status](docs/request-status.md), [Task diffs](docs/task-diffs.md), [Correlation](docs/correlation.md), [Remote children](docs/remote-snapshots.md)
+- [Waiting for tasks](docs/wait-tasks.md) (`router wait-tasks`), [Completions](docs/completions.md), [Request status](docs/request-status.md), [Task diffs](docs/task-diffs.md), [Correlation](docs/correlation.md), [Remote children](docs/remote-snapshots.md)
 
 License: [MIT](LICENSE).

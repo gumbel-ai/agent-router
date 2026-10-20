@@ -17,6 +17,10 @@ class CompletionRefused(ValueError):
     """The daemon rejected an acknowledgment's identity or cursor binding."""
 
 
+class UnknownTask(ValueError):
+    """The daemon has no task with the requested ID."""
+
+
 def request(operation: str, payload: dict, endpoint: Path | None = None, *, timeout: float = 15,
             deadline: bool = False) -> dict | list:
     """With deadline=True, timeout bounds the whole request rather than each socket operation."""
@@ -98,5 +102,7 @@ def request(operation: str, payload: dict, endpoint: Path | None = None, *, time
                 raise CompletionBusy(response.get("error", "Completion database is busy; retry delivery"))
             if operation == "completion_ack" and response.get("code") == "acknowledgment_refused":
                 raise CompletionRefused(response.get("error", "Completion acknowledgment refused"))
+            if response.get("code") == "unknown_task":
+                raise UnknownTask(response.get("error", "Unknown task_id"))
             raise ValueError(response.get("error", "Router request failed"))
         return response["result"]

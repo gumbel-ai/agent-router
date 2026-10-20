@@ -47,6 +47,7 @@ Related commands:
 
 - `router request-status` recovers a request's task after a lost reply; see [request status](request-status.md).
 - `router task-diff` reads one attempt's retained patch; see [task diffs](task-diffs.md).
+- `router wait-tasks` blocks until started tasks need a decision or finish; see [waiting for tasks](wait-tasks.md).
 - `router correlation --json` exports content-free identifiers for joining with Langfuse; see [correlation](correlation.md).
 - `router wait`, `router ack`, and `router consumer list|remove` manage durable completion delivery; see [completions](completions.md).
 
