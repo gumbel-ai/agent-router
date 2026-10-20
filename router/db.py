@@ -7,6 +7,7 @@ from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
 
+from router.client import UnknownTask
 from router.dispatch import canonical
 
 
@@ -141,7 +142,7 @@ class Store:
                 return self.get(task_id, connection)
         row = db.execute("SELECT data FROM tasks WHERE task_id=?", (task_id,)).fetchone()
         if row is None:
-            raise ValueError("Unknown task_id")
+            raise UnknownTask("Unknown task_id")
         return json.loads(row[0])
 
     def put(self, db: sqlite3.Connection, task: dict) -> None:

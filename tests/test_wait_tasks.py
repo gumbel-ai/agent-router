@@ -1,0 +1,191 @@
+import io
+import json
+import tempfile
+import threading
+import unittest
+from contextlib import contextmanager, redirect_stdout
+from pathlib import Path
+from unittest.mock import patch
+
+from test_control import settings
+
+from router.cli import main
+from router.client import UnknownTask
+from router.client import request as router_request
+from router.daemon import Controller, Handler, Server
+from router.wait_tasks import wait_tasks
+
+UNREACHABLE = object()
+
+
+class FakeRouter:
+    """Serves scripted task states, one script step per poll round; records every request."""
+
+    def __init__(self, rounds: list[dict]):
+        self.rounds = rounds
+        self.round = 0
+        self.now = 0.0
+        self.requests = []
+
+    def clock(self) -> float:
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        self.now += seconds
+        self.round = min(self.round + 1, len(self.rounds) - 1)
+
+    def request(self, operation, payload, *, timeout, deadline):
+        self.requests.append((operation, payload))
+        state = self.rounds[self.round]
+        if state is UNREACHABLE:
+            raise ValueError("Agent Router is not reachable.") from ConnectionRefusedError()
+        task = state.get(payload["task_id"])
+        if task is None:
+            raise UnknownTask("Unknown task_id")
+        return {"task_id": payload["task_id"], "attempts": 1, "cleanup_error": None, **task}
+
+    def wait(self, task_ids, mode, timeout=10):
+        return wait_tasks(task_ids, mode, timeout, request=self.request, sleep=self.sleep, clock=self.clock)
+
+
+def statuses(result):
+    return {task["task_id"]: (task["status"], task["ready"]) for task in result["tasks"]}
+
+
+class WaitTasksTests(unittest.TestCase):
+    def test_any_returns_on_first_ready_task_with_every_current_state(self):
+        router = FakeRouter([
+            {"task-a": {"status": "running"}, "task-b": {"status": "running"}},
+            {"task-a": {"status": "running"}, "task-b": {"status": "awaiting_review"}},
+        ])
+        result = router.wait(["task-a", "task-b"], "any")
+        self.assertEqual((result["condition_met"], result["timed_out"]), (True, False))
+        self.assertEqual(statuses(result), {"task-a": ("running", False), "task-b": ("awaiting_review", True)})
+
+    def test_all_waits_for_every_task_across_mixed_terminal_states(self):
+        router = FakeRouter([
+            {"task-a": {"status": "failed", "failure_reason": "tests failed"}, "task-b": {"status": "running"},
+             "task-c": {"status": "cancelling"}},
+            {"task-a": {"status": "failed", "failure_reason": "tests failed"}, "task-b": {"status": "interrupted"},
+             "task-c": {"status": "cancelled"}},
+        ])
+        result = router.wait(["task-a", "task-b", "task-c"], "all")
+        self.assertTrue(result["condition_met"])
+        self.assertEqual(statuses(result), {"task-a": ("failed", True), "task-b": ("interrupted", True),
+                                            "task-c": ("cancelled", True)})
+        self.assertEqual(result["tasks"][0]["failure_reason"], "tests failed")
+        self.assertEqual(router.now, 1)
+
+    def test_retrying_task_is_not_ready_until_the_next_review(self):
+        router = FakeRouter([
+            {"task-a": {"status": "retrying", "attempts": 1}},
+            {"task-a": {"status": "running", "attempts": 2}},
+            {"task-a": {"status": "awaiting_review", "attempts": 2}},
+        ])
+        result = router.wait(["task-a"], "any")
+        self.assertEqual(result["tasks"], [{"task_id": "task-a", "status": "awaiting_review", "attempts": 2,
+                                            "ready": True}])
+        self.assertEqual(router.now, 2)
+
+    def test_missing_task_is_reported_and_ready(self):
+        router = FakeRouter([{"task-a": {"status": "running"}}])
+        result = router.wait(["task-a", "task-gone"], "any")
+        self.assertTrue(result["condition_met"])
+        self.assertEqual(result["tasks"][1], {"task_id": "task-gone", "status": "missing", "ready": True})
+
+    def test_cleanup_error_makes_the_task_ready(self):
+        router = FakeRouter([{"task-a": {"status": "running", "cleanup_error": "worktree busy"}}])
+        result = router.wait(["task-a"], "all")
+        self.assertTrue(result["condition_met"])
+        self.assertEqual(result["tasks"][0]["cleanup_error"], "worktree busy")
+
+    def test_timeout_returns_latest_state_of_every_task(self):
+        router = FakeRouter([{"task-a": {"status": "running"}, "task-b": {"status": "awaiting_review"}}])
+        result = router.wait(["task-a", "task-b"], "all", timeout=3)
+        self.assertEqual((result["condition_met"], result["timed_out"], result["daemon_unavailable"]),
+                         (False, True, False))
+        self.assertEqual(statuses(result), {"task-a": ("running", False), "task-b": ("awaiting_review", True)})
+
+    def test_daemon_restart_keeps_waiting_then_reports_the_new_state(self):
+        router = FakeRouter([
+            {"task-a": {"status": "running"}},
+            UNREACHABLE,
+            UNREACHABLE,
+            {"task-a": {"status": "interrupted"}},
+        ])
+        result = router.wait(["task-a"], "any")
+        self.assertTrue(result["condition_met"])
+        self.assertEqual(statuses(result), {"task-a": ("interrupted", True)})
+
+    def test_daemon_unavailable_at_deadline_is_distinguished_and_keeps_last_known_state(self):
+        router = FakeRouter([{"task-a": {"status": "running"}}, UNREACHABLE])
+        result = router.wait(["task-a"], "any", timeout=3)
+        self.assertEqual((result["timed_out"], result["daemon_unavailable"]), (True, True))
+        self.assertEqual(statuses(result), {"task-a": ("running", False)})
+
+    def test_never_reached_daemon_reports_unknown_states(self):
+        router = FakeRouter([UNREACHABLE])
+        result = router.wait(["task-a"], "any", timeout=2)
+        self.assertEqual(result["tasks"], [{"task_id": "task-a", "status": "unknown", "ready": False}])
+        self.assertTrue(result["daemon_unavailable"])
+
+    def test_only_reads_status(self):
+        router = FakeRouter([{"task-a": {"status": "running"}}, {"task-a": {"status": "accepted"}}])
+        router.wait(["task-a", "task-a"], "all")
+        self.assertEqual({operation for operation, _ in router.requests}, {"status"})
+        self.assertEqual(len(router.requests), 2)  # Duplicate IDs are read once per round.
+
+    def test_rejects_invalid_arguments(self):
+        router = FakeRouter([{}])
+        for task_ids, mode, timeout in ((["task-a"], "any", 0), (["task-a"], "any", 3601),
+                                        (["native-x"], "any", 1), (["task-a"], "some", 1), ([], "any", 1)):
+            with self.subTest(task_ids=task_ids, mode=mode, timeout=timeout), self.assertRaises(ValueError):
+                router.wait(task_ids, mode, timeout)
+
+
+class WaitTasksWireTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix="ar-wait-tasks-", dir="/tmp")
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.project = self.root / "example-project"
+        self.project.mkdir()
+        self.router = Controller(settings(self.project), {}, self.root / "state")
+
+    @contextmanager
+    def wire(self):
+        endpoint = self.root / "router.sock"
+        with Server(str(endpoint), Handler) as server:
+            server.control = self.router
+            thread = threading.Thread(target=server.serve_forever)
+            thread.start()
+            try:
+                yield endpoint
+            finally:
+                server.shutdown()
+                thread.join(timeout=15)
+                self.assertFalse(thread.is_alive(), "Fixture server did not stop")
+
+    def test_cli_reads_real_daemon_and_reports_unknown_task_by_code(self):
+        task = {"task_id": "task-review", "session_id": "parent", "status": "awaiting_review", "attempts": 1,
+                "invocation": {"task": "fixture", "parent_worktree": str(self.project)}}
+        with self.router.store.transaction() as db:
+            self.router.store.put(db, task)
+        with self.wire() as endpoint:
+            with self.assertRaises(UnknownTask):
+                router_request("status", {"task_id": "task-absent"}, endpoint)
+            output = io.StringIO()
+            argv = ["router", "wait-tasks", "task-review", "task-absent", "--all", "--timeout", "5"]
+            with patch("router.wait_tasks.router_request",
+                       lambda *args, **kwargs: router_request(*args, endpoint, **kwargs)), \
+                    patch("sys.argv", argv), redirect_stdout(output):
+                main()
+        result = json.loads(output.getvalue())
+        self.assertEqual((result["mode"], result["condition_met"], result["timed_out"]), ("all", True, False))
+        self.assertEqual(statuses(result), {"task-review": ("awaiting_review", True), "task-absent": ("missing", True)})
+        with self.router.store.transaction() as db:
+            self.assertEqual(self.router.store.get("task-review", db)["status"], "awaiting_review")
+
+
+if __name__ == "__main__":
+    unittest.main()

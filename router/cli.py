@@ -291,6 +291,12 @@ def main() -> None:
     wait.add_argument("--consumer", required=True)
     wait.add_argument("--timeout", type=float, required=True, help="Deadline in seconds, greater than 0 and at most 3600")
     wait.add_argument("--include-subscription", action="store_true", help="Include the durable serving subscription binding")
+    wait_tasks = commands.add_parser("wait-tasks", help="Block until Router tasks need a decision or finish; read-only")
+    wait_tasks.add_argument("task_ids", nargs="+", metavar="TASK_ID")
+    wait_mode = wait_tasks.add_mutually_exclusive_group(required=True)
+    wait_mode.add_argument("--any", dest="mode", action="store_const", const="any", help="Return when one task is ready")
+    wait_mode.add_argument("--all", dest="mode", action="store_const", const="all", help="Return when every task is ready")
+    wait_tasks.add_argument("--timeout", type=float, required=True, help="Deadline in seconds, greater than 0 and at most 3600")
     ack = commands.add_parser("ack", help="Acknowledge a completion after durably handling it")
     ack.add_argument("--consumer", required=True)
     ack.add_argument("event_id")
@@ -516,6 +522,13 @@ def main() -> None:
             print(json.dumps(result, separators=(",", ":")))
             if result["status"] == "unavailable":
                 sys.exit(failure_code)
+        elif args.command == "wait-tasks":
+            from router.wait_tasks import wait_tasks
+            try:
+                result = wait_tasks(args.task_ids, args.mode, args.timeout)
+            except ValueError as error:
+                parser.error(str(error))
+            print(json.dumps(result, separators=(",", ":")))
         elif args.command == "ack":
             from router.managed import _completion_sequence, _identifier
             try:

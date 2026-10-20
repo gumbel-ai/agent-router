@@ -40,7 +40,8 @@ Events already removed by ordinary retention cannot be recovered. Existing retai
 terminal records are imported when upgrading. Import does not re-check project
 markers: retained evidence from before project admission was required is also imported,
 including evidence from unmarked projects. This interface does not include
-Router-dispatched agent tasks or native session lifecycle events.
+Router-dispatched agent tasks or native session lifecycle events; wait for tasks with
+[`router wait-tasks`](wait-tasks.md).
 
 Event results include the existing `host_id` and an `event` object containing a stable
 `event_id`, `managed_id`, process outcome, and known session/agent attribution. The

@@ -38,7 +38,7 @@ from router.claude_executor import (
 )
 from router.claude_executor import validate as validate_claude
 from router.claude_executor import version as claude_version
-from router.client import CompletionRefused
+from router.client import CompletionRefused, UnknownTask
 from router.codex import collect as collect_codex
 from router.codex import price_metadata
 from router.config import Settings
@@ -1800,6 +1800,8 @@ class Handler(socketserver.StreamRequestHandler):
                 response = {"ok": False, "error": "Router database is unavailable; inspect the operator log"}
         except CompletionRefused as error:
             response = {"ok": False, "error": str(error), "code": "acknowledgment_refused"}
+        except UnknownTask as error:
+            response = {"ok": False, "error": str(error), "code": "unknown_task"}
         except (ValueError, KeyError, OSError) as error:
             response = {"ok": False, "error": str(error)}
         except Exception:
