@@ -404,7 +404,13 @@ class SetupTests(unittest.TestCase):
             command.assert_not_called()
             service.assert_not_called()
             with self.assertRaisesRegex(ValueError, "not configured"):
-                request("start", {})
+                project = self.root / "project-0"
+                request("start", {
+                    "request_version": "1", "request_id": "unconfigured",
+                    "instruction_id": "unconfigured", "executor": "codex", "model": "test",
+                    "task": "must remain disabled", "parent_repo": str(project),
+                    "parent_worktree": str(project), "mode": "write",
+                })
             request("daemon_stop", {"only_if_idle": True})
             daemon.wait(timeout=15)
         finally:

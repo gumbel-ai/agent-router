@@ -88,6 +88,8 @@ previous.setdefault("commands", []).append(sys.argv[1:])
 if not persistence_disabled:
     record.write_text(json.dumps(previous))
 Path("result.txt").write_text("corrected\n" if "Parent feedback" in prompt else "first\n")
+if "Create missing.json" in prompt:
+    Path("missing.json").write_text('{"repaired":true}')
 initialization_gate = os.environ.get("ROUTER_FIXTURE_INITIALIZATION_GATE")
 if initialization_gate:
     initialization_gate = Path(initialization_gate)
@@ -138,7 +140,7 @@ if claude:
     count = len(previous["sessions"])
     if "no completion" not in prompt:
         event = {"type": "result", "session_id": session, "subtype": "error_during_execution" if "error" in prompt else "success",
-                 "is_error": "error" in prompt, "result": "Finished " + session,
+                 "is_error": "error" in prompt, "result": "" if "empty final" in prompt else "Finished " + session,
                  "total_cost_usd": .25 * count,
                  "modelUsage": {"claude-opus-4-6" if "wrong usage model" in prompt else model: {"inputTokens": 100 * count, "outputTokens": 20 * count,
                                          "cacheReadInputTokens": 40 * count, "cacheCreationInputTokens": 10 * count}}}
@@ -154,7 +156,7 @@ if "flood" in prompt:
             stream.write("x" * 400 + "\n")
         stream.flush()
 if codex:
-    print(json.dumps({"type": "item.completed", "item": {"type": "agent_message", "text": "Finished " + session}}), flush=True)
+    print(json.dumps({"type": "item.completed", "item": {"type": "agent_message", "text": "" if "empty final" in prompt else "Finished " + session}}), flush=True)
     if "no completion" not in prompt:
         count = len(previous["sessions"])
         total = 100 * count + 50 * (count - 1)

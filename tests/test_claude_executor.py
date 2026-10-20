@@ -40,6 +40,23 @@ class ClaudeExecutorTests(RuntimeHarness, unittest.TestCase):
         self.config.models["test"] = MODEL
         self.config.repositories[str(self.repo.resolve())]["claude_permissions"] = json.dumps(PROFILE)
 
+    def test_declared_final_response_requires_independent_acceptance_after_repair(self):
+        self.enable()
+        invocation = {"request_version": "1", "request_id": "claude-contract", "instruction_id": self.instruction,
+                      "executor": "claude", "model": "test", "task": "empty final", "mode": "write",
+                      "parent_repo": str(self.repo), "parent_worktree": str(self.repo),
+                      "completion": {"files": ["result.txt"], "final_response": True}}
+        task_id = self.mutate("start", invocation)["task_id"]
+        first = self.wait(task_id, {"awaiting_review", "failed"})
+        self.assertEqual(first["completion_check"]["status"], "violated", first)
+        with self.assertRaisesRegex(ValueError, "completion requirements"):
+            self.mutate("review", {"task_id": task_id, "request_id": "claude-no-accept", "expected_attempt": 1, "outcome": "accepted"})
+        self.mutate("review", {"task_id": task_id, "request_id": "claude-repair", "expected_attempt": 1,
+                               "outcome": "rejected", "feedback": "Provide a final response"})
+        second = self.wait(task_id, {"awaiting_review", "failed"})
+        self.assertEqual(second["completion_check"]["status"], "satisfied", second)
+        self.assertEqual(second["status"], "awaiting_review")
+
     def fixture_marker(self, path):
         deadline = time.monotonic() + 15
         while not path.exists() and time.monotonic() < deadline:

@@ -346,7 +346,8 @@ class RemoteChildProtocolTests(unittest.TestCase):
         task = {
             "task_id": "task-a", "session_id": "session-a", "remote_host": "worker",
             "remote_task_id": "task-a", "execution_stopped": False, "status": "interrupted",
-            "invocation": {"request_id": "request-a"},
+            "invocation": {"request_id": "request-a", "completion": {"files": ["result.txt"]}},
+            "completion_check": {"status": "violated", "violations": [{"reason": "previous attempt"}], "unchecked": []},
         }
 
         class Store:
@@ -367,11 +368,16 @@ class RemoteChildProtocolTests(unittest.TestCase):
                     {"status": "awaiting_review", "task_id": "task-a", "execution_stopped": True,
                      "attempts": 1, "attempt_number": 1, "final_tree": "a" * 40,
                      "snapshot_commit": "b" * 40, "snapshot_tree": "c" * 40,
-                     "execution_outcome": "completed"},
+                     "execution_outcome": "completed",
+                     "completion_check": {"status": "violated", "violations": [{"path": "result.txt", "reason": "required file missing"}],
+                                          "unchecked": [], "evidence_source": "stopped_worktree"}},
                 ))
 
             def status(self, _session_id, _request_id):
-                return next(self.responses)
+                response = next(self.responses)
+                if response["status"] == "awaiting_review" and "completion_check" in task:
+                    raise AssertionError("Previous attempt diagnostic survived active remote recovery")
+                return response
 
         runtime = Runtime.__new__(Runtime)
         runtime.store = Store(task)
@@ -384,7 +390,63 @@ class RemoteChildProtocolTests(unittest.TestCase):
         self.assertTrue(task["execution_stopped"])
         self.assertEqual(task["remote_task_id"], "task-a")
         self.assertEqual(task["final_tree"], "a" * 40)
+        self.assertEqual(task["completion_check"]["violations"][0]["path"], "result.txt")
+        task["invocation"].pop("completion")
+        task.update(status="interrupted", completion_check={"status": "violated"})
+        with patch("router.fleet.load_fleet_config", return_value=config), \
+                patch("router.remote_child.RemoteChildTransport", Transport), \
+                patch("router.daemon.time.sleep"):
+            runtime.execute_remote("task-a", recovered=True)
+        self.assertNotIn("completion_check", task)
 
+
+
+    def test_remote_final_states_require_satisfied_declared_completion(self):
+        good = {"status": "satisfied", "violations": [], "unchecked": [],
+                "evidence_source": "stopped_worktree"}
+        diagnostics = [
+            ("satisfied", True, good, "satisfied"),
+            ("missing", False, None, "unknown"),
+            ("malformed", True, [], "unknown"),
+            ("violated", True, {**good, "status": "violated",
+                                "violations": [{"reason": "required output missing"}]}, "violated"),
+        ]
+        config = SimpleNamespace(hosts=(FleetHost("worker", "ssh", target="example"),),
+                                 ssh_timeout_seconds=1)
+        for remote_status in ("accepted", "integrated", "closed"):
+            for name, included, diagnostic, expected in diagnostics:
+                response = {"status": remote_status, "task_id": "task-a"}
+                if included:
+                    response["completion_check"] = diagnostic
+
+                class Transport:
+                    def __init__(self, _host, _timeout):
+                        pass
+
+                    def status(self, _session_id, _request_id):
+                        return response
+
+                invocation = {**self.invocation, "executor": "codex",
+                              "completion": {"files": ["result.txt"]}}
+                store = self.remote_store({
+                    "task_id": "task-a", "status": "interrupted", "execution_stopped": False,
+                    "invocation": invocation,
+                })
+                runtime = Runtime.__new__(Runtime)
+                runtime.store = store
+                with self.subTest(remote_status=remote_status, diagnostic=name), \
+                        patch("router.fleet.load_fleet_config", return_value=config), \
+                        patch("router.remote_child.RemoteChildTransport", Transport):
+                    runtime.execute_remote("task-a", recovered=True)
+                task = store.get("task-a")
+                self.assertEqual(task["completion_check"]["status"], expected)
+                if expected == "satisfied":
+                    self.assertEqual(task["status"], remote_status)
+                    self.assertTrue(task["execution_stopped"])
+                else:
+                    self.assertEqual(task["status"], "interrupted")
+                    self.assertFalse(task["execution_stopped"])
+                    self.assertIn("invalid_response", task["failure_reason"])
 
     def remote_store(self, task: dict) -> Store:
         directory = tempfile.TemporaryDirectory()

@@ -141,6 +141,8 @@ def collect(task: dict, event: dict) -> None:
             task["execution_error"] = True
         if isinstance(event.get("result"), str):
             task["summary"] = event["result"][-8000:]
+        if "completion" in task.get("invocation", {}):
+            task["completion_final_response_present"] = bool(event.get("result", "").strip()) if isinstance(event.get("result"), str) else False
         reported_models = event.get("modelUsage")
         if isinstance(reported_models, dict) and reported_models and model not in reported_models and event.get("subtype") == "success":
             task["execution_error"] = True

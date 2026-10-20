@@ -19,6 +19,7 @@ from pathlib import Path
 from router.correlation import identifier
 from router.dispatch import canonical
 from router.fleet import FleetHost
+from router.lifecycle import validate as validate_payload
 
 MAX_REQUEST_BYTES = 12 * 1024 * 1024
 MAX_RESPONSE_BYTES = 1 * 1024 * 1024
@@ -109,10 +110,7 @@ def _start_payload(payload: dict) -> dict:
     invocation = payload["invocation"]
     if not isinstance(invocation, dict):
         raise TypeError("Remote start invocation must be an object")
-    if set(invocation) - {"request_version", "request_id", "instruction_id", "executor", "model", "task",
-                          "parent_repo", "parent_worktree", "mode", "context", "work_item_id",
-                          "host", "remote_repo", "remote_worktree"}:
-        raise ValueError("Remote start invocation has unknown fields")
+    validate_payload("start", invocation)
     if invocation.get("request_id") != payload["request_id"]:
         raise ValueError("Remote start request identity mismatch")
     _receipt(payload["snapshot_receipt"])
